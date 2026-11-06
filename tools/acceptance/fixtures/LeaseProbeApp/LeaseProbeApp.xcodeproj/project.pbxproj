@@ -1,0 +1,358 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		5A0000000000000000000009 /* LeaseProbeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A0000000000000000000007 /* LeaseProbeApp.swift */; };
+		5A000000000000000000000A /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A0000000000000000000008 /* ContentView.swift */; };
+		5A0000000000000000000015 /* GestureProbeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A0000000000000000000014 /* GestureProbeView.swift */; };
+		5A0000000000000000000026 /* TapTimingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A0000000000000000000025 /* TapTimingView.swift */; };
+		5A000000000000000000001D /* GestureUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A000000000000000000001B /* GestureUITests.swift */; };
+		5A000000000000000000001E /* SmokeUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A000000000000000000001C /* SmokeUITests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		5A000000000000000000001F /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 5A0000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 5A0000000000000000000005;
+			remoteInfo = LeaseProbeApp;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		5A0000000000000000000006 /* LeaseProbeApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LeaseProbeApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		5A0000000000000000000007 /* LeaseProbeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LeaseProbeApp.swift; sourceTree = "<group>"; };
+		5A0000000000000000000008 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		5A0000000000000000000014 /* GestureProbeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GestureProbeView.swift; sourceTree = "<group>"; };
+		5A0000000000000000000025 /* TapTimingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TapTimingView.swift; sourceTree = "<group>"; };
+		5A0000000000000000000016 /* LeaseProbeUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LeaseProbeUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		5A000000000000000000001B /* GestureUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GestureUITests.swift; sourceTree = "<group>"; };
+		5A000000000000000000001C /* SmokeUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SmokeUITests.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		5A000000000000000000000C /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		5A0000000000000000000019 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		5A0000000000000000000002 = {
+			isa = PBXGroup;
+			children = (
+				5A0000000000000000000004 /* LeaseProbeApp */,
+				5A000000000000000000001A /* LeaseProbeUITests */,
+				5A0000000000000000000003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		5A0000000000000000000003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				5A0000000000000000000006 /* LeaseProbeApp.app */,
+				5A0000000000000000000016 /* LeaseProbeUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		5A0000000000000000000004 /* LeaseProbeApp */ = {
+			isa = PBXGroup;
+			children = (
+				5A0000000000000000000007 /* LeaseProbeApp.swift */,
+				5A0000000000000000000008 /* ContentView.swift */,
+				5A0000000000000000000014 /* GestureProbeView.swift */,
+				5A0000000000000000000025 /* TapTimingView.swift */,
+			);
+			path = LeaseProbeApp;
+			sourceTree = "<group>";
+		};
+		5A000000000000000000001A /* LeaseProbeUITests */ = {
+			isa = PBXGroup;
+			children = (
+				5A000000000000000000001B /* GestureUITests.swift */,
+				5A000000000000000000001C /* SmokeUITests.swift */,
+			);
+			path = LeaseProbeUITests;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		5A0000000000000000000005 /* LeaseProbeApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 5A000000000000000000000F /* Build configuration list for PBXNativeTarget "LeaseProbeApp" */;
+			buildPhases = (
+				5A000000000000000000000B /* Sources */,
+				5A000000000000000000000C /* Frameworks */,
+				5A000000000000000000000D /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = LeaseProbeApp;
+			productName = LeaseProbeApp;
+			productReference = 5A0000000000000000000006 /* LeaseProbeApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+		5A0000000000000000000017 /* LeaseProbeUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 5A0000000000000000000023 /* Build configuration list for PBXNativeTarget "LeaseProbeUITests" */;
+			buildPhases = (
+				5A0000000000000000000018 /* Sources */,
+				5A0000000000000000000019 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				5A0000000000000000000020 /* PBXTargetDependency */,
+			);
+			name = LeaseProbeUITests;
+			productName = LeaseProbeUITests;
+			productReference = 5A0000000000000000000016 /* LeaseProbeUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		5A0000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					5A0000000000000000000005 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+					5A0000000000000000000017 = {
+						CreatedOnToolsVersion = 15.0;
+						TestTargetID = 5A0000000000000000000005;
+					};
+				};
+			};
+			buildConfigurationList = 5A000000000000000000000E /* Build configuration list for PBXProject "LeaseProbeApp" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 5A0000000000000000000002;
+			packageReferences = (
+				5A0000000000000000000024 /* XCLocalSwiftPackageReference "LeaseProbeKit" */,
+			);
+			productRefGroup = 5A0000000000000000000003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				5A0000000000000000000005 /* LeaseProbeApp */,
+				5A0000000000000000000017 /* LeaseProbeUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		5A000000000000000000000D /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		5A000000000000000000000B /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				5A0000000000000000000009 /* LeaseProbeApp.swift in Sources */,
+				5A000000000000000000000A /* ContentView.swift in Sources */,
+				5A0000000000000000000015 /* GestureProbeView.swift in Sources */,
+				5A0000000000000000000026 /* TapTimingView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		5A0000000000000000000018 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				5A000000000000000000001D /* GestureUITests.swift in Sources */,
+				5A000000000000000000001E /* SmokeUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		5A0000000000000000000020 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 5A0000000000000000000005 /* LeaseProbeApp */;
+			targetProxy = 5A000000000000000000001F /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		5A0000000000000000000010 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		5A0000000000000000000011 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		5A0000000000000000000012 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.firm.acceptance.LeaseProbeApp;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		5A0000000000000000000013 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.firm.acceptance.LeaseProbeApp;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		5A0000000000000000000021 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.firm.acceptance.LeaseProbeUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+				TEST_TARGET_NAME = LeaseProbeApp;
+			};
+			name = Debug;
+		};
+		5A0000000000000000000022 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.firm.acceptance.LeaseProbeUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+				TEST_TARGET_NAME = LeaseProbeApp;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		5A0000000000000000000024 /* XCLocalSwiftPackageReference "LeaseProbeKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = LeaseProbeKit;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCConfigurationList section */
+		5A000000000000000000000E /* Build configuration list for PBXProject "LeaseProbeApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				5A0000000000000000000010 /* Debug */,
+				5A0000000000000000000011 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		5A000000000000000000000F /* Build configuration list for PBXNativeTarget "LeaseProbeApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				5A0000000000000000000012 /* Debug */,
+				5A0000000000000000000013 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		5A0000000000000000000023 /* Build configuration list for PBXNativeTarget "LeaseProbeUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				5A0000000000000000000021 /* Debug */,
+				5A0000000000000000000022 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 5A0000000000000000000001 /* Project object */;
+}

@@ -1,0 +1,6 @@
+{
+  "advisory": "Working memory is filling. Consider saving progress and handing off before taking more work.",
+  "handoff_required": "Working memory is full. Do not claim new mail; save handoff notes and finish this work period.",
+  "drain": "The owner is pausing the firm. Save handoff notes and finish this work period. Further work waits for the owner’s restart.",
+  "saved": "Your notes are saved. End this work period."
+}

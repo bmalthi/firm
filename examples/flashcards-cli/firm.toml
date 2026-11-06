@@ -1,0 +1,12 @@
+max_active = 6
+founder_profile = "codex"
+
+[profiles.codex]
+provider = "codex"
+model = "gpt-6-luna"
+effort = "medium"
+accounts = ["codex-personal"]
+
+[accounts.codex-personal]
+provider = "codex"
+max_active = 6

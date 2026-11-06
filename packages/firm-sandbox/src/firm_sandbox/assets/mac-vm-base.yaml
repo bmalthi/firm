@@ -1,0 +1,32 @@
+# Pinned clean macOS base-image inputs for the Mac VM.
+# macOS 27.0 (26A428). The digest is Apple's own object metadata for this URL
+# (x-amz-meta-digest-sha256), matching the ipsw.me index for VirtualMac2,1.
+os: Darwin
+arch: aarch64
+vmType: vz
+cpus: 6
+memory: 12GiB
+# Disk size is not pinned here; the image recipe's disk_gib sets it (mac_image._load_config).
+images:
+- location: https://updates.cdn-apple.com/2026FallFCS/afcfc88e-bbe6-44bf-a5da-07c56eebc06c/UniversalMac_27.0_26A428_Restore.ipsw
+  arch: aarch64
+  digest: sha256:2a5d3c695d501022b7fad9adaffcf2627bcb867d993fb5662dcd41bac99a2836
+mounts: []
+plain: true
+video:
+  display: default
+audio:
+  device: none
+ssh:
+  loadDotSSHPubKeys: false
+  forwardAgent: false
+  forwardX11: false
+  forwardX11Trusted: false
+user:
+  name: firmvm
+  comment: Firm Mac VM control account
+  home: /Users/firmvm
+  shell: /bin/zsh
+propagateProxyEnv: false
+networks:
+- vzNAT: true

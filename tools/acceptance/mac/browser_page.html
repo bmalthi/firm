@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Firm helper browser test</title>
+<style>
+  body { font: 24px system-ui; margin: 60px; }
+  input, button { font: inherit; padding: 12px; }
+  p { color: #075; }
+</style>
+<h1>Firm helper browser test</h1>
+<label>Project name <input id="name" aria-label="Project name"></label>
+<button id="save">Save project</button>
+<p role="status" id="result">No project saved</p>
+<script>
+  document.getElementById('save').onclick = () => {
+    const result = 'Saved: ' + document.getElementById('name').value;
+    document.getElementById('result').textContent = result;
+    document.title = result;
+  };
+</script>

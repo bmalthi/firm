@@ -1,0 +1,123 @@
+gui/502/com.apple.managedcorespotlightd.00000000-0000-4000-8000-000000000002 = {
+	original = com.apple.managedcorespotlightd
+	active count = 4
+	path = /System/Library/LaunchAgents/com.apple.managedcorespotlightd.plist
+	type = LaunchAgent
+	state = running
+
+	program = /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/managedcorespotlightd
+	arguments = {
+		/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/managedcorespotlightd
+	}
+
+	inherited environment = {
+		SSH_AUTH_SOCK => /var/run/com.apple.launchd.Synthetic0/Listeners
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		LaunchInstanceID => 00000000-0000-4000-8000-000000000002
+		XPC_SERVICE_NAME => com.apple.managedcorespotlightd
+		MallocSpaceEfficient => 1
+		OSLogRateLimit => 64
+	}
+
+	domain = gui/502 [100002]
+	asid = 100002
+	minimum runtime = 10
+	base minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	pid = 2458
+	immediate reason = ipc (mach)
+	forks = 0
+	execs = 1
+	initialized = 1
+	trampolined = 1
+	started suspended = 0
+	proxy started suspended = 0
+	checked allocations = 0 (queried = 1)
+	checked allocations reason = no host
+	checked allocations flags = 0x0
+	last exit code = (never exited)
+
+	event triggers = {
+		com.apple.spotlight.textstore.Analytics => {
+			keepalive = 0
+			service = com.apple.managedcorespotlightd.00000000-0000-4000-8000-000000000002
+			stream = com.apple.xpc.activity
+			monitor = com.apple.UserEventAgent-Aqua
+			descriptor = {
+				"Repeating" => true
+				"_SequenceNumber" => 1
+				"GracePeriod" => 300
+				"Delay" => 3600
+			}
+		}
+	}
+
+	instance-specific endpoints = {
+		"com.apple.managedcorespotlightd" = {
+			port = 0xbd1cb
+			active = 1
+			managed = 1
+			reset = 0
+			hide = 0
+			watching = 0
+		}
+	}
+
+	event channels = {
+		"com.apple.bg.system.task" = {
+			port = 0xc140f
+			active = 1
+			managed = 1
+			reset = 0
+			hide = 0
+			watching = 0
+		}
+		"com.apple.xpc.activity" = {
+			port = 0xc132b
+			active = 1
+			managed = 1
+			reset = 0
+			hide = 0
+			watching = 0
+		}
+	}
+
+	resource coalition = {
+		ID = 1044
+		type = resource
+		state = active
+		active count = 1
+		name = com.apple.managedcorespotlightd.00000000-0000-4000-8000-000000000002
+	}
+
+	jetsam coalition = {
+		ID = 1045
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.apple.managedcorespotlightd.00000000-0000-4000-8000-000000000002
+	}
+
+	spawn type = adaptive (6)
+	jetsam priority = 40
+	jetsam memory limit (active, soft) = 40 MB
+	jetsam memory limit (inactive, hard) = 40 MB
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	resource limits = {
+		maxfiles (soft) => 1024
+		maxfiles (hard) => 1024
+	}
+
+	exponential throttling grace limit = 3
+
+	properties = supports transactions | supports pressured exit | inferred program | is copy | system service | exponential throttling | tle system
+}

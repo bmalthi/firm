@@ -1,0 +1,14 @@
+gui/502 = {
+	type = login
+	services = {
+		     474      - 	com.apple.syncdefaultsd
+		       0      - 	com.apple.DataDetectorsLocalSources
+		     449      - 	dev.firm.station-helper
+	}
+	endpoints = {
+		 0xb9303    M   D   com.apple.CoreSimulator.CoreSimulatorService
+	}
+	disabled services = {
+		"com.apple.Siri.agent" => disabled
+	}
+}

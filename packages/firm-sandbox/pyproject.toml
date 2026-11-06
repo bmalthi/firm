@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "firm-sandbox"
+version = "0.1.0"
+description = "Persistent role execution on a retained Linux VM for Firm, with a leased Mac station"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [{ name = "bmalthi" }]
+license-files = ["LICENSE", "NOTICE"]
+urls = { Documentation = "https://github.com/bmalthi/firm/tree/main/docs", Source = "https://github.com/bmalthi/firm" }
+dependencies = [
+    "pyyaml>=6,<7",
+]
+
+[project.scripts]
+firm-sandbox = "firm_sandbox.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/firm_sandbox"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: requires a dedicated VM and built image"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/pyproject.toml", "/README.md"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9,<10",
+    "ruff>=0.16,<1",
+]

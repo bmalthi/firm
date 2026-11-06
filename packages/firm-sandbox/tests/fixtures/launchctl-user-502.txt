@@ -1,0 +1,17 @@
+user/502 = {
+	type = user
+	services = {
+		     408      - 	com.apple.trustd.agent
+		       0     -9 	com.apple.CoreSimulator.CoreSimulatorService
+		       0      - 	com.apple.mdworker.shared
+		       0     -9 	com.apple.CoreSimulator.SimLaunchHost-arm64
+		       0   (pe) 	com.apple.filederivatived
+		    1099   (pe) 	com.apple.ndoagent
+	}
+	endpoints = {
+		 0xb9303    M   D   com.apple.CoreSimulator.CoreSimulatorService
+	}
+	disabled services = {
+		"com.apple.Siri.agent" => disabled
+	}
+}

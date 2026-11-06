@@ -1,0 +1,71 @@
+program path = /bin/sleep
+Could not print Mach info for pid 3409: 0x5
+argument count = 2
+argument vector = {
+	[0] = /bin/sleep
+	[1] = 300
+}
+environment vector = {
+}
+bsd proc info = {
+	pid = 3409
+	ppid = 1
+	pgid = 3403
+	status = stopped
+	xstatus = 0x00000000
+	flags = 64-bit
+	uid = 502
+	svuid = 502
+	ruid = 502
+	gid = 20
+	svgid = 20
+	rgid = 20
+	comm name = sleep
+	long name = sleep
+	controlling tty devnode = 0xffffffff
+	controlling tty pgid = 0
+	start date = 2026-01-01 00:00:00
+}
+unique identifier info = {
+	uuid = 00000000-0000-4000-8000-000000000003
+	id = 3409
+	parent id = 1
+	version = 8404
+	orig parent version = 8401
+}
+audit info
+	session id = 100002
+	uid = 502
+	success mask = 0x0
+	failure mask = 0x0
+	flags = has_graphic_access,has_tty,has_console_access
+sandboxed = no
+container = (no container)
+
+responsible pid = 525
+responsible unique pid = 525
+responsible path = /usr/libexec/sshd-keygen-wrapper
+
+pressured exit info = {
+	dirty state tracked = 0
+	dirty = 0
+	pressured-exit capable = 0
+}
+
+jetsam priority = 180
+jetsam memory limit = -1
+jetsam state = (normal memory state)
+
+entitlements = (no entitlements)
+
+code signing info = valid
+	refuse invalid pages
+	kill on invalid pages
+	restrict
+	require enforcement
+	allowed mach-o
+	platform dyld
+	platform binary
+
+(pid 3409 is not managed by launchd)
+

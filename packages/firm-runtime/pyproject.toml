@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "firm-runtime"
+version = "0.1.0"
+description = "Durable runtime core for self-organizing firms"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [{ name = "bmalthi" }]
+license-files = ["LICENSE", "NOTICE"]
+urls = { Documentation = "https://github.com/bmalthi/firm/tree/main/docs", Source = "https://github.com/bmalthi/firm" }
+dependencies = [
+    "mcp>=1.13,<2",
+    "firm-sandbox==0.1.0",
+    "uvicorn>=0.52,<1",
+    "pydantic>=2,<3",
+    "pyjwt[crypto]>=2.15,<3",
+    "markdown-it-py>=4.2,<5",
+    "anyio>=4.15,<5",
+    "starlette>=1.6,<2",
+    "cryptography>=50,<51",
+]
+
+[tool.uv.sources]
+firm-sandbox = { workspace = true }
+
+[project.scripts]
+firm = "firm_runtime.cli:main"
+firm-role-tools = "firm_runtime.mcp_server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/firm_runtime"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/pyproject.toml", "/README.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

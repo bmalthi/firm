@@ -1,0 +1,6 @@
+{
+  "invalid_continuation": "invalid discovery continuation: use a reference returned in this work period, or restart the lookup.",
+  "changed_view": "continuation no longer matches this discovery view; restart",
+  "message_budget": "${label} exceeds ${limit} UTF-8 bytes; select fewer messages",
+  "row_budget": "one conversation's row exceeds the peek limit; claim it by conversation, or use messages with an ID from an earlier peek"
+}

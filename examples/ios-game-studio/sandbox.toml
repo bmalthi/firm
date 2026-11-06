@@ -1,0 +1,14 @@
+# Template for a new run; this is not the historical machine configuration.
+# Set the firm ID and Mac image path before initialization.
+[firm]
+id = "ios-game-studio"
+cpus = 4
+memory_gib = 8
+disk_gib = 60
+
+[network]
+egress = "observe"
+allow_hosts = []
+
+[mac]
+image = "/absolute/path/to/your/mac-station-image"

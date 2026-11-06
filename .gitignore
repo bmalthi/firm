@@ -1,0 +1,22 @@
+.DS_Store
+/.venv
+/venv.nosync/
+/.pytest_cache/
+/.ruff_cache/
+/dist/
+**/__pycache__/
+*.egg-info/
+/.state/
+/firms/
+/images/.images/
+/packages/*/.venv/
+/packages/*/.pytest_cache/
+/packages/*/.ruff_cache/
+/packages/*/dist/
+
+# Personal agent settings. AGENTS.md, which both read, stays tracked.
+/.claude/
+/.codex/
+/CLAUDE.md
+/.cursor/
+/.agents/

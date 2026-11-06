@@ -1,0 +1,12 @@
+# Copy with mandate.md when creating a fresh space-station firm.
+# Set id to match the new firm ID before initialization.
+[firm]
+id = "space-station"
+cpus = 4
+memory_gib = 8
+disk_gib = 60
+
+[network]
+# Allow public-web access without per-host approval and log network activity.
+egress = "observe"
+allow_hosts = []

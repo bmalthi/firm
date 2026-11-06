@@ -1,0 +1,24 @@
+[tool.uv.workspace]
+members = ["packages/firm-runtime", "packages/firm-sandbox"]
+exclude = ["tools"]
+
+[tool.uv.sources]
+firm-runtime = { workspace = true }
+
+[dependency-groups]
+dev = ["firm-runtime", "pytest>=9,<10", "ruff>=0.16,<1"]
+
+[tool.pytest.ini_options]
+testpaths = ["packages/firm-runtime/tests", "packages/firm-sandbox/tests"]
+markers = [
+    "integration: requires a dedicated VM and built image",
+    "darwin: requires macOS filesystem or process facilities",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["packages/firm-runtime/src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

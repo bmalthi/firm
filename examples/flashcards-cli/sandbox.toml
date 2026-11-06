@@ -1,0 +1,10 @@
+# Set id to the new firm ID before initialization.
+[firm]
+id = "flashcards-cli"
+cpus = 4
+memory_gib = 8
+disk_gib = 60
+
+[network]
+egress = "observe"
+allow_hosts = []

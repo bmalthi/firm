@@ -1,0 +1,19 @@
+# Mac image recipe: what `mac-image-build`, `mac-image-apply` and `mac-image-seal` read.
+# See docs/mac-vm-images.md "Build an image".
+disk_gib = 192
+stations = 2
+
+[[application]]
+path = "/Applications/Xcode.app"
+
+# No version: the runtime this Xcode downloads by default, so it follows a new Xcode.
+[[simulator]]
+platform = "iOS"
+
+# A pinned older runtime, written as `simctl list runtimes` reports it.
+[[simulator]]
+platform = "iOS"
+version = "26.0"
+
+[[simulator]]
+platform = "watchOS"

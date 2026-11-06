@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Firm console</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="firm-identity"><span class="firm-mark" aria-hidden="true">F</span><div>
+        <strong id="firm-name">Connecting…</strong>
+        <div id="freshness" class="role-meta" role="status">Waiting for the first sample</div>
+      </div></div>
+      <details id="firm-menu" class="firm-menu">
+        <summary id="lifecycle-state">Firm: connecting…</summary>
+        <div class="firm-menu-items">
+          <p class="source-age" data-source="/api/control/status"></p>
+          <button id="stop-firm" data-mutation type="button">Stop after current work</button>
+          <button id="force-stop-firm" data-mutation type="button">Force stop now</button>
+          <button id="resume-firm" data-mutation type="button">Resume Firm</button>
+          <button id="close-firm" data-mutation type="button">Close Firm</button>
+        </div>
+      </details>
+    </header>
+    <div class="console-layout">
+      <nav id="destinations" aria-label="Console sections">
+        <a href="#overview" aria-current="page">Overview <span id="decision-count" class="count" hidden></span></a>
+        <a href="#inbox">Inbox <span id="mail-count" class="mail-count" hidden></span></a>
+        <a href="#results">Results</a>
+        <a href="#team">Team</a>
+        <a href="#system">System</a>
+      </nav>
+      <div class="page">
+        <div id="banner" class="notice error" role="alert" hidden></div>
+        <p id="notice" class="notice" role="status" hidden></p>
+        <p id="startup-error" class="notice error" role="alert" hidden></p>
+        <main id="main">
+          <div id="route-overview" class="route">
+            <section id="mandate" aria-labelledby="mandate-title">
+              <h1 id="mandate-title">Mandate</h1>
+              <p id="mandate-text">Loading the founder’s mandate…</p>
+              <details id="full-mandate" hidden><summary>Read the full mandate</summary><p class="message-body"></p></details>
+              <p id="mandate-age" class="source-age"></p>
+            </section>
+            <section id="overview-status" class="panel" aria-labelledby="status-title">
+              <h2 id="status-title">Connecting…</h2><p id="status-sentence"></p>
+              <button id="instruct-founder" type="button" hidden>Instruct the founder</button>
+              <dl id="facts" class="facts"></dl>
+              <p id="status-age" class="source-age"></p>
+            </section>
+            <div class="overview-columns">
+              <div class="overview-primary">
+                <section aria-labelledby="decisions-title"><h2 id="decisions-title">Needs your decision</h2><p id="decisions-age" class="source-age"></p><div id="decision-list"></div></section>
+                <section aria-labelledby="latest-results-title"><div class="panel-title"><h2 id="latest-results-title">Latest results</h2><a href="#results">All results</a></div><p class="source-age" data-source="/api/results"></p><div id="latest-results"></div></section>
+                <section aria-labelledby="mail-title"><div class="panel-title"><h2 id="mail-title">From the firm</h2><a href="#inbox">Open inbox</a></div><p id="owner-mail-age" class="source-age"></p><div id="owner-mail"></div></section>
+              </div>
+              <div class="overview-secondary">
+                <section class="panel" aria-labelledby="team-now-title"><h2 id="team-now-title">Team now</h2><p id="team-age" class="source-age"></p><ul id="team-now"></ul><a href="#team">Open team and roles</a></section>
+                <section id="overview-composer" class="panel" aria-labelledby="ask-title">
+          <form id="send-form" class="message-composer">
+            <h2 id="ask-title">Ask or instruct</h2>
+            <label class="new-message-field">To <select id="send-recipients" required></select></label>
+            <p id="send-address" class="role-meta"></p>
+            <label class="new-message-field">Subject <input id="send-subject" placeholder="Optional"></label>
+            <label>Message <textarea id="send-body" required rows="4"></textarea></label>
+            <p id="send-attachment" class="attachment-chip" hidden></p>
+            <div class="owner-controls"><button type="submit" data-mutation>Send message</button><button id="cancel-reply" type="button" hidden>Cancel</button><button id="new-message-draft" type="button" hidden>Start new draft (previous may have sent)</button></div><span id="send-status" class="role-meta" role="status"></span>
+          </form>
+                </section>
+              </div>
+            </div>
+          </div>
+          <div id="route-inbox" class="route" hidden>
+        <section class="inbox-page" aria-labelledby="messages-title">
+          <div class="panel-title"><h1 id="messages-title">Inbox</h1><button id="refresh" type="button">Refresh</button></div>
+          <div class="inbox-toolbar">
+            <div id="inbox-views" class="segmented" role="group" aria-label="Show mail">
+              <button type="button" data-view="new" aria-pressed="true">New</button><button type="button" data-view="all" aria-pressed="false">Everything</button><button type="button" data-view="done" aria-pressed="false">Done</button>
+            </div>
+            <label class="switch-label"><input id="include-role-mail" type="checkbox" role="switch">Include mail between roles</label>
+          </div>
+          <p id="inbox-age" class="source-age"></p>
+          <div id="messages" class="message-list"></div>
+          <div class="inbox-footer"><p id="inbox-count" class="role-meta"></p><button id="inbox-more" type="button" hidden>Load older messages</button></div>
+          <div id="inbox-composer" class="panel"></div>
+        </section>
+
+          </div>
+          <div id="route-results" class="route" hidden>
+      <header class="page-heading"><h1>Results</h1><p class="muted">Files from your firm</p></header>
+      <section id="result-reader" aria-labelledby="reader-title" hidden>
+        <div class="panel-title"><h2 id="reader-title"></h2><a class="button-link" href="#results">All results</a></div>
+        <div class="reader-columns">
+          <div class="reader-document">
+            <div id="reader-actions" class="file-actions"></div>
+            <p id="reader-isolation" class="role-meta"></p>
+            <iframe id="reader-frame" sandbox="" title="File preview"></iframe>
+            <p id="reader-unavailable" class="empty-state" hidden></p>
+          </div>
+          <aside class="reader-sidebar" aria-label="About and follow up">
+            <section class="panel"><h2>Ask about this file</h2><p class="role-meta">Reply in the conversation that delivered this file, with the file attached.</p><div id="reader-follow-up"></div><div id="results-composer"></div></section>
+            <section class="panel"><h2>About this file</h2><div id="reader-about"></div><p class="source-age" data-source="/api/results"></p></section>
+          </aside>
+        </div>
+      </section>
+      <section aria-labelledby="results-title"><h2 id="results-title">Files sent to you</h2><p class="source-age" data-source="/api/results"></p><div id="result-list"></div><p id="results-limit" class="role-meta"></p></section>
+      <section id="deliverables" class="panel folder-browser" aria-labelledby="folders-title">
+        <h2 id="folders-title">Browse folders</h2>
+        <div class="deliverables-toolbar"><label>Workspace <select id="file-root"></select></label><button id="browse-files" type="button">Browse</button><span id="file-status" class="role-meta"></span></div>
+        <nav id="file-breadcrumbs" aria-label="Folder"></nav>
+        <div id="file-list" class="file-list"></div>
+        <p class="source-age" data-source="/api/files/list"></p>
+      </section>
+      <dialog id="artifact-dialog" class="artifact-dialog" aria-labelledby="artifact-title">
+        <div class="artifact-toolbar"><strong id="artifact-title"></strong><button id="artifact-close" type="button">Close preview</button></div>
+        <iframe id="artifact-frame" sandbox="allow-scripts" title="Untrusted deliverable preview"></iframe>
+      </dialog>
+
+          </div>
+          <div id="route-team" class="route" hidden>
+        <header class="page-heading"><h1 id="roles-title">Team</h1><p class="muted">Who is working, what they are waiting for, and what each role is here to do.</p></header>
+        <section class="panel" aria-labelledby="roles-title">
+          <div class="panel-title"><h2>Roles</h2><span id="role-count" class="role-meta"></span></div>
+          <form id="role-search" class="search-row" role="search">
+            <input id="role-query" aria-label="Search roles" placeholder="Search roles and responsibilities" type="search">
+            <button type="submit">Search</button><button id="all-roles" type="button" hidden>All roles</button>
+          </form>
+          <div id="roles"></div>
+          <p id="team-view-age" class="source-age"></p>
+        </section>
+
+          </div>
+          <div id="route-system" class="route" hidden>
+            <header class="page-heading"><h1>System</h1><p class="muted">Health, access and capacity. The deeper records are here when you need them.</p></header>
+            <section class="panel"><h2>Health</h2><table class="health-table"><thead><tr><th scope="col">Fact</th><th scope="col">Now</th><th scope="col">Measured</th></tr></thead><tbody id="health-rows"></tbody></table><p id="system-age" class="source-age"></p></section>
+            <section class="panel"><h2>Web access</h2><div id="network-details"></div><p id="network-age" class="source-age"></p></section>
+            <section class="panel"><h2>Accounts and capacity</h2><p id="capacity-summary" class="role-meta"></p><p class="source-age" data-source="/api/snapshot"></p><div id="accounts" class="account-list"></div></section>
+      <details id="analysis" class="panel">
+        <summary>Diagnostics <span class="role-meta">Role activity, usage and communication</span></summary>
+        <form id="analysis-filters" class="analysis-filters">
+          <label>Window <select id="analysis-window"><option value="day">Latest 24 hours</option><option value="all">All time</option><option value="custom">Custom</option></select></label>
+          <label>Role <select id="analysis-role"><option value="">All roles</option></select></label>
+          <label class="analysis-custom" hidden>From (local time) <input id="analysis-from" type="datetime-local" step="1"></label>
+          <label class="analysis-custom" hidden>Until (local time) <input id="analysis-until" type="datetime-local" step="1"></label>
+          <button type="submit">Apply / refresh</button>
+        </form>
+        <p id="analysis-status" role="status" class="role-meta">Open Diagnostics to load recorded observations.</p>
+        <nav id="analysis-tabs" class="analysis-tabs" aria-label="Diagnostic views">
+          <button type="button" data-section="timeline" aria-pressed="true">Activity</button>
+          <button type="button" data-section="usage" aria-pressed="false">Usage</button>
+          <button type="button" data-section="conversations" aria-pressed="false">Messaging</button>
+          <button type="button" data-section="readiness" aria-pressed="false">Readiness</button>
+          <button type="button" data-section="mac" aria-pressed="false" hidden>Mac</button>
+          <button type="button" data-section="resources" aria-pressed="false">Resources</button>
+        </nav>
+        <label id="analysis-view-options" hidden>Group usage by <select id="analysis-breakdown"><option value="role">Role</option><option value="model">Model</option><option value="session">Conversation</option><option value="workload">Work type</option><option value="tool">Tool</option></select></label>
+        <p id="analysis-description" class="role-meta"></p>
+        <div id="analysis-content" class="analysis-content"></div>
+        <button id="analysis-more" type="button" hidden>Load more</button>
+      </details>
+      <details id="history" class="panel">
+        <summary>History <span class="role-meta">Decisions, incidents and past work</span></summary>
+        <p class="source-age" data-source="/api/snapshot"></p>
+        <details class="history-section"><summary>Decisions</summary><p class="source-age" data-source="/api/requests"></p><div id="decision-history"></div></details>
+        <details class="history-section"><summary>Incidents</summary><p class="source-age" data-source="/api/incidents"></p><div id="incident-history"></div></details>
+        <details class="history-section"><summary>Stops and drains</summary><div id="drain-history"></div></details>
+        <details class="history-section"><summary>Failed work periods</summary><div id="failure-history"></div></details>
+        <details class="history-section"><summary>GitHub</summary><div id="github-history"></div></details>
+        <details class="history-section"><summary>Model sessions</summary><div id="session-history"></div></details>
+      </details>
+      <section class="panel"><h2>Firm controls</h2><p class="role-meta">These actions are in the Firm menu on every page.</p><div id="firm-actions"></div></section>
+
+          </div>
+        </main>
+        <footer><span id="sampled-at">Not sampled</span><span>Updates every 3 seconds</span></footer>
+      </div>
+    </div>
+    <dialog id="control-dialog" aria-labelledby="control-title">
+      <form id="control-form">
+        <h2 id="control-title"></h2><p id="control-description"></p>
+        <div class="owner-controls"><button id="confirm-control" type="submit" data-mutation>Confirm</button><button id="cancel-control" type="button">Cancel</button></div>
+      </form>
+    </dialog>
+    <script type="module" src="/app.js"></script>
+    <script type="module" src="/analysis.js"></script>
+  </body>
+</html>

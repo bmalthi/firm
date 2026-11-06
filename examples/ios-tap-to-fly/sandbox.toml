@@ -1,0 +1,15 @@
+# Copy with mandate.md when creating a fresh ios-tap-to-fly-v1 firm.
+# Set id to match the new firm ID before initialization.
+[firm]
+id = "ios-tap-to-fly-v1"
+cpus = 4
+memory_gib = 8
+disk_gib = 60
+
+[network]
+# Allow public-web access without per-host approval and log network activity.
+egress = "observe"
+allow_hosts = []
+
+[mac]
+image = "/example-home/Documents/projects/firm/images/.images/station-macos27-stations2-2"
