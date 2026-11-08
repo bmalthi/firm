@@ -119,14 +119,16 @@ def _write_new_file(path: Path, content: str) -> None:
 
 def generated_files(directory: Path, provider: str, mandate: str) -> dict[Path, str]:
     """Return the ordinary files consumed by existing init/check/start paths."""
-    if provider not in {"codex", "claude"}:
-        raise FirmError("choose Codex or Claude")
+    if provider not in {"codex", "claude", "agy"}:
+        raise FirmError("choose Codex, Claude or experimental AGY")
     if not isinstance(mandate, str) or not mandate.strip():
         raise FirmError("the first task must not be empty")
     firm_id = Path(directory).name.lower()
     account = f"{provider}-personal"
     if provider == "codex":
         model, effort = "gpt-6-luna", "low"
+    elif provider == "agy":
+        model, effort = "gemini-3.8-flash", "medium"
     else:
         model, effort = "sonnet", "medium"
     firm_toml = (
@@ -213,7 +215,14 @@ def _private_credential_exists(path: Path) -> bool:
 
 
 def _provider_command(provider: str) -> tuple[list[str], str]:
-    executable = "codex" if provider == "codex" else "claude"
+    if provider == "agy":
+        from .agy_auth import native_command
+
+        executable = native_command()
+        return [executable], executable
+    if provider not in {"codex", "claude"}:
+        raise FirmError("unsupported login provider")
+    executable = provider
     found = shutil.which(executable)
     if found:
         return [found], found
@@ -299,6 +308,9 @@ def login_provider(
     owner-private save fails. This lets the owner resume without losing a completed
     login, while a successful save removes the temporary copy.
     """
+    if provider == "agy":
+        return _login_agy(account, target_credentials_path=target_credentials_path,
+                          force_login=force_login)
     if provider not in {"codex", "claude"}:
         raise FirmError("choose Codex or Claude")
     if state_directory is None:
@@ -435,4 +447,61 @@ def login_provider(
             temp_root.parent.rmdir()
     else:
         shutil.rmtree(temp_root)
+    return target
+
+
+def _login_agy(account, *, target_credentials_path=None, force_login=False):
+    """Retain the host-owned native profile for subsequent native renewal."""
+    from .agy_auth import environment, host_argv, prepare_profile
+    from .provider_support import read_private_credential
+
+    target = (credentials_path(account, "agy") if target_credentials_path is None
+              else Path(target_credentials_path).expanduser())
+    home = prepare_profile(target)
+    store = CredentialStore("agy", target)
+    command, _ = _provider_command("agy")
+    print(
+        "Experimental AGY uses your subscription login in a dedicated host profile. "
+        "Credit overages are disabled. Quota and context telemetry are unavailable; "
+        "Workspace instructions can be read and implicit native tools are not fully isolated.",
+        file=sys.stderr,
+    )
+    if not force_login and _private_credential_exists(target):
+        from .credential_store import guest_credentials
+
+        guest_credentials("agy", read_private_credential(target, "AGY"))
+        return target
+    # Native login state may be needed by models; retain the whole dedicated profile.
+    # Like other providers, interactive login never holds the renewal lock.
+    process = None
+    try:
+        process = subprocess.Popen(
+            host_argv(
+                ["acp", "--login", "--include-default-customizations=false"],
+                executable=command[0],
+            ),
+            env=environment(home), cwd=home, umask=0o077,
+        )
+        returncode = process.wait()
+    except OSError:
+        raise FirmError(f"could not start AGY login; profile retained at {home}") from None
+    except BaseException:
+        if process is not None:
+            _stop_child(process)
+        raise
+    finally:
+        prepare_profile(target)
+    if returncode != 0:
+        raise FirmError(
+            f"AGY login exited with status {returncode}; profile retained at {home}. "
+            "Rerun firm login to retry sign-in in this profile."
+        )
+    try:
+        # Validate and atomically save the token, preserving all other native state.
+        store.save(read_private_credential(target, "AGY"))
+    except (OSError, ProviderSetupError) as exc:
+        raise FirmError(
+            f"AGY credentials could not be saved ({getattr(exc, 'code', 'io')}); "
+            f"profile retained at {home}. Rerun firm login to retry sign-in."
+        ) from None
     return target

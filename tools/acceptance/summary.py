@@ -9,6 +9,8 @@ and the guest's provider output, never credentials.
 
 import argparse
 import json
+import os
+import sys
 import time
 import tomllib
 import uuid
@@ -22,6 +24,14 @@ from firm_runtime.sandbox_dispatcher import SandboxDispatcher
 from firm_runtime.store import OWNER, Store
 from firm_sandbox import Config, Sandbox
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from provider_checks.acceptance_common import (  # noqa: E402
+    PROVIDERS,
+    agy_output_evidence,
+    capture_agy_launches,
+    selected_profile,
+)
+
 MANDATE = "Validate isolated summary and hiring-level turns. Do no other work."
 HIRE_MANDATE = (
     "Reconcile the firm's monthly supplier invoices against purchase orders and report "
@@ -33,17 +43,24 @@ MESSAGE = (
 )
 
 
-def main():
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True, help="Firm containing sandbox.toml")
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--provider-config", type=Path, required=True)
     parser.add_argument("--profile", required=True)
+    parser.add_argument("--provider", choices=PROVIDERS, help="Require this profile provider")
+    return parser
+
+
+def main():
+    parser = argument_parser()
     args = parser.parse_args()
     source = tomllib.loads(args.provider_config.read_text())
-    profile = dict(source["profiles"][args.profile])
-    profile.pop("alternates", None)
-    accounts = {name: source["accounts"][name] for name in profile["accounts"]}
+    try:
+        profile, accounts = selected_profile(source, args.profile, args.provider)
+    except ValueError as exc:
+        parser.error(str(exc))
     config = {
         "max_active": 2,
         "founder_profile": args.profile,
@@ -55,10 +72,14 @@ def main():
         },
         "profiles": {args.profile: profile},
         "accounts": accounts,
+        "summary": {profile["provider"]: source.get("summary", {}).get(profile["provider"], {})},
     }
     sandbox_config = args.root / "sandbox.toml"
+    os.umask(0o077)
     args.evidence.mkdir(mode=0o700, parents=True, exist_ok=False)
     box = Sandbox(Config.load(sandbox_config))
+    launches = capture_agy_launches(box, args.evidence)
+    outputs = {}
     # This check builds its own runtime database under --evidence, and a file
     # server may only ever serve one. A firm that has already run rejects it.
     if box.file_server.database_identity() is not None:
@@ -78,6 +99,19 @@ def main():
     follow = box.follow
 
     def capture_follow(run):
+        if profile["provider"] == "agy":
+            logs = bytearray()
+            try:
+                for chunk in follow(run):
+                    logs.extend(chunk)
+                    yield chunk
+            finally:
+                receipt = agy_output_evidence(
+                    bytes(logs), expected_model=launches.get(run.run_id, {}).get("native_model"))
+                outputs[run.run_id] = receipt
+                (args.evidence / f"{run.run_id}.output.json").write_text(
+                    json.dumps(receipt, indent=2))
+            return
         with (args.evidence / f"{run.run_id}.log").open("ab") as output:
             for chunk in follow(run):
                 output.write(chunk)
@@ -152,6 +186,14 @@ def main():
                     },
                     "runs": runs,
                 }
+                if profile["provider"] == "agy":
+                    result["summary"].pop("text", None)
+                    result["launches"], result["outputs"] = launches, outputs
+                    result["passed"] = result["passed"] and len(launches) == 2 and all(
+                        launch["passed"] and key in outputs and outputs[key]["success"]
+                        and outputs[key]["model_matches"] and outputs[key]["tool_steps"] == 0
+                        for key, launch in launches.items()
+                    )
                 (args.evidence / "result.json").write_text(json.dumps(result, indent=2))
                 dispatcher.stop()
                 while runtime.status()["state"] != "stopped":
@@ -165,10 +207,7 @@ def main():
                 if run["state"] != "summarized":
                     print(
                         f"{run['kind']} run {run['run_id']} was {run['state']} "
-                        f"({run['reason']}); guest output is in "
-                        f"{args.evidence / (run['run_id'] + '.log')}, or read it with:\n"
-                        f"  uv run firm-sandbox --config {sandbox_config} "
-                        f"logs s-{run['run_id'][-32:]}"
+                        f"({run['reason']}); evidence is in {args.evidence}"
                     )
             raise SystemExit(1)
     finally:

@@ -9,7 +9,8 @@ import pytest
 REPOSITORY = Path(__file__).resolve().parents[3]
 ACCEPTANCE = REPOSITORY / "tools" / "acceptance"
 ENTRYPOINTS = sorted(
-    path for path in ACCEPTANCE.rglob("*.py") if path.name != "acceptance_common.py"
+    path for path in ACCEPTANCE.rglob("*.py")
+    if path.name not in {"acceptance_common.py", "agy_protocol.py"}
 )
 
 

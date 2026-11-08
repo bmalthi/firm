@@ -40,6 +40,17 @@ class CredentialMirror:
             # Explicit long-lived tokens have no renewal credential.
             os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = snapshot["data"]
             return
+        if snapshot["kind"] == "agy-access":
+            # Separate native file delivery, never Claude's environment token path.
+            document = snapshot["data"]
+            token = document.get("token", {})
+            if (set(document) != {"auth_method", "token"}
+                    or set(token) - {"access_token", "token_type", "expiry", "expires_in",
+                                     "refresh_token"}
+                    or token.get("refresh_token") != ""):
+                raise ValueError("Invalid AGY access projection")
+        elif snapshot["kind"] not in {"codex-json", "credentials-json"}:
+            raise ValueError("Unsupported credential kind")
         raw = json.dumps(snapshot["data"]).encode()
         if self.path.exists() and self.path.read_bytes() == raw:
             return

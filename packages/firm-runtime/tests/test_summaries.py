@@ -668,3 +668,25 @@ def test_failed_summary_retirement_retries_until_success():
             thread.join(5)
             assert not thread.is_alive()
     assert attempts == [run.role_id, run.role_id]
+
+
+@pytest.mark.parametrize("kind", ["staffing", "summary"])
+def test_agy_thinking_keeps_answer_and_raw_usage(kind):
+    from test_agy_provider import encode, stream
+
+    from firm_runtime.agy_provider import parse_summary
+
+    class Provider:
+        def summarize(self, prompt, *, timeout):
+            return parse_summary(
+                encode(stream(usage={"output_tokens": 2294, "thinking_tokens": 2241})), 0
+            )
+
+    result = SummaryService(FunctionRunner(Provider())).run_isolated(
+        "Synthetic choice", kind=kind
+    )
+    assert result["status"] == "completed"
+    assert result["text"] == "FIRM_OK"
+    assert result["output_tokens"] == 2294
+    assert result["usage"]["output_tokens"] == 2294
+    assert result["usage"]["reasoning_output_tokens"] == 2241

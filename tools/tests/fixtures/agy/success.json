@@ -1,0 +1,23 @@
+{
+  "fixture_kind": "synthetic",
+  "events": [
+    {
+      "event": "init",
+      "conversation_id": "synthetic-conversation",
+      "init": {}
+    },
+    {
+      "event": "result",
+      "result": {
+        "conversation_id": "synthetic-conversation",
+        "status": "SUCCESS",
+        "response": "FIRM_OK"
+      }
+    }
+  ],
+  "exit_code": 0,
+  "expected": {
+    "success": true,
+    "protocol_complete": true
+  }
+}

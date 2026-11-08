@@ -64,14 +64,17 @@ def _ask(prompt: str, *, input_fn=None) -> str:
 
 
 def _choose_provider(*, input_fn=None) -> str:
-    print("Choose the model provider for this firm:\n  1) Codex\n  2) Claude Code", file=sys.stderr)
+    print("Choose the model provider for this firm:\n  1) Codex\n  2) Claude Code"
+          "\n  3) AGY (experimental subscription)", file=sys.stderr)
     while True:
-        choice = _ask("Provider [1/2]: ", input_fn=input_fn)
+        choice = _ask("Provider [1/2/3]: ", input_fn=input_fn)
         if choice in {"1", "codex", "Codex", "CODEx"}:
             return "codex"
         if choice in {"2", "claude", "Claude", "Claude Code", "claude code"}:
             return "claude"
-        print("Enter 1 for Codex or 2 for Claude Code.", file=sys.stderr)
+        if choice.lower() in {"3", "agy"}:
+            return "agy"
+        print("Enter 1 for Codex, 2 for Claude Code or 3 for experimental AGY.", file=sys.stderr)
 
 
 def _choose_task(*, input_fn=None) -> tuple[str, str]:
@@ -128,7 +131,8 @@ def _show_check(report: dict) -> bool:
 
 
 def _announce_first_run(provider: str, *, directory: Path | None = None) -> None:
-    model = "gpt-6-luna" if provider == "codex" else "Claude Sonnet"
+    model = {"codex": "gpt-6-luna", "claude": "Claude Sonnet",
+             "agy": "Gemini 3.8 Flash (experimental)"}[provider]
     allocation = "8 GiB of RAM and a 60 GiB maximum virtual disk"
     if directory is not None and (directory / "sandbox.toml").is_file():
         try:
@@ -144,6 +148,10 @@ def _announce_first_run(provider: str, *, directory: Path | None = None) -> None
         " If your account or workspace does not offer it, change profiles.codex.model in "
         "firm.toml and apply it with `firm configure DIRECTORY --config DIRECTORY/firm.toml`."
         if provider == "codex"
+        else " Experimental AGY uses subscription login; credit overages are disabled. "
+        "Quota and context are unavailable. Workspace instructions can be read; "
+        "implicit native tools are not fully isolated."
+        if provider == "agy"
         else " Claude Code sign-in uses its one-year setup token, saved owner-only for this firm."
     )
     print(
@@ -564,7 +572,11 @@ def main(argv=None):
         help="Store credentials read from stdin as the account's default private auth_file",
     )
     save.add_argument("account")
-    save.add_argument("--provider", choices=("claude", "codex"), required=True)
+    save.add_argument("--provider", choices=("claude", "codex", "agy"), required=True)
+    login = commands.add_parser("login", help="Sign in using an isolated provider profile")
+    login.add_argument("account")
+    login.add_argument("--provider", choices=("claude", "codex", "agy"), required=True)
+    login.add_argument("--auth-file", type=Path, help="Configured account auth_file")
     listing = commands.add_parser(
         "list", help="List firms under a firms directory with state and durable size"
     )
@@ -608,11 +620,15 @@ def main(argv=None):
             return
         elif args.command == "start" and args.data_dir is not None:
             raise FirmError("--data-dir is only used by guided `firm start` without a directory")
+        elif args.command == "login":
+            path = login_provider(args.provider, args.account,
+                                  target_credentials_path=args.auth_file, force_login=True)
+            result = {"account": args.account, "provider": args.provider, "auth_file": str(path)}
         elif args.command == "save-credentials":
             from .accounts import credentials_path
             from .credential_store import CredentialStore
 
-            path = credentials_path(args.account)
+            path = credentials_path(args.account, args.provider)
             if sys.stdin.isatty():
                 print("Paste the credentials, then press Ctrl-D.", file=sys.stderr)
             try:

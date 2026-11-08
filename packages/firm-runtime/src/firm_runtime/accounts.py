@@ -19,6 +19,7 @@ CREDENTIALS_DIR = Path("~/.config/firm-runtime/credentials")
 ACCOUNT_NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 SUMMARY_DEFAULTS = {
+    "agy": {"model": "gemini-3.8-flash", "effort": "medium"},
     "codex": {"model": "gpt-6-luna", "effort": "medium"},
     "claude": {"model": "sonnet", "effort": "medium"},
 }
@@ -26,6 +27,7 @@ SUMMARY_DEFAULTS = {
 SUBSCRIPTION_READING_FRESH_SECONDS = 5 * 60
 
 TASK_DEFAULTS = {
+    "agy": {"model": "gemini-3.8-flash", "effort": "high"},
     "max_concurrent": 2,
     "timeout_seconds": 600,
     "max_instruction_bytes": 16384,
@@ -125,9 +127,13 @@ def _positive(value, label):
         raise FirmError(f"{label} must be a positive finite number")
 
 
-def credentials_path(account):
+def credentials_path(account, provider=None):
     if not isinstance(account, str) or ACCOUNT_NAME.fullmatch(account) is None:
         raise FirmError("account names must use letters, digits, '-' and '_'")
+    if provider == "agy":
+        from .agy_auth import TOKEN_PATH
+
+        return CREDENTIALS_DIR.expanduser() / f"{account}-agy" / "home" / TOKEN_PATH
     return CREDENTIALS_DIR.expanduser() / f"{account}.json"
 
 
@@ -137,7 +143,7 @@ def validate_accounts(config):
     summary = config.get("summary")
     if summary is not None:
         if not isinstance(summary, dict) or set(summary) - set(SUMMARY_DEFAULTS):
-            raise FirmError("summary must contain only codex and claude settings")
+            raise FirmError("summary must contain only codex, claude and agy settings")
         for provider, defaults in SUMMARY_DEFAULTS.items():
             setting = summary.get(provider, defaults)
             if not isinstance(setting, dict) or set(setting) - set(defaults):
@@ -150,6 +156,12 @@ def validate_accounts(config):
     if "accounts" not in config:
         return
     accounts, profiles = config["accounts"], config["profiles"]
+    if config.get("google_cloud") and any(
+        isinstance(item, dict) and item.get("provider") == "agy"
+        for collection in (accounts, profiles) if isinstance(collection, dict)
+        for item in collection.values()
+    ):
+        raise FirmError("AGY subscription inference cannot coexist with [google_cloud]")
     if not isinstance(accounts, dict) or not accounts:
         raise FirmError("accounts must be a nonempty mapping")
     for name, account in accounts.items():
@@ -162,10 +174,10 @@ def validate_accounts(config):
         }:
             raise FirmError(f"unknown account setting for {name}")
         provider = account.get("provider")
-        if not isinstance(provider, str) or provider not in ("codex", "claude"):
+        if not isinstance(provider, str) or provider not in ("codex", "claude", "agy"):
             raise FirmError(f"invalid account provider for {name}")
         if "auth_file" not in account:
-            account["auth_file"] = str(credentials_path(name))
+            account["auth_file"] = str(credentials_path(name, provider))
         auth = account["auth_file"]
         try:
             auth_path = Path(auth).expanduser() if isinstance(auth, str) else None
@@ -204,7 +216,7 @@ def validate_accounts(config):
         }:
             raise FirmError(f"unsupported execution setting in {name}")
         provider = profile.get("provider")
-        if not isinstance(provider, str) or provider not in ("codex", "claude"):
+        if not isinstance(provider, str) or provider not in ("codex", "claude", "agy"):
             raise FirmError(f"invalid profile provider for {name}")
         if not isinstance(profile.get("model"), str) or not profile["model"].strip():
             raise FirmError(f"profile {name} requires a model")

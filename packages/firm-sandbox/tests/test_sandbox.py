@@ -805,6 +805,7 @@ def test_configured_hosts_are_reported_once_by_their_first_source(tmp_path, monk
     box._file_server = FakeFiles()
     box.set_allowed_hosts(["docs.example", "granted.example"])
     rows = box.allowed_hosts()
+    assert not any(row["host"] == "storage.googleapis.com" for row in rows)
     assert [row for row in rows if row["host"] in {"github.com", "docs.example",
                                                    "granted.example"}] == [
         {"host": "github.com", "source": "baseline"},

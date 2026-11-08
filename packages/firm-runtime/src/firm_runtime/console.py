@@ -295,10 +295,12 @@ def build_console_app(
                 account_id = account["account_id"]
                 auth_file = Path(configured_accounts[account_id]["auth_file"]).expanduser()
                 account["auth_file"] = str(auth_file)
-                account["default_auth_file"] = auth_file == credentials_path(account_id)
+                account["default_auth_file"] = auth_file == credentials_path(
+                    account_id, account["provider"]
+                )
                 # Admission is the durable evidence, even if work finishes between polls.
                 account["last_started_at"] = last_started.get(account_id)
-                if account["provider"] in {"claude", "codex"}:
+                if account["provider"] in {"claude", "codex", "agy"}:
                     account["subscription_quota"] = quota_observer.snapshot(
                         account["account_id"],
                         runtime.accounts.subscription_reading(db, account["account_id"]),
@@ -1117,6 +1119,16 @@ def build_console_app(
                     ids,
                 )
             }
+            native_models = {
+                row["session_id"]: row["resolved_model"]
+                for row in db.execute(
+                    "SELECT u.session_id,u.resolved_model FROM activation_usage u "
+                    "JOIN roles r ON r.session_id=u.session_id "
+                    f"WHERE r.employee_id IN ({placeholders}) AND u.resolved_model IS NOT NULL "
+                    "ORDER BY u.observed_at,u.rowid",
+                    ids,
+                )
+            }
             contexts = {
                 row["session_id"]: dict(row)
                 for row in db.execute(
@@ -1162,6 +1174,8 @@ def build_console_app(
                 "context_advisory_fraction": context["advisory_fraction"] if context else fraction,
                 "handoff_reserve": context["handoff_reserve"] if context else reserve,
             }
+            if execution["provider"] == "agy":
+                execution["resolved_model"] = native_models.get(row["session_id"])
             enriched.append(
                 {
                     **role,

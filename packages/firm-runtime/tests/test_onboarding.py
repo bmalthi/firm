@@ -25,7 +25,7 @@ def test_data_directory_and_derived_firm_names_are_stable_and_unique(tmp_path, m
     assert second.name == "2026-10-28_make-a-weekly-planner_2"
 
 
-@pytest.mark.parametrize("provider", ["codex", "claude"])
+@pytest.mark.parametrize("provider", ["codex", "claude", "agy"])
 def test_generated_files_validate_and_are_owner_only_without_overwrite(tmp_path, provider):
     firm = tmp_path / "2026-10-28_my-task"
     onboarding.create_firm_files(firm, provider, "Do the user's own task.\n")
@@ -355,3 +355,15 @@ def test_forced_provider_login_uses_configured_destination_and_ignores_cached_lo
     assert saved == target
     assert json.loads(target.read_text())["tokens"]["access_token"] == "new"
     assert not state.exists()
+
+
+def test_agy_selection_discloses_experimental_subscription_limits(tmp_path, capsys):
+    from firm_runtime.cli import _announce_first_run, _choose_provider
+
+    assert _choose_provider(input_fn=lambda _: "3") == "agy"
+    _announce_first_run("agy", directory=tmp_path)
+    text = capsys.readouterr().err
+    assert "experimental" in text.lower()
+    assert "subscription" in text and "overages are disabled" in text
+    assert "Quota and context are unavailable" in text
+    assert "implicit native tools are not fully isolated" in text

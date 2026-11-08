@@ -88,11 +88,12 @@ export function createSystem({$, api, element, number, time, sourceText, technic
         }
         card.append(windows);
         let detail = "";
-        if (quota.state === "awaiting_stream") detail = "Subscription allowance appears after a Claude role runs.";
+        if (quota.state === "unsupported") detail = "Subscription quota and context unavailable for experimental AGY.";
+        else if (quota.state === "awaiting_stream") detail = "Subscription allowance appears after a Claude role runs.";
         else if (!quota.observed_at) detail = quota.state === "loading" ? "Checking subscription allowance…" : "Subscription allowance unavailable; will retry.";
         else if (quota.state === "stale" || quota.error) detail = `Stale quota reading · observed ${time(quota.observed_at)}${quota.checked_at ? ` · checked ${time(quota.checked_at)}` : ""}${quota.error ? " · latest refresh unavailable" : ""}`;
         if (detail) card.append(element("p", "quota-detail", detail));
-        card.append(technicalDetails(`Quota observed ${time(quota.observed_at)}${quota.polled ? ` · checked ${time(quota.checked_at)} · refreshes every 5 minutes` : " · updates while Claude roles run"}`));
+        if (quota.state !== "unsupported") card.append(technicalDetails(`Quota observed ${time(quota.observed_at)}${quota.polled ? ` · checked ${time(quota.checked_at)} · refreshes every 5 minutes` : " · updates while Claude roles run"}`));
       } else card.append(element("p", "quota-detail", account.headroom === "known"
         ? `${Math.round(account.remaining_fraction * 100)}% allowance remaining (last supplied reading)`
         : "Remaining allowance unavailable · no fresh quota reading. Work remains eligible unless blocked."));

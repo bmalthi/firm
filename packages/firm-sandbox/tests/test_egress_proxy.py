@@ -18,6 +18,7 @@ import pytest
 from firm_sandbox.egress_proxy import (
     BASELINE_HOSTS,
     PROVISION,
+    PROVISION_HOSTS,
     EgressProxy,
     RequestLog,
     Summary,
@@ -32,6 +33,7 @@ PUBLIC = "93.184.216.34"
 NAMES = {
     "api.anthropic.com": [PUBLIC],
     "pypi.org": [PUBLIC],
+    "storage.googleapis.com": [PUBLIC],
     "a.b.example.com": [PUBLIC],
     "example.com": [PUBLIC],
     "unlisted.example": [PUBLIC],
@@ -273,6 +275,50 @@ def test_uv_installer_redirect_host_is_allowed_without_wildcarding_astral():
     assert permitted("releases.astral.sh", BASELINE_HOSTS)
     assert not permitted("download.releases.astral.sh", BASELINE_HOSTS)
     assert not permitted("releases.astral.sh.attacker.example", BASELINE_HOSTS)
+
+
+def test_agy_hosts_are_exact_and_do_not_include_host_renewal_or_optional_services():
+    for host in ("www.googleapis.com", "daily-cloudcode-pa.googleapis.com"):
+        assert permitted(host, BASELINE_HOSTS)
+        assert not permitted("subdomain." + host, BASELINE_HOSTS)
+        assert not permitted(host + ".attacker.example", BASELINE_HOSTS)
+    for host in ("oauth2.googleapis.com", "accounts.google.com", "play.googleapis.com",
+                 "aicode.googleapis.com",
+                 "lh3.googleusercontent.com", "generativelanguage.googleapis.com",
+                 "antigravity-cli-auto-updater-974169037036.us-central1.run.app"):
+        assert not permitted(host, BASELINE_HOSTS)
+
+
+def test_setup_hosts_require_live_provision_identity(start, tmp_path):
+    provisioning = [True]
+    proxy = start(provisioning=lambda: provisioning[0])
+    host = "storage.googleapis.com"
+    assert PROVISION_HOSTS == (host,)
+    assert not permitted(host, BASELINE_HOSTS)
+    assert tunnel(proxy, host, PROVISION).startswith(b"HTTP/1.1 200")
+    assert tunnel(proxy, host, "analyst").startswith(b"HTTP/1.1 403")
+    provisioning[0] = False
+    assert tunnel(proxy, host, PROVISION).startswith(b"HTTP/1.1 407")
+    assert not proxy.listed(host, PROVISION)
+    assert [(r["role"], r["listed"], r["reason"]) for r in records(tmp_path, 3)] == [
+        (PROVISION, True, None), ("analyst", False, "not_allowed"),
+        ("unknown", False, "credentials"),
+    ]
+    for baseline in BASELINE_HOSTS:
+        assert proxy.listed(baseline.replace("*.", "test."), "analyst")
+
+
+def test_setup_host_owner_grants_and_observe_mode_are_unchanged(start):
+    host = "storage.googleapis.com"
+    proxy = start()
+    proxy.set_granted((host,))
+    assert tunnel(proxy, host, "analyst").startswith(b"HTTP/1.1 200")
+    proxy.set_granted(())
+    assert tunnel(proxy, host, "analyst").startswith(b"HTTP/1.1 403")
+    observed = start(mode="observe")
+    assert not observed.listed(host, "analyst")
+    assert tunnel(observed, host, "analyst").startswith(b"HTTP/1.1 200")
+    assert tunnel(observed, host, PROVISION).startswith(b"HTTP/1.1 407")
 
 
 def test_connect_to_an_allowed_name_tunnels_and_is_logged_and_summarized(start, tmp_path):
@@ -550,7 +596,7 @@ def test_a_grant_gone_while_the_client_hello_arrives_is_refused_before_forwardin
     # Allowed when the CONNECT is decided, gone by the time its hello has been read: the
     # change lands between the two checks, where no revocation could reach the relay.
     answers = iter([True, False])
-    proxy.allowed = lambda host: next(answers)
+    proxy.allowed = lambda host, identity=None: next(answers)
     answer = tunnel(proxy, "unlisted.example")
     assert answer == b"HTTP/1.1 200 Connection established\r\n\r\n"
     (record,) = records(tmp_path)

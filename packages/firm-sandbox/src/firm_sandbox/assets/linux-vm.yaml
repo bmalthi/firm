@@ -55,6 +55,12 @@ provision:
       NODE_VERSION=24.21.0
       CLAUDE_CODE_VERSION=2.1.281
       CODEX_VERSION=0.165.0
+      AGY_VERSION=1.5.3
+      AGY_URL=https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.3-6604829099950080/linux-arm/cli_linux_arm64.tar.gz
+      # Vendor SHA-512 from the linux_arm64 (glibc) manifest, resolved at release time:
+      # https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_arm64.json
+      AGY_SHA512=c2fac818b3c1bb224079df03a714ccba99728b6a3a41d86d247ab2feb8582a43840c5032f1c2b75e72667623d5503e7ffda2712c4f37b6ee19f99c3fcfb25bae
+      export AGY_CLI_DISABLE_AUTO_UPDATE=true
       # This script runs on every boot. Each step is skipped once its result is
       # already on the disk, so a restart needs no apt or npm registry: a stall
       # there otherwise outlives the VM's readiness window and the start fails.
@@ -93,6 +99,30 @@ provision:
         npm install -g --prefix /usr/local \
           "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@openai/codex@${CODEX_VERSION}"
       fi
+      # Like npm's package metadata above, inspect installation metadata without
+      # starting the provider. Publish it only after the verified install succeeds.
+      if [ ! -x /usr/local/lib/agy/agy ] \
+        || [ "$(cat /usr/local/lib/agy/version 2>/dev/null || true)" != "${AGY_VERSION}" ]; then
+        agy_stage=$(mktemp -d)
+        trap 'rm -rf "$agy_stage"' EXIT
+        curl -fsSL "$AGY_URL" -o "$agy_stage/agy.tar.gz"
+        printf '%s  %s\n' "$AGY_SHA512" "$agy_stage/agy.tar.gz" | sha512sum --check --status
+        tar -xzf "$agy_stage/agy.tar.gz" -C "$agy_stage" --no-same-owner antigravity
+        install -d -o root -g root -m 0755 /usr/local/lib/agy
+        rm -f /usr/local/lib/agy/version
+        install -o root -g root -m 0755 "$agy_stage/antigravity" /usr/local/lib/agy/agy
+        printf '%s\n' "$AGY_VERSION" > "$agy_stage/version"
+        install -o root -g root -m 0644 "$agy_stage/version" /usr/local/lib/agy/version
+        rm -rf "$agy_stage"
+        trap - EXIT
+      fi
+      # Enforce the vendor's opt-out for every invocation, including role shells.
+      cat > /usr/local/bin/agy <<'AGY'
+      #!/bin/sh
+      export AGY_CLI_DISABLE_AUTO_UPDATE=true
+      exec /usr/local/lib/agy/agy "$@"
+      AGY
+      chmod 0755 /usr/local/bin/agy
       # GitHub credentials come from the runtime during a role's run (github-credential in
       # the run's credentials directory); outside a run git and gh behave as installed.
       cat > /etc/gitconfig <<'GITCONFIG'
@@ -113,9 +143,11 @@ provision:
       # provision script reached every dependency. set -e/pipefail above keeps this
       # marker absent when any required setup step fails.
       for command in mount.cifs setfacl smbpasswd smbd newuidmap newgidmap dbus-run-session \
-        docker uv node npm claude codex gh git curl xz gcc g++ make modprobe; do
+        docker uv node npm claude codex agy gh git curl xz gcc g++ make modprobe; do
         command -v "$command" >/dev/null
       done
       dpkg -s $PACKAGES >/dev/null
+      test -x /usr/local/lib/agy/agy
+      test "$(cat /usr/local/lib/agy/version)" = "$AGY_VERSION"
       printf 'firm-linux-provisioned-v1\n' > /run/firm-provisioned.new
       mv /run/firm-provisioned.new /run/firm-provisioned

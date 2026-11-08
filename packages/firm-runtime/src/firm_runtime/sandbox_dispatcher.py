@@ -614,6 +614,8 @@ class SandboxDispatcher:
             self.runtime.finish(
                 row["activation_id"], "failed", failure="execution inactivity timeout expired"
             )
+        elif parsed is not None and getattr(parsed, "interrupted", False):
+            self.runtime.finish(row["activation_id"], "interrupted", category="transient")
         elif row["state"] == "running" and parsed.success:
             self.runtime.finish(row["activation_id"])
         else:
@@ -934,6 +936,8 @@ class SandboxDispatcher:
                 if session and session["provider"] != profile:
                     raise FirmError("retained conversation cannot silently change providers")
                 adapter = self._provider({"provider": profile, "session_id": invocation.session_id})
+                if getattr(adapter, "name", None) == "agy" and image_access:
+                    raise FirmError("AGY subscription inference cannot coexist with [google_cloud]")
                 spec = adapter.build_spec(
                     invocation,
                     role_id,
@@ -941,6 +945,9 @@ class SandboxDispatcher:
                     self.mcp_url,
                     session["native_session_id"] if session else None,
                     layout=layout,
+                    **({"mcp_tools": [tool["name"] for tool in self._tool_catalog],
+                        "mcp_timeout": config["task"]["timeout_seconds"]}
+                       if getattr(adapter, "name", None) == "agy" else {}),
                 )
                 spec = replace(
                     spec,

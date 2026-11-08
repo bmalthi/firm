@@ -813,6 +813,19 @@ def test_removed_retained_account_pins_role_and_notifies_manager_until_repaired(
     assert binding(runtime, resumed)["account_id"] == "a"
 
 
+def test_provider_interruption_resumes_without_failure_budget_or_holds(system):
+    runtime, _ = system
+    session = None
+    for _ in range(6):
+        attempt = start(runtime)
+        session = session or attempt.session_id
+        assert attempt.session_id == session
+        runtime.finish(attempt.activation_id, "interrupted", category="transient")
+        assert role(runtime)["attempt_count"] == 0
+        assert role(runtime)["hold_reason"] is None
+        assert runtime.accounts.status()["incidents"] == []
+
+
 def test_transient_setup_failures_use_bounded_existing_budget_and_notice(system):
     runtime, now = system
     for count in range(1, 5):

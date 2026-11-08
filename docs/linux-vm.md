@@ -255,6 +255,11 @@ Anything else is refused with `403`, which a role reads as a host the firm has n
 allowed yet and asks for with `request_access`; see
 [owner requests](runtime.md#owner-requests).
 
+The separate setup-only list contains `storage.googleapis.com`, for the pinned AGY
+archive. Only the authenticated `_provision` identity can use that list, until the
+guest controller is first ready. Roles need an ordinary owner grant for this host;
+it is omitted from the role baseline shown by status, analysis and the console.
+
 Every role's run carries the proxy in its environment with a credential that names
 the role, so `curl`, `git`, `uv`, `npm`, `apt`, Claude Code and Codex go through it
 unchanged and each request is attributed. The role's rootless Docker daemon pulls

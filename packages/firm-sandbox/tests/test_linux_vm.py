@@ -7,7 +7,9 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
+import tarfile
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -146,6 +148,93 @@ def test_shipped_image_resolves_nothing_and_provisions_through_the_proxy(image):
     assert script.index('HTTPS_PROXY="$PARAM_FIRM_PROXY"') < script.index("set -x")
     assert script.startswith("#!/bin/bash\nset -euo pipefail\n")
     assert script.index("nameserver 127.0.0.1") < script.index("Acquire::Retries=3")
+
+
+def test_agy_pin_is_verified_before_install_and_required_at_readiness(image):
+    script = yaml.safe_load(image.read_text())["provision"][0]["script"]
+    assert "AGY_VERSION=1.5.3" in script
+    assert f"AGY_VERSION={linux_vm.AGY_VERSION}" in script
+    assert "1.5.3-6604829099950080/linux-arm/cli_linux_arm64.tar.gz" in script
+    assert script.index('sha512sum --check --status') < script.index('tar -xzf "$agy_stage')
+    assert script.index('install -o root -g root -m 0755 "$agy_stage/antigravity"') < script.index(
+        'install -o root -g root -m 0644 "$agy_stage/version"')
+    assert "agy" in linux_vm.GUEST_DEPENDENCIES
+    assert (f'test "$(cat /usr/local/lib/agy/version)" = "{linux_vm.AGY_VERSION}"'
+            in linux_vm.GUEST_DEPENDENCY_CHECK)
+    assert "--version" not in script
+    assert "--version" not in linux_vm.GUEST_DEPENDENCY_CHECK
+    assert script.index('test "$(cat /usr/local/lib/agy/version)"') < script.index(
+        'mv /run/firm-provisioned.new')
+
+
+def test_agy_wrapper_disables_updates_even_if_caller_enables_them(image, tmp_path):
+    script = yaml.safe_load(image.read_text())["provision"][0]["script"]
+    wrapper = script.split("cat > /usr/local/bin/agy <<'AGY'\n", 1)[1].split("\nAGY\n", 1)[0]
+    binary = tmp_path / "binary"
+    binary.write_text('#!/bin/sh\nprintf "%s\\n" "$AGY_CLI_DISABLE_AUTO_UPDATE" "$@"\n')
+    binary.chmod(0o755)
+    command = tmp_path / "agy"
+    command.write_text(wrapper.replace('/usr/local/lib/agy/agy', str(binary)))
+    command.chmod(0o755)
+    result = subprocess.run([str(command), "argument with spaces"], check=True,
+                            capture_output=True, text=True,
+                            env={"AGY_CLI_DISABLE_AUTO_UPDATE": "false"})
+    assert result.stdout.splitlines() == ["true", "argument with spaces"]
+
+
+@pytest.mark.parametrize("valid_checksum", [False, True])
+def test_agy_install_stamp_requires_verified_payload_and_skips_cached_install(
+    image, tmp_path, valid_checksum
+):
+    script = yaml.safe_load(image.read_text())["provision"][0]["script"]
+    block = script[script.index('if [ ! -x /usr/local/lib/agy/agy ]'):script.index(
+        "# Enforce the vendor's opt-out")]
+    # Run the real install/check block as an ordinary user in a disposable prefix.
+    block = block.replace('/usr/local/lib/agy', '"$INSTALL_ROOT"')
+    block = block.replace("-o root -g root ", "")
+    if sys.platform == "darwin":
+        block = block.replace("sha512sum --check --status", "shasum -a 512 --check --status")
+    binary = tmp_path / "antigravity"
+    binary.write_text('#!/bin/sh\ntouch "$PROVIDER_STARTED"\nexit 99\n')
+    binary.chmod(0o755)
+    archive = tmp_path / "agy.tar.gz"
+    with tarfile.open(archive, "w:gz") as target:
+        target.add(binary, arcname="antigravity")
+    installed = tmp_path / "installed"
+    downloads = tmp_path / "downloads"
+    started = tmp_path / "provider-started"
+    checksum = hashlib.sha512(archive.read_bytes()).hexdigest() if valid_checksum else "0" * 128
+    env = {
+        **os.environ, "INSTALL_ROOT": str(installed), "FIXTURE": str(archive),
+        "DOWNLOADS": str(downloads), "PROVIDER_STARTED": str(started),
+        "AGY_VERSION": "1.5.3", "AGY_URL": "https://unused.invalid/pinned.tar.gz",
+        "AGY_SHA512": checksum,
+    }
+    command = 'set -eu\ncurl() { echo download >> "$DOWNLOADS"; cp "$FIXTURE" "$4"; }\n' + block
+
+    def run():
+        return subprocess.run(["bash", "-c", command], env=env, capture_output=True)
+
+    assert (run().returncode == 0) is valid_checksum
+    assert not started.exists()
+    if not valid_checksum:
+        assert not (installed / "version").exists()
+        assert not (installed / "agy").exists()
+        return
+    assert (installed / "version").read_text() == "1.5.3\n"
+    assert run().returncode == 0
+    assert downloads.read_text().splitlines() == ["download"]
+    # Stale metadata and a missing executable each require a verified reinstall.
+    (installed / "version").write_text("old\n")
+    assert run().returncode == 0
+    (installed / "agy").unlink()
+    failed_install = command.replace('install -m 0755 "$agy_stage/antigravity"', 'false')
+    assert subprocess.run(["bash", "-c", failed_install], env=env,
+                          capture_output=True).returncode != 0
+    assert not (installed / "version").exists()
+    assert run().returncode == 0
+    assert downloads.read_text().splitlines() == ["download"] * 4
+    assert not started.exists()
 
 
 def test_force_down_powers_off_before_cleanup_without_lifecycle_lock(vm, monkeypatch):

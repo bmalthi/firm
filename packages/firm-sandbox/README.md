@@ -63,6 +63,27 @@ Runtime-managed firms already receive the same release marker from `firm init`.
 Sandbox-only `init` is for a new empty-state firm (such as image enrollment); it
 refuses to mark existing unversioned VM state as compatible.
 
+The guest recipe pins AGY CLI **1.5.3** (experimental, Linux ARM64 glibc) and
+verifies its vendor SHA-512 before extraction. `src/firm_sandbox/assets/linux-vm.yaml`
+records the URL/checksum from the
+[official installer's](https://antigravity.google/cli/install.sh)
+[ARM64 manifest](https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_arm64.json).
+Boots reuse matching installations without a manifest lookup. `/usr/local/bin/agy`
+wraps root-owned `/usr/local/lib/agy/agy`, enforcing `AGY_CLI_DISABLE_AUTO_UPDATE=true`, the
+[documented opt-out](https://antigravity.google/docs/cli/troubleshooting/).
+Readiness checks the executable and root-owned `/usr/local/lib/agy/version` stamp,
+written after verified installation; metadata-only boot checks do not launch providers.
+
+Subscription egress allows exact hosts `www.googleapis.com` and
+`daily-cloudcode-pa.googleapis.com`. Archive host `storage.googleapis.com` is setup-only:
+authenticated `_provision` requests before guest readiness; roles need an owner grant.
+OAuth/login, updater manifests, avatars and telemetry are excluded from the baseline.
+Under the launcher's HOME, `.gemini/antigravity-cli/` holds access-only
+`antigravity-oauth-token` and CLI `settings.json`; `.gemini/config/` holds shared
+`config.json` and `agents/`. Renewable login state stays on the host.
+Keep [credit overages disabled](../../docs/installation.md#experimental-agy-integration).
+Packaging alone does not establish provider acceptance.
+
 ### Operator verbs
 
 All operations use `--config PATH` (default `sandbox.toml`), except

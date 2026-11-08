@@ -69,7 +69,7 @@ uv tool install --force --python 3.12 \
 
 #### Step 3 — Ensure a dedicated provider login exists
 
-Firm stores credentials in `~/.config/firm-runtime/credentials/<account>.json` (`0600`).
+Firm stores Codex and Claude credentials in `~/.config/firm-runtime/credentials/<account>.json` (`0600`).
 * **Recommended (isolated browser login for Codex or Claude):** Check if `~/.config/firm-runtime/credentials/codex-personal.json` (or `claude-personal.json`) exists. If not, run the isolated sign-in helper, which opens the user's browser in a temporary profile so Firm gets its own refresh token without signing out the user's everyday host CLI:
   ```sh
   # For Codex:
@@ -77,6 +77,10 @@ Firm stores credentials in `~/.config/firm-runtime/credentials/<account>.json` (
 
   # For Claude:
   uv run --directory ~/firm-src python -c 'from firm_runtime.onboarding import login_provider; print(login_provider("claude", "claude-personal"))'
+  ```
+* **AGY (experimental subscription):** Install the native CLI on the host, then create a dedicated login as described in [Experimental AGY integration](#experimental-agy-integration):
+  ```sh
+  firm login ACCOUNT --provider agy
   ```
 * *(Optional shortcut for Codex:* `~/.local/bin/firm save-credentials codex-personal --provider codex < ~/.codex/auth.json` imports the user's existing host login without a browser step, **but** because OAuth refresh tokens rotate on renewal, sharing one login between the host CLI and a running firm can sign the other out. Prefer the isolated login above.)
 
@@ -198,7 +202,8 @@ firm start
 ```
 
 The wizard walks you through three steps:
-1. **Choose your provider:** Pick **Codex** or **Claude**.
+1. **Choose your provider:** Pick **Codex**, **Claude**, or **AGY (experimental subscription)**.
+   See [Experimental AGY integration](#experimental-agy-integration).
 2. **Choose your first mandate:** Pick the built-in **weekly planner** starter (which produces a single interactive HTML weekly planner you can preview in the console) or describe your own task.
 3. **Complete isolated sign-in:** Firm checks local prerequisites, opens an isolated provider sign-in in your browser, saves the login owner-private (`0600`) under `~/.config/firm-runtime/credentials/`, and starts the firm.
 
@@ -210,7 +215,7 @@ Firm stores owner data under `firms/` in the current directory by default. Run t
 
 Every guest VM's network interfaces are locked down at the host boundary: there is no direct internet route, no UDP/DNS, and no access to your Mac's loopback or private LAN. All outbound HTTP/HTTPS traffic from roles goes through the host's egress proxy (`packages/firm-sandbox/src/firm_sandbox/egress_proxy.py`).
 
-* **Web Search works out of the box:** Provider-native web search (`web_search` in Codex and `WebSearch` in Claude Code) is enabled by default and executes on the provider's servers over the pre-allowed provider API hosts.
+* **Web Search works out of the box:** Provider-native web search (`web_search` in Codex, `WebSearch` in Claude Code, and `search_web` in AGY roles and tasks) is enabled by default and executes on the provider's servers over the pre-allowed provider API hosts. Firm denies AGY's native page fetch (`read_url`); AGY tool-free runs do not enable search.
 * **Default mode (`egress = "enforce"`):** Allows a built-in baseline of essential hosts out of the box:
   * **Providers & Web Search:** `*.anthropic.com`, `*.claude.com`, `*.openai.com`, `chatgpt.com`, `*.chatgpt.com`
   * **GitHub & Containers:** `github.com`, `*.github.com`, `*.githubusercontent.com`, `ghcr.io`, `*.docker.com`, `*.docker.io`
@@ -232,6 +237,8 @@ The first start downloads the Ubuntu cloud image and provisions the Linux guest,
 The console can be ready before the Linux VM finishes starting. If startup fails, the console stays available and shows the cause. Firm retries brief package-download problems and leaves incomplete setup safe to resume. Before clicking **Resume**, wait until the console confirms the VM has stopped; then retry from the console. If shutdown is still in progress, wait and check again.
 
 ### Provider sign-in and model defaults
+
+See [Provider differences](runtime.md#provider-differences) for a comparison of Codex, Claude and AGY.
 
 The wizard isolates login from your everyday provider CLI. If Codex or Claude Code
 is installed, Firm uses that CLI in a dedicated temporary configuration. If the CLI
@@ -383,3 +390,44 @@ environment with disposable firms; only the Mac lease checks need `[mac]`.
 ## Project and release information
 
 See [release procedures](releases.md) and [source and attribution](provenance.md).
+
+## Experimental AGY integration
+
+AGY is an **experimental subscription provider** in the first-run chooser. Install
+the native host CLI with the [vendor's installer](https://antigravity.google/cli/install.sh);
+the `agy` executable must be on the PATH of the process that runs `firm start`.
+Firm does not fetch it through npm. The guest package pins CLI 1.5.3.
+
+`firm login ACCOUNT --provider agy` opens the interactive native
+`agy acp --login --include-default-customizations=false` flow in a dedicated
+host-owned profile. The default credential is
+`~/.config/firm-runtime/credentials/ACCOUNT-agy/home/.gemini/antigravity-cli/antigravity-oauth-token`.
+An explicit `--auth-file PATH` must be absolute and end in
+`home/.gemini/antigravity-cli/antigravity-oauth-token`; that profile's `home`
+must not be the owner's own HOME. Firm does not import ordinary AGY HOME,
+`.gemini`, API keys, or keyring credentials. On macOS, host login and renewal run
+under a macOS sandbox that blocks the `security` tool, so the CLI keeps its
+credentials in the profile's token file and shows no Keychain dialog.
+These launches require `/usr/bin/sandbox-exec`.
+
+Both `useG1Credits: false` in CLI settings and `userSettings.useAiCredits: false`
+in native config disable credit overages. Refresh credentials stay on the host;
+guests receive an access-only projection with a blank refresh token and no email
+or unknown fields. Repeating login retries sign-in in the same profile; login
+does not prove model entitlement. Quota/context telemetry are unavailable.
+`[google_cloud]` cannot coexist with AGY because image API-key injection could
+change inference billing. `gemini` is not a provider alias.
+
+Long turns yield after roughly 45–55 minutes and resume the same conversation
+with fresh credentials. AGY reads its token once; replacing it mid-turn cannot
+extend its lifetime. Expiry can leave a conversation reporting persistent ERROR.
+The VM clock must track the host; skew over roughly 300 seconds can defeat the
+pre-expiry yield bound. See [runtime policy](runtime.md#experimental-agy-configuration)
+for configuration, retry limits and experimental tool isolation.
+
+If a retained conversation keeps failing, route it fresh on its current profile,
+then authorize retry if its role budget is exhausted:
+`firm route DIR EMPLOYEE --profile PROFILE --fresh --request-id ID`, then
+`firm retry DIR EMPLOYEE --episode EPISODE --request-id ANOTHER_ID`.
+Fresh routing discards the conversation but preserves holds and the attempt
+budget; an ordinary retry alone retains the conversation.

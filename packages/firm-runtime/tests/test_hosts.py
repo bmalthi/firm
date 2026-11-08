@@ -188,6 +188,19 @@ def test_an_allowed_host_is_granted_at_once_without_asking(tmp_path, clock):
     assert runtime.posted == []
 
 
+def test_setup_only_host_uses_normal_owner_request(tmp_path, clock):
+    from firm_sandbox.egress_proxy import BASELINE_HOSTS
+
+    runtime, founder = request_firm(tmp_path, clock, baseline=BASELINE_HOSTS)
+    host = "storage.googleapis.com"
+    answer = runtime.tools(founder.token).request_access(
+        "network_host", host, "Fetch public test data", "setup-host")
+    assert answer["status"] == "pending"
+    assert runtime.hosts.sandbox.granted == []
+    runtime.requests.grant(OWNER, answer["request_id"])
+    assert runtime.hosts.sandbox.granted == [host]
+
+
 def test_observe_mode_grants_hosts_without_requests_or_persistent_grants(tmp_path, clock):
     runtime, founder = request_firm(tmp_path, clock)
     runtime.hosts.sandbox.mode = "observe"

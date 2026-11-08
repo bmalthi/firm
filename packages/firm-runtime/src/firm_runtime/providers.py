@@ -20,6 +20,8 @@ def provider_adapter(profile, account):
         from .codex_provider import CodexProvider as Adapter
     elif profile["provider"] == "claude":
         from .claude_provider import ClaudeProvider as Adapter
+    elif profile["provider"] == "agy":
+        from .agy_provider import AgyProvider as Adapter
     else:
         raise FirmError("unsupported provider in retained binding")
     return Adapter(
@@ -59,7 +61,8 @@ class Providers:
                 except ProviderSetupError as exc:
                     scope = "account" if exc.category == "auth" else "profile"
                     dependency = account_id if scope == "account" else name
-                    self.runtime.accounts.pause(OWNER, scope, dependency, exc.category)
+                    if exc.category in {"auth", "config"}:
+                        self.runtime.accounts.pause(OWNER, scope, dependency, exc.category)
                     result.append({"scope": scope, "dependency": dependency, "code": exc.code})
         return {"checked_accounts": sorted(checked), "failures": result}
 
@@ -113,6 +116,7 @@ class Providers:
             return spec
 
         def parse(request, logs, exit_code):
+            from .agy_provider import AgyProvider
             from .claude_provider import ClaudeProvider
             from .codex_provider import CodexProvider
 
@@ -120,7 +124,9 @@ class Providers:
                 raise FirmError("summary request was not retained")
             # A later configuration edit cannot change how an already-started
             # provider's output and usage are interpreted.
-            parser = {"codex": CodexProvider, "claude": ClaudeProvider}[request.provider]
+            parser = {
+                "codex": CodexProvider, "claude": ClaudeProvider, "agy": AgyProvider,
+            }[request.provider]
             output = parser.parse_summary(logs, exit_code)
             subscription = getattr(parser, "parse_subscription", None)
             reading = subscription(logs) if subscription is not None else None
@@ -195,9 +201,9 @@ class Providers:
 
 
 def record_task_output(runtime, run_id, provider, account_id, logs, exit_code, *, apply_holds):
-    from . import claude_provider, codex_provider
+    from . import agy_provider, claude_provider, codex_provider
 
-    parser = {"codex": codex_provider, "claude": claude_provider}[provider]
+    parser = {"codex": codex_provider, "claude": claude_provider, "agy": agy_provider}[provider]
     result = parser.parse_result(logs, exit_code)
     observed = parser.parse_usage(logs)
     if apply_holds:

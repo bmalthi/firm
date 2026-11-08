@@ -1,0 +1,15 @@
+{
+  "fixture_kind": "synthetic",
+  "events": [
+    {
+      "event": "init",
+      "conversation_id": "synthetic-conversation",
+      "init": {}
+    }
+  ],
+  "exit_code": 0,
+  "expected": {
+    "success": false,
+    "error": "missing_result"
+  }
+}
