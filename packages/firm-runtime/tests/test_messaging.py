@@ -9,6 +9,7 @@ from firm_runtime.lifecycle import Lifecycle
 from firm_runtime.messaging import MAX_BODY_BYTES, MAX_PEEK_BYTES, MAX_RESULT_BYTES, Messaging
 from firm_runtime.role_output import render_tool_result
 from firm_runtime.store import OPERATIONS, OWNER, Store, encoded  # noqa: F401
+from firm_runtime.summaries import MAX_SUMMARY_TEXT_BYTES, SummaryOutput, SummaryService
 from firm_runtime.workspaces import sandbox_role_id
 
 
@@ -818,6 +819,50 @@ class RecordingSummaries:
     def summarize(self, snapshot, *, caller_session_id=None):
         self.snapshots.append((snapshot, caller_session_id))
         return dict(self.outcome)
+
+
+def test_cut_off_summary_reaches_new_participant_and_context_unchanged(mailroom):
+    store, messaging, founder, (alice, bob, carol, _), _ = mailroom
+
+    class Runner:
+        def start(self, request):
+            return request
+
+        def wait(self, handle, timeout):
+            return SummaryOutput("é界🙂" * 2000, output_tokens=1_000_000)
+
+        def stop(self, handle):
+            return True
+
+    messaging.summary_service = SummaryService(Runner(), store=store)
+    opening = messaging.send(founder, [alice, bob], "First ask", request_id="opening")
+    introduced = messaging.reply(
+        bob, opening["message_id"], "Carol, joining you in.", add=[carol],
+        summarize=True, request_id="intro",
+    )
+    assert introduced["summary"] == {"status": "attached", "truncated": True}
+    assert messaging.reply(
+        bob, opening["message_id"], "Carol, joining you in.", add=[carol],
+        summarize=True, request_id="intro",
+    ) == introduced
+    claimed = messaging.claim(carol, [introduced["message_id"]], request_id="read")
+    delivered = claimed["messages"][0]["summary"]
+    context = messaging.context(carol, introduced["conversation_id"])
+    assert context["status"] == "summarized"
+    assert context["truncated"] is True
+    assert context["summary"] == delivered
+    assert delivered.endswith(
+        "\n[THIS SUMMARY WAS CUT OFF at 16 KiB; the rest was not delivered.]"
+    )
+    assert len(delivered.encode("utf-8")) <= MAX_SUMMARY_TEXT_BYTES
+    assert delivered in render_tool_result("claim", claimed)
+    assert delivered in render_tool_result("context", context)
+    with store.read() as db:
+        assert db.execute("SELECT summary FROM messages WHERE message_id=?", (
+            introduced["message_id"],
+        )).fetchone()[0] == delivered
+        runs = db.execute("SELECT state,output_tokens,reason FROM summary_runs").fetchall()
+    assert [tuple(run) for run in runs] == [("summarized", 1_000_000, None)] * 2
 
 
 def test_introduction_carries_a_derived_summary_once_and_context_follows_continues(mailroom):

@@ -650,16 +650,11 @@ def test_isolated_staffing_turn_carries_instructions_kind_and_reservation(system
         kind="staffing",
         instructions="choose",
         reserve=runtime.accounts.reserve_staffing,
-        max_output_tokens=levels.MAX_OUTPUT_TOKENS,
         max_input_bytes=levels.MAX_STAFFING_PROMPT_BYTES,
     )
     assert outcome["status"] == "completed" and outcome["output_tokens"] == 12
     (request,) = seen
-    assert (request.kind, request.instructions, request.max_output_tokens) == (
-        "staffing",
-        "choose",
-        levels.MAX_OUTPUT_TOKENS,
-    )
+    assert (request.kind, request.instructions) == ("staffing", "choose")
     assert request.run_id.startswith("run-")
     assert request.max_input_bytes == levels.MAX_STAFFING_PROMPT_BYTES
     with runtime.store.read() as db:

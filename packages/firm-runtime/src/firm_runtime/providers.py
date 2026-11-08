@@ -155,7 +155,7 @@ class Providers:
                 account,
             )
             launch = SummaryLaunch(
-                run_id=request.run_id, prompt=request.instruction, max_output_tokens=0,
+                run_id=request.run_id, prompt=request.instruction,
                 timeout=max(0, request.deadline - self.runtime.store.clock()),
                 account_id=request.account_id, provider=request.provider,
                 model=request.model, effort=request.effort, start_url=start_url,

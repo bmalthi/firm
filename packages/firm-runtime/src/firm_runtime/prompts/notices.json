@@ -15,7 +15,7 @@
   "delivery_bounce_subject": "Delivery failure for ${message_id}",
   "level_default": "The level chooser failed for ${address}. Failed assessments: ${attempts}. Last reason: ${reason}. The employee starts at the default level, ${model_class} class at ${effort} effort. Route the role to change it.",
   "level_default_subject": "Hire level defaulted",
-  "held": "${address} is held: ${reason}. Recovery revision ${episode}. Request an authorized retry after review.",
+  "held": "${address} is held: ${reason}. Recovery revision ${episode}. Request an authorized retry after review. If retained context is unusable, the owner can use `firm route --fresh` on the current profile before authorizing retry; routing discards the conversation but preserves the attempt budget.",
   "held_subject": "Employee work requires manager action",
   "reminder": "Your reminder ${reminder_id} (due at ${due_at}):\n\n${note}",
   "reminder_subject": "Scheduled self-reminder",

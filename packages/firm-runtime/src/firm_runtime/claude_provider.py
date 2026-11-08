@@ -372,9 +372,6 @@ class ClaudeProvider:
                 "FIRM_PRIVATE_HOME": layout.private,
                 "FIRM_SUMMARY_RUN": "1",
                 **({"FIRM_TASK_RUN": "1"} if task else {}),
-                **({} if task else {
-                    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(request.max_output_tokens)
-                }),
                 "CLAUDE_CODE_MAX_RETRIES": "0",
                 "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1",
                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",

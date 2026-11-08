@@ -81,7 +81,9 @@ Its path is supplied with the role's other paths through `Layout`. Provisioning 
 reserves a subordinate UID and GID range of 65536 IDs at
 `100000 + index * 65536`, written to `/etc/subuid` and `/etc/subgid`, and writes
 the unit for the account's standard slice `user-<uid>.slice`. Rootless Docker is
-installed for the account once. How the slice, user manager and daemon are started
+installed for the account once, and the role home is flushed to disk before the role is
+recorded, so an emergency power-off cannot leave an empty, and therefore masked,
+`docker.service` user unit. How the slice, user manager and daemon are started
 and settled is in the [sandbox design](../design/sandbox.md#roles-on-the-linux-vm).
 
 A run starts inside the slice: the guest controller starts the user manager and the

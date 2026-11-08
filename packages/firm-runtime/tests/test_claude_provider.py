@@ -125,7 +125,6 @@ def test_builds_summary_spec_with_empty_tool_set_and_no_activation(tmp_path):
     request = SummaryLaunch(
         "summary-" + uuid4().hex[:32],
         "derive this",
-        1000,
         30,
         account_id="personal",
         provider="claude",
@@ -175,7 +174,6 @@ def test_isolated_claude_turn_always_has_an_empty_tool_set_and_no_mcp(
     request = SummaryLaunch(
         "run-" + uuid4().hex,
         "derive this",
-        1000,
         30,
         provider="claude",
         model=model,
@@ -192,6 +190,7 @@ def test_isolated_claude_turn_always_has_an_empty_tool_set_and_no_mcp(
     assert not any(arg in command for arg in ("--mcp-config", "--allowedTools", "--allowed-tools"))
     assert "--strict-mcp-config" in command
     assert spec.env["FIRM_SUMMARY_RUN"] == "1"
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in spec.env
 
 
 def test_summary_launcher_refuses_missing_or_denied_gate(monkeypatch):

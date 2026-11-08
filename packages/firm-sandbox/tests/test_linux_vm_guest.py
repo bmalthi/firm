@@ -66,6 +66,7 @@ PROVISION = [
     scope("dockerd-rootless-setuptool.sh", "install"),
     user_systemctl("disable", "docker.service"),
     *SETTLE,
+    ["sync", "-f", "HOME"],
 ]
 
 
@@ -190,6 +191,24 @@ def test_provision_reserves_identity_range_units_and_docker(sim):
     sim.commands.clear()
     assert guest.provision(ROLE) == info
     assert sim.commands == []
+
+
+def test_provision_does_not_commit_role_before_docker_install_is_durable(sim, monkeypatch):
+    run = sim.run
+
+    def fail_sync(argv, **kwargs):
+        if argv[0] == "sync":
+            assert ROLE not in guest.database()["roles"]
+            raise subprocess.CalledProcessError(1, argv)
+        return run(argv, **kwargs)
+
+    monkeypatch.setattr(sim, "run", fail_sync)
+    with pytest.raises(subprocess.CalledProcessError):
+        guest.provision(ROLE)
+    assert ROLE not in guest.database()["roles"]
+    assert guest.database()["pending"]["role_id"] == ROLE
+    monkeypatch.setattr(sim, "run", run)
+    assert guest.provision(ROLE)["role_id"] == ROLE
 
 
 def test_second_role_gets_the_next_range_and_retired_slots_stay_reserved(sim):

@@ -175,7 +175,7 @@ def test_claude_summary_output_records_streamed_allowance_for_its_account(tmp_pa
 
     runtime, _ = runtime_with_accounts(tmp_path)
     runner = Providers(runtime).summary_runner(object(), mcp_url="http://127.0.0.1:9000/mcp")
-    request = SummaryLaunch("summary-run", "derive", 1000, 30, account_id="good", provider="claude")
+    request = SummaryLaunch("summary-run", "derive", 30, account_id="good", provider="claude")
     event = {
         "type": "rate_limit_event",
         "rate_limit_info": {
@@ -190,3 +190,55 @@ def test_claude_summary_output_records_streamed_allowance_for_its_account(tmp_pa
     assert reading["windows"] == [
         {"window": "seven_day", "used_percent": 54.0, "resets_at": 1789858800}
     ]
+
+
+@pytest.mark.parametrize("category", ["transient", "config", "auth"])
+def test_managed_setup_error_preserves_category_and_retry_budget(tmp_path, monkeypatch, category):
+    from runtime_test_support import FakeSandbox
+
+    runtime, _ = runtime_with_accounts(tmp_path)
+    now = [runtime.store.clock()]
+    runtime.store.clock = lambda: now[0]
+    with runtime.store.transaction() as db:
+        config = runtime.accounts.config(db)
+        config["profiles"]["codex"]["accounts"] = ["good"]
+        db.execute("UPDATE firm SET config_json=?", (json.dumps(config),))
+    box = FakeSandbox(tmp_path / "sandbox")
+
+    def unavailable(*args, **kwargs):
+        raise ProviderSetupError(category=category, code="setup_unavailable", message="test outage")
+
+    monkeypatch.setattr(CodexProvider, "build_spec", unavailable)
+    with SandboxDispatcher(runtime, box, Providers(runtime),
+                           mcp_url="http://127.0.0.1:9000/mcp") as dispatcher:
+        dispatcher.start()
+        for count in range(1, 5 if category == "transient" else 2):
+            assert dispatcher.tick() == []
+            with runtime.store.read() as db:
+                activations = db.execute("SELECT * FROM activations").fetchall()
+                assert len(activations) == count
+                assert all(row["state"] == "interrupted" for row in activations)
+                assert all(row["failure_category"] == category for row in activations)
+                assert all(row["launch_attempted_at"] is None for row in activations)
+                current = dict(runtime.store.role(db, "founder"))
+            incidents = runtime.accounts.status()["incidents"]
+            if category == "transient":
+                assert incidents == []
+                assert current["attempt_count"] == count
+                if count < 4:
+                    assert current["hold_reason"] is None
+                    assert current["retry_at"] == now[0] + (60, 300, 1800)[count - 1]
+                    assert runtime.admit() is None
+                    now[0] = current["retry_at"]
+                else:
+                    assert current["hold_reason"] == "attempts_exhausted"
+                    assert current["retry_at"] is None
+                    assert runtime.admit() is None
+            else:
+                assert current["attempt_count"] == 0
+                assert current["hold_reason"] is None
+                assert current["retry_at"] is None
+                assert len(incidents) == 1
+                assert incidents[0]["scope"] == ("account" if category == "auth" else "profile")
+                assert incidents[0]["kind"] == category
+                assert runtime.admit() is None

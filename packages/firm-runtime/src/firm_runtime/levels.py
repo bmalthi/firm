@@ -32,7 +32,6 @@ FOUNDER_LEVEL = ("high", "high")
 FALLBACK_LEVEL = ("medium", "high")
 MAX_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 60.0
-MAX_OUTPUT_TOKENS = 400
 MAX_STAFFING_PROMPT_BYTES = 256 * 1024
 # The hire's mandate is authoritative input and is passed through unchanged.
 # Only surrounding mandates are excerpts, so a verbose manager cannot crowd out
@@ -375,7 +374,6 @@ class Levels:
             kind="staffing",
             instructions=level_instructions(),
             reserve=self.runtime.accounts.reserve_staffing,
-            max_output_tokens=MAX_OUTPUT_TOKENS,
             max_input_bytes=MAX_STAFFING_PROMPT_BYTES,
         )
         if outcome.get("reason") == "input_limit":

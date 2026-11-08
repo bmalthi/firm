@@ -404,6 +404,8 @@ class Messaging:
         if summary is not None:
             if summary_text is not None:
                 result["summary"] = {"status": "attached"}
+                if summary.get("truncated"):
+                    result["summary"]["truncated"] = True
             else:
                 reason = summary.get("reason", "unavailable") if moved else "nobody_new"
                 result["summary"] = {"status": "unavailable", "reason": reason}
