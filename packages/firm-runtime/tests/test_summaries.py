@@ -11,6 +11,7 @@ from firm_runtime.summaries import (
     MAX_CONTEXT_BYTES,
     MAX_SUMMARY_CONCURRENCY,
     MAX_SUMMARY_PROMPT_BYTES,
+    MAX_SUMMARY_TEXT_BYTES,
     SandboxSummaryRunner,
     SummaryInputTooLarge,
     SummaryLaunch,
@@ -104,7 +105,7 @@ class BlockingProvider:
         self._count = 0
         self.release = threading.Event()
 
-    def summarize(self, prompt, *, max_output_tokens, timeout):
+    def summarize(self, prompt, *, timeout):
         with self._lock:
             self._count += 1
             if self._count == MAX_SUMMARY_CONCURRENCY:
@@ -124,9 +125,7 @@ class FunctionRunner:
         return request
 
     def wait(self, handle, timeout):
-        value = self.provider.summarize(
-            handle.prompt, max_output_tokens=handle.max_output_tokens, timeout=timeout
-        )
+        value = self.provider.summarize(handle.prompt, timeout=timeout)
         return value if isinstance(value, SummaryOutput) else SummaryOutput(value)
 
     def stop(self, handle):
@@ -158,7 +157,7 @@ def test_summary_service_returns_busy_without_queueing_beyond_its_concurrency():
 
 def test_summary_service_normalizes_timeout_without_retry():
     class TimeoutProvider:
-        def summarize(self, prompt, *, max_output_tokens, timeout):
+        def summarize(self, prompt, *, timeout):
             raise SummaryTimedOut
 
     result = SummaryService(FunctionRunner(TimeoutProvider())).summarize(summary_snapshot())
@@ -168,7 +167,7 @@ def test_summary_service_normalizes_timeout_without_retry():
 
 def test_summary_service_persists_usage_and_latency(tmp_path):
     class Provider:
-        def summarize(self, prompt, *, max_output_tokens, timeout):
+        def summarize(self, prompt, *, timeout):
             return SummaryOutput("derived", output_tokens=7, usage={"output_tokens": 7})
 
     store = Store.scratch(tmp_path / "firm.sqlite3")
@@ -183,14 +182,69 @@ def test_summary_service_persists_usage_and_latency(tmp_path):
     assert tuple(run) == ("summarized", result["coverage"]["input_bytes"], 7, 0)
 
 
-def test_summary_service_rejects_unknown_output_over_conservative_byte_cap():
+@pytest.mark.parametrize("kind", ["summary", "staffing"])
+@pytest.mark.parametrize("output_tokens", [None, 1_000_000])
+def test_isolated_turn_keeps_answer_regardless_of_reported_tokens(kind, output_tokens):
     class Provider:
-        def summarize(self, prompt, *, max_output_tokens, timeout):
-            return "x" * 1001
+        def summarize(self, prompt, *, timeout):
+            return SummaryOutput(
+                "é" * (MAX_SUMMARY_TEXT_BYTES // 2),
+                output_tokens=output_tokens,
+                usage={"output_tokens": output_tokens},
+            )
 
-    result = SummaryService(FunctionRunner(Provider())).summarize(summary_snapshot())
+    result = SummaryService(FunctionRunner(Provider())).run_isolated("derive", kind=kind)
+    assert result["status"] == "completed"
+    assert result["text"] == "é" * (MAX_SUMMARY_TEXT_BYTES // 2)
+    assert "truncated" not in result
+    if output_tokens is not None:
+        assert result["output_tokens"] == output_tokens
+        assert result["usage"] == {"output_tokens": output_tokens}
+    else:
+        assert "output_tokens" not in result
+        assert "usage" not in result
+
+
+@pytest.mark.parametrize("output_tokens", [None, 1_000_000])
+def test_summary_cuts_overlong_text_at_utf8_boundary_with_marker(output_tokens):
+    original = "é界🙂" * 2000
+
+    class Provider:
+        def summarize(self, prompt, *, timeout):
+            return SummaryOutput(
+                original, output_tokens=output_tokens, usage={"output_tokens": output_tokens}
+            )
+
+    result = SummaryService(FunctionRunner(Provider())).run_isolated("derive")
+    assert result["status"] == "completed"
+    assert result["truncated"] is True
+    kept, marker = result["text"].rsplit("\n", 1)
+    assert marker == "[THIS SUMMARY WAS CUT OFF at 16 KiB; the rest was not delivered.]"
+    assert kept and original.startswith(kept)
+    assert MAX_SUMMARY_TEXT_BYTES - 4 < len(result["text"].encode("utf-8")) <= (
+        MAX_SUMMARY_TEXT_BYTES
+    )
+    if output_tokens is not None:
+        assert result["output_tokens"] == output_tokens
+        assert result["usage"] == {"output_tokens": output_tokens}
+
+
+@pytest.mark.parametrize("kind", ["staffing", "other"])
+@pytest.mark.parametrize("output_tokens", [None, 1_000_000])
+def test_isolated_turn_rejects_answer_over_text_byte_cap(kind, output_tokens):
+    class Provider:
+        def summarize(self, prompt, *, timeout):
+            return SummaryOutput(
+                "é" * (MAX_SUMMARY_TEXT_BYTES // 2) + "x",
+                output_tokens=output_tokens,
+                usage={"output_tokens": output_tokens},
+            )
+
+    result = SummaryService(FunctionRunner(Provider())).run_isolated("derive", kind=kind)
     assert result["status"] == "unavailable"
     assert result["reason"] == "output_limit"
+    if output_tokens is not None:
+        assert result["usage"] == {"output_tokens": output_tokens}
 
 
 class Capacity:
@@ -241,7 +295,6 @@ def test_isolated_runner_receives_no_tools_or_workspace_authority(tmp_path):
     )
     assert result["status"] == "summarized"
     request = runner.requests[0]
-    assert request.max_output_tokens == 1000
     assert request.max_input_bytes == MAX_SUMMARY_PROMPT_BYTES
     assert request.tools_enabled is False
     assert request.workspace_grants == ()
@@ -481,7 +534,7 @@ def test_sandbox_summary_runner_enforces_input_boundary_and_no_authority_spec(ma
         lambda request, logs, exit_code: SummaryOutput(logs.decode(), output_tokens=1),
     )
     request = SummaryLaunch(
-        "run-id", "é" * (max_input_bytes // 2), 1000, 30, max_input_bytes=max_input_bytes
+        "run-id", "é" * (max_input_bytes // 2), 30, max_input_bytes=max_input_bytes
     )
     assert runner.wait(runner.start(request), 30).text == "summary"
     assert sandbox.spec.stdin.decode() == request.prompt
@@ -524,7 +577,7 @@ def test_reconcile_uses_the_dispatchers_own_inventory_status_without_asking_agai
     sandbox = Sandbox()
     runner = SandboxSummaryRunner(sandbox, lambda request: None, lambda *args: None)
     run = Run("s-" + "a" * 32, "run-" + "a" * 32, "g" * 64)
-    handle = summaries_module._SummaryHandle(SummaryLaunch(run.run_id, "fixture", 1000, 30))
+    handle = summaries_module._SummaryHandle(SummaryLaunch(run.run_id, "fixture", 30))
     handle.launch_pending = False
     runner._handles[run.run_id] = handle
     maintenance = []

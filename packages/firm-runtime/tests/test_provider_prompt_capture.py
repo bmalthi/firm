@@ -295,7 +295,7 @@ def test_task_builder_uses_worker_settings_without_role_authority(tmp_path, prov
         model="parent-model", effort="high", auth_file=auth,
     )
     request = SummaryLaunch(
-        "task-" + uuid4().hex, "Instruction", 0, 30, provider=provider,
+        "task-" + uuid4().hex, "Instruction", 30, provider=provider,
         model="worker-model", effort="medium", start_url="http://firm/summary/start",
         start_token="one-use-token", kind="task", instructions="Worker prompt",
     )
@@ -370,7 +370,7 @@ def test_task_worker_request_is_isolated_and_usage_is_parsed(tmp_path, provider,
     worker_prompt = "WORKER_ONLY_MARKER. Complete the supplied instruction and return one answer."
     instruction = "TASK_INSTRUCTION_MARKER. Say done."
     launch = SummaryLaunch(
-        "task-" + uuid4().hex, instruction, 1000, 30, provider=provider,
+        "task-" + uuid4().hex, instruction, 30, provider=provider,
         model="gpt-6-astra" if provider == "codex" else "sonnet", effort="medium",
         start_url="http://unused.invalid/summary/start", start_token="one-use-worker-token",
         kind="task", instructions=worker_prompt,

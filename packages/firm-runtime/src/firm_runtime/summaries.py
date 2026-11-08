@@ -26,10 +26,10 @@ from .store import encoded
 
 MAX_CONTEXT_MESSAGES = 50
 MAX_CONTEXT_BYTES = 64 * 1024
-MAX_SUMMARY_OUTPUT_TOKENS = 1000
 SUMMARY_TIMEOUT_SECONDS = 30.0
 MAX_SUMMARY_CONCURRENCY = 4
 MAX_SUMMARY_TEXT_BYTES = 16 * 1024
+SUMMARY_TRUNCATION_MARKER = "[THIS SUMMARY WAS CUT OFF at 16 KiB; the rest was not delivered.]"
 MAX_SUMMARY_PROMPT_BYTES = MAX_CONTEXT_BYTES + 4 * 1024
 MAX_SUMMARY_LOG_BYTES = 256 * 1024
 PROVIDER_REASON = re.compile(r"[a-z][a-z0-9_]{0,63}")
@@ -92,7 +92,6 @@ class SummaryLaunch:
 
     run_id: str
     prompt: str
-    max_output_tokens: int
     timeout: float
     account_id: str | None = None
     profile: str | None = None
@@ -797,7 +796,6 @@ class SummaryService:
         kind: str = "summary",
         instructions: str | None = None,
         reserve=None,
-        max_output_tokens: int = MAX_SUMMARY_OUTPUT_TOKENS,
         max_input_bytes: int = MAX_SUMMARY_PROMPT_BYTES,
         caller_session_id: str | None = None,
         input_bytes: int | None = None,
@@ -837,7 +835,6 @@ class SummaryService:
         request = SummaryLaunch(
             run_id=run_id,
             prompt=prompt,
-            max_output_tokens=max_output_tokens,
             timeout=SUMMARY_TIMEOUT_SECONDS,
             account_id=reservation.get("account_id"),
             profile=reservation.get("profile"),
@@ -893,18 +890,16 @@ class SummaryService:
             if not isinstance(text, str) or not text.strip():
                 return unavailable("empty_summary")
             raw = text.encode("utf-8")
-            if output_tokens is not None and (
-                isinstance(output_tokens, bool)
-                or not isinstance(output_tokens, int)
-                or output_tokens < 0
-                or output_tokens > max_output_tokens
-            ):
-                return unavailable("output_limit")
-            if output_tokens is None and len(raw) > max_output_tokens:
-                return unavailable("output_limit")
-            if len(raw) > MAX_SUMMARY_TEXT_BYTES:
-                return unavailable("output_limit")
+            truncated = len(raw) > MAX_SUMMARY_TEXT_BYTES
+            if truncated:
+                if kind != "summary":
+                    return unavailable("output_limit")
+                suffix = "\n" + SUMMARY_TRUNCATION_MARKER
+                kept_bytes = MAX_SUMMARY_TEXT_BYTES - len(suffix.encode("utf-8"))
+                text = raw[:kept_bytes].decode("utf-8", errors="ignore") + suffix
             result = {"status": "completed", "text": text}
+            if truncated:
+                result["truncated"] = True
             if output_tokens is not None:
                 result["output_tokens"] = output_tokens
             if safe_usage is not None:
@@ -947,6 +942,8 @@ class SummaryService:
             result = {**result_base, "status": "unavailable", "reason": outcome["reason"]}
         else:
             result = {**result_base, "status": "summarized", "summary": outcome["text"]}
+            if outcome.get("truncated"):
+                result["truncated"] = True
             if "output_tokens" in outcome:
                 result["output_tokens"] = outcome["output_tokens"]
         if "usage" in outcome:

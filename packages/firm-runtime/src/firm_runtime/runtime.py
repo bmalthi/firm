@@ -625,7 +625,15 @@ class Runtime:
                         "UPDATE roles SET recovery_json=?,handoff_notes=NULL WHERE employee_id=?",
                         (encoded(recovery), role["employee_id"]),
                     )
-                if category == "owner_stop" or activation["launch_attempted_at"] is None:
+                setup_retry = category == "transient" and activation["launch_attempted_at"] is None
+                attempts = role["attempt_count"] + int(setup_retry)
+                if setup_retry:
+                    db.execute(
+                        "UPDATE roles SET attempt_count=? WHERE employee_id=?",
+                        (attempts, role["employee_id"]),
+                    )
+                if (category == "owner_stop"
+                        or (activation["launch_attempted_at"] is None and not setup_retry)):
                     if activation["launch_attempted_at"] is not None:
                         db.execute(
                             "UPDATE roles SET attempt_count=MAX(0,attempt_count-1) "
@@ -642,7 +650,7 @@ class Runtime:
                     if role["employment"] != "retired":
                         self.store.request_execution(db, role["employee_id"], "dependency_recovery")
                 elif role["employment"] != "retired":
-                    if category == "refusal" or role["attempt_count"] >= 4:
+                    if category == "refusal" or attempts >= 4:
                         reason = "refusal" if category == "refusal" else "attempts_exhausted"
                         db.execute(
                             "UPDATE roles SET hold_reason=?,retry_at=NULL WHERE employee_id=?",
@@ -664,7 +672,7 @@ class Runtime:
                     else:
                         config = json.loads(self.store.firm(db)["config_json"])
                         delays = config.get("retry_delays", RETRY_DELAYS)
-                        ready = max(now + delays[role["attempt_count"] - 1], retry_after or 0)
+                        ready = max(now + delays[attempts - 1], retry_after or 0)
                         db.execute(
                             "UPDATE roles SET retry_at=? WHERE employee_id=?",
                             (ready, role["employee_id"]),

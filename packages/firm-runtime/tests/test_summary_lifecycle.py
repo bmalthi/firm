@@ -142,7 +142,7 @@ def test_real_sandbox_facade_supports_summary_stream_and_cleanup(tmp_path):
         lambda request: RunSpec(run.role_id, ("provider",), run_id=run.run_id),
         lambda request, logs, code: SummaryOutput(logs.decode(), 1),
     )
-    result = runner.wait(runner.start(SummaryLaunch(run.run_id, "fixture", 1000, 30)), 2)
+    result = runner.wait(runner.start(SummaryLaunch(run.run_id, "fixture", 30)), 2)
     assert result.text == "derived"
     assert retired.wait(2)
 
@@ -182,7 +182,7 @@ def test_unregistered_summary_prefix_does_not_bypass_inventory_ownership(setup):
 def test_failed_launch_handle_requires_inventory_after_launch_settles(setup):
     runtime, box, runner, host = setup
     run_id, _ = runtime.summary_service._reserve(summary_snapshot(), None)
-    handle = summaries._SummaryHandle(SummaryLaunch(run_id, "fixture", 1000, 30))
+    handle = summaries._SummaryHandle(SummaryLaunch(run_id, "fixture", 30))
     runner._handles[run_id] = handle
     handle.launch_pending = False
     handle.result.set_exception(RuntimeError("sandbox call failed before creation"))
@@ -202,7 +202,7 @@ def test_new_failed_launch_cannot_use_inventory_from_before_its_reservation(setu
     def create_after_inventory():
         inventory = original_inventory()
         run_id, _ = runtime.summary_service._reserve(summary_snapshot(), None)
-        handle = summaries._SummaryHandle(SummaryLaunch(run_id, "fixture", 1000, 30))
+        handle = summaries._SummaryHandle(SummaryLaunch(run_id, "fixture", 30))
         handle.launch_pending = False
         handle.result.set_exception(RuntimeError("sandbox call failed after creation"))
         runner._handles[run_id] = handle
@@ -229,7 +229,7 @@ def test_one_late_summary_is_powered_off_while_another_launch_remains_pending(se
     handles = []
     for _ in range(2):
         run_id, _ = runtime.summary_service._reserve(summary_snapshot(), None)
-        handle = summaries._SummaryHandle(SummaryLaunch(run_id, "fixture", 1000, 30))
+        handle = summaries._SummaryHandle(SummaryLaunch(run_id, "fixture", 30))
         runner._handles[run_id] = handle
         handles.append(handle)
     first, second = handles
@@ -431,7 +431,7 @@ def test_unexpected_off_observation_does_not_release_a_launch_that_settles_after
 ):
     runtime, box, runner, host = setup
     run_id, _ = runtime.summary_service._reserve(summary_snapshot(), None)
-    handle = summaries._SummaryHandle(SummaryLaunch(run_id, "fixture", 1000, 30))
+    handle = summaries._SummaryHandle(SummaryLaunch(run_id, "fixture", 30))
     runner._handles[run_id] = handle
     host.stop()
     original_status = box.infrastructure_status

@@ -811,3 +811,29 @@ def test_removed_retained_account_pins_role_and_notifies_manager_until_repaired(
     resumed = start(runtime)
     assert resumed.session_id == first.session_id
     assert binding(runtime, resumed)["account_id"] == "a"
+
+
+def test_transient_setup_failures_use_bounded_existing_budget_and_notice(system):
+    runtime, now = system
+    for count in range(1, 5):
+        attempt = runtime.admit()
+        assert attempt is not None
+        runtime.finish(attempt.activation_id, "interrupted", category="transient")
+        current = role(runtime)
+        assert current["attempt_count"] == count
+        assert runtime.accounts.status()["incidents"] == []
+        if count < 4:
+            assert current["retry_at"] > now[0]
+            now[0] = current["retry_at"]
+    assert role(runtime)["hold_reason"] == "attempts_exhausted"
+    assert runtime.admit() is None
+    with runtime.store.read() as db:
+        notices = db.execute("SELECT body FROM messages WHERE subject=?",
+                             ("Employee work requires manager action",)).fetchall()
+    assert len(notices) == 1 and "firm route --fresh" in notices[0][0]
+    episode = role(runtime)["recovery_episode"]
+    runtime.owner.route(OWNER, "founder", "primary", "fresh")
+    assert role(runtime)["session_id"] is None
+    assert role(runtime)["hold_reason"] == "attempts_exhausted"
+    runtime.retry(OWNER, "founder", episode, "retry")
+    assert runtime.admit() is not None

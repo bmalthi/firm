@@ -95,7 +95,7 @@ def test_real_task_builders_and_parsers_retain_usage(worker, outcome):
         assert command[command.index("--effort") + 1] == "high"
         assert command[command.index("--mcp-config") + 1] == '{"mcpServers":{}}'
         assert "Agent" in command and "Task" in command
-        assert env.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS") != "0"
+        assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in env
     assert env["FIRM_PRIVATE_HOME"] == f"/var/lib/firm/task-homes/{run_id}/home"
     assert env["FIRM_STATE_DIR"] == f"/var/lib/firm/task-homes/{run_id}/state"
     assert payload["argv"][1].startswith(f"/run/firm/{parent.role_id}/tasks/{run_id}/credentials/")

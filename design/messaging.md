@@ -58,7 +58,7 @@ Each message is stored once (`m1`, `m2`, …), with independent per-recipient de
 
 When a role calls `context(conversation="c9")` (or introduces a colleague with `reply(..., add=[D], summarize=true)`):
 1. **Selection:** The runtime gathers the newest messages in `c9` first, then walks backward through up to 5 ancestors along `continues` until reaching the 50-message or 64 KiB selection limit. (If the newest message alone exceeds 64 KiB, it is excerpted rather than skipped in favor of older mail.)
-2. **Isolated Summarizer:** Runs an isolated, tool-free turn on the caller's bound provider account without consuming an active role slot (capped at 4 concurrent isolated calls firm-wide, 30s timeout, 1,000 output tokens).
+2. **Isolated Summarizer:** Runs an isolated, tool-free turn on the caller's bound provider account without consuming an active role slot (capped at 4 concurrent isolated calls firm-wide, 30s timeout, 16 KiB of summary text). A longer summary is cut to fit, ends with a marker line saying so, and is flagged `truncated: true`.
 3. **Never blocks sending:** On `reply(..., summarize=true)`, the summary is computed before opening the send transaction and attached as derived text. If the summarizer times out or is busy, the introduction message is still sent immediately without the summary.
 
 ---

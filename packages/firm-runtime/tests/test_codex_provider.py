@@ -127,7 +127,6 @@ def test_builds_summary_spec_without_role_authority_or_tools(tmp_path):
     request = SummaryLaunch(
         "summary-" + uuid4().hex[:32],
         "derive this",
-        1000,
         30,
         account_id="personal",
         provider="codex",

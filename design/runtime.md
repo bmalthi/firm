@@ -157,6 +157,7 @@ Every failure is classified from structured provider/sandbox evidence before cha
 | **Owner stop / Pre-launch exit** | Queue interrupted work for next start. | **No** (refunded) |
 | **Explicit model refusal** | Hold the role; notify direct manager (or Owner for Founder). | Yes |
 | **Transient / Unclassified crash** | Isolate to the role; retry on `1m / 5m / 30m` schedule. | Yes |
+| **Transient provider setup (named account, before launch)** | Retry on the same schedule; hold `attempts_exhausted` after the fourth failure. | Yes |
 
 ### Recovery Notice
 When a role restarts after an abnormal exit that actually ran, it receives a minimal recovery notice: the UTC detection time, whether session context was retained, the **last 5 claimed message IDs and subjects**, and a reminder to check workspace files before repeating side effects.

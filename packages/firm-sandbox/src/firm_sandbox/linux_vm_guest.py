@@ -861,6 +861,9 @@ def install_docker(info):
     )
     privileged.run(user_systemctl(info, "disable", "docker.service"))
     settle(info)
+    # The installer does not fsync its user unit. Commit its files before recording
+    # the role: a later emergency power-off must not leave an empty (masked) unit.
+    privileged.run(["sync", "-f", info["home"]])
 
 
 def provision(role):

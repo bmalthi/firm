@@ -261,7 +261,12 @@ returns an unavailable result rather than switching providers. Its
 foreground process receives no MCP server, activation token, workspace or drive.
 
 An unavailable summary or hiring-level assessment records a short reason in
-`summary_runs.reason`, such as `busy`, `timeout`, `output_limit` or `empty_summary`. When the
+`summary_runs.reason`, such as `busy`, `timeout`, `output_limit` or `empty_summary`.
+`output_limit` means a chooser answer exceeded 16 KiB or the provider stream exceeded 256 KiB.
+Conversation summaries are limited to 16 KiB of text. A longer summary is cut to fit and
+ends with the line `[THIS SUMMARY WAS CUT OFF at 16 KiB; the rest was not delivered.]`;
+the `context` result or `reply` receipt then carries `truncated: true`. Reported output
+tokens are recorded as usage. When the
 provider turn itself fails, the reason is the provider's failure kind — `process_exit`,
 `result_error`, `turn_failed`, `invalid_output`, `activation_gate` or `launcher_setup` — and
 `provider_error` only when there is none. For `process_exit`, read the guest log with
@@ -756,6 +761,12 @@ observations do not generate duplicate notices. Clearing a specific incident doe
 newer incident or reset a role's attempt budget. Manager retry releases only an exact isolated
 refusal or exhaustion episode and reports when execution remains blocked on a dependency.
 
+On a named account, a transient provider-setup failure before launch consumes one role
+attempt and uses the normal retry delay; the fourth failure holds the role with
+`attempts_exhausted`. Setup `auth` and `config` failures create account holds without
+spending attempts. Without a named account, any setup failure closes admission until
+the owner repairs the configuration.
+
 ### Moving a role to another provider
 
 Configure the named account and profile, stop the role, wait for confirmed exit, then route
@@ -771,6 +782,9 @@ This preserves files, mail and previous failure accounting. It starts fresh cont
 transfer a provider conversation. `resume-role` reopens a paused role with its retained
 conversation instead. Isolated role holds still require an authorized `retry` against the current
 recovery episode, and a stopped firm additionally needs an explicit start.
+The held-role notice, sent to the role's manager (the owner, for the founder), names
+`firm route --fresh` on the current profile for when retained context is unusable. Routing
+discards that conversation and resets the role's effort to the profile default.
 
 ## Context pressure
 

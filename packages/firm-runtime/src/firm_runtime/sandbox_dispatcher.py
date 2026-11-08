@@ -981,7 +981,7 @@ class SandboxDispatcher:
                     managed = self.runtime.accounts.binding(db, invocation.session_id) is not None
                 if managed:
                     category = getattr(exc, "category", "config")
-                    if category not in {"auth", "config"}:
+                    if category not in {"auth", "config", "transient"}:
                         category = "config"
                     self.runtime.finish(invocation.activation_id, "interrupted", category=category)
                     continue
