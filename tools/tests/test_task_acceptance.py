@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from firm_runtime.agy_provider import AgyProvider
 from firm_runtime.claude_provider import ClaudeProvider
 from firm_runtime.codex_provider import CodexProvider
 from firm_sandbox import RunSpec
@@ -145,3 +146,87 @@ def test_acceptance_wraps_real_task_spec_and_filters_auth_evidence(monkeypatch, 
     assert task.auth_file_evidence(b"no receipt", provider, "one") == {
         "path": path, "passed": False,
     }
+
+
+@pytest.mark.parametrize("state", ["clean", "refresh", "email", "copied", "symlink",
+                                   "missing", "public", "outside_run"])
+def test_agy_guest_checks_ephemeral_projection_and_native_file_cleanup(tmp_path, state):
+    namespace = {"__name__": "probe_test"}
+    exec(task.AUTH_PROBE, namespace)
+    run = tmp_path / "run"
+    run.mkdir()
+    source = run / "agy-auth" if state != "outside_run" else tmp_path / "outside"
+    document = {"auth_method": "oauth-personal", "token": {
+        "access_token": "synthetic-access-never-in-evidence", "token_type": "Bearer",
+        "expiry": "2099-01-01T00:00:00Z", "refresh_token": "",
+    }}
+    if state == "refresh":
+        document["token"]["refresh_token"] = "synthetic-refresh-never-in-evidence"
+    if state == "email":
+        document["email"] = "synthetic-owner@example.invalid"
+    if state != "missing":
+        source.write_text(json.dumps(document))
+        source.chmod(0o644 if state == "public" else 0o600)
+    path = tmp_path / "native-auth"
+    if state == "copied":
+        path.write_text(json.dumps(document))
+    elif state == "symlink":
+        path.symlink_to(source)
+    evidence = namespace["agy_auth_evidence"](path, source, run)
+    assert evidence["passed"] is (state == "clean")
+    assert "synthetic-" not in json.dumps(evidence)
+    assert evidence["kind"] == "agy-access"
+
+
+def test_agy_auth_receipt_filters_values_and_recomputes_pass():
+    path = task.auth_file_evidence(b"", "agy", "one")["path"]
+    assert "/home/.firm/agy-sessions/" in path
+    assert path.endswith("/.gemini/antigravity-cli/antigravity-oauth-token")
+    receipt = {"path": path, "kind": "agy-access", "private_file": True,
+               "projection_into_run": True, "absent": True, "access_only": True,
+               "no_refresh_token": True, "no_email": True, "passed": True}
+    logs = json.dumps({"task_auth_files": {**receipt, "extra": "synthetic-private"}}).encode()
+    assert task.auth_file_evidence(logs, "agy", "one") == receipt
+    receipt["no_refresh_token"] = False
+    logs = json.dumps({"task_auth_files": receipt}).encode()
+    assert not task.auth_file_evidence(logs, "agy", "one")["passed"]
+    assert not task.auth_file_evidence(logs, "agy", "different")["passed"]
+    with pytest.raises(KeyError):
+        task.auth_file_evidence(b"", "unknown", "one")
+
+
+def test_agy_advertised_firm_tools_are_seen_inside_init():
+    logs = json.dumps({"event": "init", "conversation_id": "synthetic-id",
+                       "init": {"tools": ["mcp_firm_peek"]}}).encode()
+    assert task.output_evidence(logs, AgyProvider, "ROLE-marker")["firm_tools_seen"]
+
+
+def test_agy_task_wrapper_separates_receipt_from_native_parser(monkeypatch):
+    projection = {"auth_method": "oauth-personal", "token": {
+        "access_token": "synthetic-access", "token_type": "Bearer",
+        "expiry": "2099-01-01T00:00:00Z", "refresh_token": "",
+    }}
+    spec = RunSpec("role", ("python", "launcher"), env={
+        "FIRM_AGY_MODE": "task", "FIRM_AGY_ARGV": json.dumps([
+            "agy", "--model", "gemini-3.8-flash-high"]),
+    }, secrets={"agy-auth": json.dumps(projection).encode()}, stdin=b"synthetic instruction")
+    parsed = []
+    monkeypatch.setattr(task.Providers, "__init__", lambda *args: None)
+    monkeypatch.setattr(task.Providers, "task_runner", lambda *args, **kwargs: SimpleNamespace(
+        build_spec=lambda request, parent: spec,
+        parse_output=lambda request, logs, *args, **kwargs: parsed.append(logs),
+    ))
+    box = SimpleNamespace(child_layout=lambda *args: SimpleNamespace(python="guest-python"))
+    providers = task.TaskProviders(None, None)
+    runner = providers.task_runner(box, mcp_url="unused")
+    request = SimpleNamespace(provider="agy", run_id="one")
+    wrapped = runner.build_spec(request, SimpleNamespace(role_id="role"))
+    assert wrapped.argv == ("guest-python", "-c", task.AUTH_PROBE, "agy", *spec.argv)
+    assert wrapped.stdin == spec.stdin and wrapped.secrets == spec.secrets
+    assert providers.launches["one"]["credential_projection"]["passed"]
+    native = b'{"event":"result"}\n'
+    logs = native + b'{"task_auth_files":{"passed":true}}\n'
+    runner.parse_output(request, logs, 0, apply_holds=True)
+    assert parsed == [native]
+    # Do not hide a malformed native tail or an event after the wrapper receipt.
+    assert task.provider_output(logs + b"unexpected\n") == logs + b"unexpected\n"

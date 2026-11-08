@@ -43,6 +43,9 @@ LOGGER = logging.getLogger(__name__)
 BASELINE_HOSTS = tuple(sorted({
     # Model providers: Claude Code and Codex, whose web search runs provider-side.
     "*.anthropic.com", "*.claude.com", "*.openai.com", "chatgpt.com", "*.chatgpt.com",
+    # AGY subscription: access-token identity, inference and client/model services.
+    # OAuth renewal stays on the host; avatar and telemetry hosts are unnecessary.
+    "www.googleapis.com", "daily-cloudcode-pa.googleapis.com",
     # GitHub: git over HTTPS, the API, release downloads and raw content.
     "github.com", "*.github.com", "*.githubusercontent.com",
     # Language registries and uv's installer bootstrap plus its redirect download host.
@@ -57,6 +60,9 @@ BASELINE_HOSTS = tuple(sorted({
     # downloads that mac-image-apply's simulator runtimes need.
     "*.apple.com", "*.cdn-apple.com", "formulae.brew.sh",
 }))
+
+# First-boot downloads only; never part of a role's baseline host list.
+PROVISION_HOSTS = ("storage.googleapis.com",)
 
 # The Linux image's own boot provisioning (apt, Docker, uv, Node, npm). Not a role ID,
 # so it can never be one role's name.
@@ -469,16 +475,17 @@ class EgressProxy:
     def set_granted(self, hosts) -> None:
         """Replace the granted hosts; open relays to a host no longer allowed are closed."""
         self.granted = tuple(hosts)
-        self._close_relays("revoked", lambda host: not self.allowed(host))
+        self._close_relays("revoked", lambda record: not self.allowed(
+            record["host"], record["role"]))
 
     def close_relays(self) -> None:
         """End every open relay: egress was cut off."""
-        self._close_relays("egress_off", lambda host: True)
+        self._close_relays("egress_off", lambda record: True)
 
     def _close_relays(self, reason, condition):
         def close():
             for task, record in list(self._relays.items()):
-                if condition(record["host"]):
+                if condition(record):
                     record["reason"] = reason
                     task.cancel()
 
@@ -489,12 +496,13 @@ class EgressProxy:
             except RuntimeError:
                 pass  # The loop closed meanwhile, and its relays with it.
 
-    def listed(self, host: str) -> bool:
+    def listed(self, host: str, identity: str | None = None) -> bool:
         """Whether the host is on the firm's list, as enforce mode decides it."""
-        return permitted(host, self.configured + self.granted)
+        setup = PROVISION_HOSTS if identity == PROVISION and self.provisioning() else ()
+        return permitted(host, self.configured + self.granted + setup)
 
-    def allowed(self, host: str) -> bool:
-        return self.mode == "observe" or self.listed(host)
+    def allowed(self, host: str, identity: str | None = None) -> bool:
+        return self.mode == "observe" or self.listed(host, identity)
 
     @property
     def alive(self) -> bool:
@@ -645,6 +653,7 @@ class EgressProxy:
                 [("Proxy-Authenticate", 'Basic realm="firm"')],
             )
         record["role"] = role
+        record["listed"] = self.listed(host, role)
         if port != PORTS[scheme]:
             return await self._deny(
                 writer, record, 403, "port", f"Only {scheme} on port {PORTS[scheme]} is allowed"
@@ -657,7 +666,7 @@ class EgressProxy:
             hostname(host)
         except ValueError:
             return await self._deny(writer, record, 400, "bad_host", f"Invalid host: {host}")
-        if not self.allowed(host):
+        if not self.allowed(host, role):
             return await self._deny(
                 writer, record, 403, "not_allowed", f"Host not allowed by the firm: {host}"
             )
@@ -700,7 +709,7 @@ class EgressProxy:
                 else:
                     reason = None if name == host else "sni_mismatch"
                     # The grant may have gone while the client was sending its hello.
-                    if reason is None and not self.allowed(host):
+                    if reason is None and not self.allowed(host, role):
                         reason = "revoked"
                 if reason is not None:
                     record["allowed"], logged = False, True

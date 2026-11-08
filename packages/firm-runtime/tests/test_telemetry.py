@@ -19,7 +19,7 @@ from firm_runtime.telemetry import context_policy
         ("claude", "opus", 500_000),
         ("claude", "claude-fable-5-1", 500_000),
         ("claude", "sonnet", 500_000),
-        ("agy", "gemini-3.8-flash-high", 500_000),
+        ("agy", "gemini-3.8-flash", None),
         ("codex", "gpt-5.6-sol", 256_000),
         ("codex", "gpt-6-astra", 256_000),
     ],

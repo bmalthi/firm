@@ -14,7 +14,7 @@ from .store import OWNER, encoded
 
 DEFAULT_ADVISORY_FRACTION = 0.60
 DEFAULT_HANDOFF_RESERVE = 10_000
-DEFAULT_CONTEXT_WINDOWS = {"claude": 500_000, "agy": 500_000, "codex": 256_000}
+DEFAULT_CONTEXT_WINDOWS = {"claude": 500_000, "codex": 256_000}
 CONTEXT_POLICY_KEYS = frozenset({"context_window", "context_advisory_fraction", "handoff_reserve"})
 
 SCHEMA = """

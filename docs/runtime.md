@@ -154,6 +154,29 @@ An explicit absolute `auth_file` (`~` is expanded) overrides the default. Pointi
 CLI's own login, such as `~/.codex/auth.json` or an export of Claude Code's Keychain item,
 works but shares that login's refresh token as described above.
 
+### Provider differences
+
+Host paths below are relative to `~/.config/firm-runtime/credentials/` unless
+`auth_file` overrides them. Model defaults are written as model / effort;
+class entries are ordered low, medium, high. Quota and context depend on provider reports.
+
+| Difference | [Codex](#codex) | [Claude](#claude) | [AGY](#experimental-agy-configuration) |
+| --- | --- | --- | --- |
+| Sign-in | `firm login ACCOUNT --provider codex`: browser login | `firm login ACCOUNT --provider claude`: `setup-token` | `firm login ACCOUNT --provider agy`: native `agy acp --login` |
+| Host credentials | `ACCOUNT.json` | `ACCOUNT.json` | `ACCOUNT-agy/home/.gemini/antigravity-cli/antigravity-oauth-token` |
+| VM credentials | OAuth access bundle, blank refresh token; or static API key | Setup token as-is; or OAuth access bundle without refresh token | Access-only token file, blank refresh token |
+| [Renewal](#renewal) | Host OAuth exchange within 10 min of expiry; API keys static | Repeat setup-token sign-in; OAuth JSON uses host exchange within 10 min | Host `agy models` below 50 min; macOS Keychain sandbox |
+| [Model classes](#firm-configuration): low, medium, high | `gpt-6-luna` / high; `gpt-6.1-sol` / high; `gpt-6-astra` / medium | `sonnet` / high; `opus` / high; `claude-fable-5-1` / high | `gemini-3.8-flash` / medium; `gemini-3.8-flash` / high; `gemini-4-argon` / medium |
+| Chooser / [summary](#correspondence-summaries) default | `gpt-6-luna` / medium | `sonnet` / medium | `gemini-3.8-flash` / medium |
+| [Task](#tasks) default | `gpt-6.1-sol` / medium | `opus` / medium | `gemini-3.8-flash` / high |
+| Accepted efforts | low, medium, high, xhigh, max, ultra | low, medium, high, xhigh, max | low, medium, high; Firm `xhigh` → `gemini-4-argon-high` |
+| Resume / retained conversation | `exec resume`; private `sessions` tree | `--resume`; private `projects` tree | `--conversation`; private HOME and checked conversation DB |
+| [Web search](installation.md#4-default-firewall-web-search-and-network-egress) | Provider-side `web_search` | Provider-side `WebSearch` | Provider-side `search_web` for roles/tasks |
+| [Page fetch](linux-vm.md#network-access-and-cutoff) | Shell `curl` through firewall | `WebFetch` through firewall | Shell `curl` through firewall; native page fetch denied |
+| [Quota](#accounts-quota-and-recovery) / [context](#context-pressure) | Quota polling/stream; context from rollout | Quota stream (OAuth JSON also polling); context from stream | Unavailable |
+| [Provider network hosts](linux-vm.md#network-access-and-cutoff) | `*.openai.com`, `chatgpt.com`, `*.chatgpt.com` | `*.anthropic.com`, `*.claude.com` | `www.googleapis.com`, `daily-cloudcode-pa.googleapis.com`; `storage.googleapis.com` for setup only |
+| Status | Supported | Supported | Experimental subscription provider |
+
 ### Claude
 
 The guided first sign-in uses `claude setup-token` in an isolated configuration and
@@ -1162,3 +1185,76 @@ uv run firm status firms/example
 Initialization is repeatable with identical inputs and creates only the founder, in a stopped firm.
 Owner mail queues work without starting execution. `firm_id` and role slugs use lowercase letters,
 digits, underscores and hyphens.
+
+## Experimental AGY configuration
+
+`agy` is an experimental subscription provider; see [host setup and login](installation.md#experimental-agy-integration).
+
+```toml
+staffing = false
+founder_profile = "agy"
+
+[profiles.agy]
+provider = "agy"
+model = "gemini-3.8-flash"
+effort = "medium"
+accounts = ["agy-personal"]
+
+[accounts.agy-personal]
+provider = "agy"
+max_active = 1
+```
+
+Firm stores model and effort separately. Low/medium classes select
+`gemini-3.8-flash`; high selects `gemini-4-argon`, with class default efforts
+medium/high/medium respectively. The founder's high/high override selects Argon
+high. Chooser/summary defaults are Flash medium; tasks default to Flash high.
+Efforts low, medium and high append a suffix to the base model. **Firm xhigh
+selects `gemini-4-argon-high` regardless of class**; native xhigh is unsupported.
+The command passes only `--model`. Console diagnostics report native `init.model`;
+the retained binding separately stores the configured base identity.
+
+Role/task agents declare bounded file/shell tools plus provider-side `search_web`,
+using `toolPermission: "always-proceed"` and `agentMode: "accept-edits"` with VM/UID
+isolation. Firm denies `read_url(*)` and `execute_url(*)`, plus `mcp(*)` outside
+roles. Search needs no extra permission namespace or page-fetch allowance.
+Every agent sets `inheritCustomizations: false`; workspace instructions can reach
+role/task runs. Tool-free runs declare `tools: []` and explicitly deny native
+names/namespaces, including search, `manage_task` and `mcp(*)`, under strict
+permissions. Empty declarations alone do not enforce isolation: implicit native
+tools, delegation, browser and scheduler exclusion are unproven, and an implicit
+`manage_task` step can occur. Summaries have no shares or role authority.
+
+Only roles get eager authenticated Firm MCP, with an activation bearer and the
+configured task timeout. Tasks and summaries get no MCP config. A tool ERROR
+does not fail an otherwise successful activation: the protocol cannot distinguish
+ordinary tool errors from transport/auth failures. Missing MCP without a structured
+failure cannot be reliably inferred from prose.
+
+Each Firm session retains a private native HOME at `.firm/agy-sessions/SESSION_UUID`
+for conversations, summaries and cache. Settings/agents are rewritten per activation;
+access credentials and role MCP headers link to ephemeral credentials, with stale
+links removed before preparation and links removed at exit. Resume requires an
+existing regular, non-symlink `conversations/ID.db`; a returned ID mismatch kills
+the child and fails. Only a valid SUCCESS with exit zero completes a turn.
+
+AGY reads credentials once. Firm requests native renewal below 50 minutes of
+token lifetime and bounds print timeout by the staged lifetime minus 300 seconds
+(with a one-second guard), independently of the activity-extended inactivity
+deadline. Long turns yield after roughly 45–55 minutes and resume the same
+conversation with fresh credentials, without a dependency hold or spending the
+failure budget. The launcher forwards signals, kills process-group children and
+reaps its child; sandbox cgroup cleanup provides the final execution boundary.
+Terminal ERROR and transient pre-launch failures use the ordinary four-attempt
+role budget/backoff and role-scoped hold; local resume/settings failures do not
+create shared account/profile holds. See [expiry recovery and clock requirements](installation.md#experimental-agy-integration).
+
+Usage is cumulative per conversation: input, output, cache-read and thinking map
+to session counters, with thinking included in output. Activation deltas, context
+occupancy/window, compactions and quota are unknown. Fresh summary/chooser/task
+sessions also report session totals as run totals, without double counting.
+Summary/chooser `output_tokens` use the raw reported total; reasoning is also
+reported separately. Those turns use a 30-second timeout, configured effort,
+brevity instructions, a 256 KiB stream cap and 16 KiB answer-text cap. Overlong
+summaries are cut with a visible marker; overlong chooser answers are rejected.
+These byte caps do not cap generation cost.

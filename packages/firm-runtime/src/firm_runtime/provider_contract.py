@@ -30,6 +30,8 @@ SetupCategory = Literal["auth", "config", "transient"]
 MAX_RETRY_AFTER_SECONDS = 7 * 24 * 60 * 60
 SAFE_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 SUPPORTED_EFFORTS = {
+    # Owner mapping: Firm xhigh selects native Argon high, never native xhigh.
+    "agy": frozenset({"low", "medium", "high", "xhigh"}),
     "codex": frozenset({"low", "medium", "high", "xhigh", "max", "ultra"}),
     "claude": frozenset({"low", "medium", "high", "xhigh", "max"}),
 }
@@ -97,6 +99,7 @@ class ProviderResult:
     final_text: str | None
     error: ProviderError | None
     usage: ProviderUsage | None = None
+    interrupted: bool = False
 
 
 @dataclass(frozen=True)

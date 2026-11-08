@@ -18,9 +18,11 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
+from . import agy_auth
 from .claude_provider import _read_auth as read_claude_auth
 from .codex_provider import _read_auth as read_codex_auth
 from .provider_contract import ProviderSetupError
+from .provider_support import read_private_credential
 
 REFRESH_MARGIN = 600
 MAX_RESPONSE_BYTES = 1024 * 1024
@@ -61,7 +63,7 @@ def _jwt_expiry(token):
 
 
 def _decode(provider, raw):
-    if provider not in OAUTH_ENDPOINTS:
+    if provider not in (*OAUTH_ENDPOINTS, "agy"):
         raise _failure("credential_provider_invalid")
     try:
         text = raw.decode() if isinstance(raw, bytes) else raw
@@ -72,7 +74,8 @@ def _decode(provider, raw):
         value = json.loads(text)
         if not isinstance(value, dict):
             raise ValueError
-        return "credentials-json" if provider == "claude" else "codex-json", value
+        kind = {"claude": "credentials-json", "codex": "codex-json", "agy": "agy-access"}
+        return kind[provider], value
     except (UnicodeError, ValueError, AttributeError, TypeError):
         raise _failure("credential_invalid") from None
 
@@ -80,6 +83,8 @@ def _decode(provider, raw):
 def guest_credentials(provider, raw):
     """Project an already-read credential bundle without network or filesystem mutation."""
     kind, document = _decode(provider, raw)
+    if provider == "agy":
+        return agy_auth.access_projection(document)
     if kind == "oauth-token":
         return {"kind": kind, "data": document, "expires_at": None}
     if provider == "claude":
@@ -151,6 +156,8 @@ def open_without_redirects(request, *, timeout):
 
 def refresh_credentials(provider, document, now):
     """Exchange one refresh token, returning a complete renewed host-only bundle."""
+    if provider == "agy":
+        raise _failure("credential_native_renewal_required")
     fields = document.get("claudeAiOauth" if provider == "claude" else "tokens", {})
     key = "refreshToken" if provider == "claude" else "refresh_token"
     refresh = fields.get(key)
@@ -218,6 +225,9 @@ class CredentialStore:
         self.clock, self.refresh = clock, refresh
 
     def _read(self):
+        if self.provider == "agy":
+            agy_auth.profile_home(self.path)
+            return read_private_credential(self.path, "AGY")
         if self.provider == "claude":
             return read_claude_auth(self.path)[1]
         if self.provider == "codex":
@@ -283,6 +293,8 @@ class CredentialStore:
         if len(raw) > MAX_RESPONSE_BYTES:
             raise _failure("credential_too_large")
         guest_credentials(self.provider, raw)
+        if self.provider == "agy":
+            agy_auth.prepare_profile(self.path)
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with self._lock():
             descriptor, temporary = tempfile.mkstemp(prefix=".firm-auth-", dir=self.path.parent)
@@ -298,7 +310,58 @@ class CredentialStore:
                 except FileNotFoundError:
                     pass
 
+    def _agy_snapshot(self, force, *, margin=agy_auth.RENEWAL_MARGIN):
+        agy_auth.profile_home(self.path)
+        try:
+            raw, document = agy_auth.read_native(self.path)
+            snapshot = agy_auth.access_projection(document)
+        except ProviderSetupError:
+            pass  # A native mid-write gets a second read under the renewal lock.
+        else:
+            backup = agy_auth._expiry_backup(self.path)
+            if (not force and not backup.exists() and not backup.is_symlink()
+                    and (margin is None or snapshot["expires_at"] >= self.clock() + margin)):
+                return snapshot
+        with self._lock():
+            agy_auth.restore_expiry(self.path, replace=self._replace)
+            for _ in range(3):
+                raw, document = agy_auth.read_native(self.path)
+                current = agy_auth.access_projection(document)
+                if not force and (margin is None or current["expires_at"] >= self.clock() + margin):
+                    return current
+                try:
+                    renewed = agy_auth.force_renew(self.path, replace=self._replace)
+                except (ProviderSetupError, OSError) as exc:
+                    if isinstance(exc, OSError):
+                        exc = _failure("credential_persist_unavailable", transient=True)
+                    if agy_auth.read_native(self.path)[1] != document:
+                        force = False
+                        continue
+                    # Native CLI has no structured HTTP rejection; do not infer from prose.
+                    if exc.category == "transient":
+                        if current["expires_at"] > self.clock() + 300:
+                            return current
+                        if current["expires_at"] <= self.clock():
+                            raise _failure("credential_refresh_rejected") from None
+                    raise exc from None
+                native, native_document = agy_auth.read_native(self.path)
+                if native_document != renewed:
+                    force = False
+                    continue
+                result = guest_credentials(self.provider, native)
+                if result["expires_at"] <= self.clock():
+                    raise _failure("credential_refresh_invalid", transient=True)
+                try:
+                    if self._replace(native, renewed):
+                        return result
+                except OSError:
+                    raise _failure("credential_persist_unavailable", transient=True) from None
+                force = False
+        raise _failure("credential_refresh_conflict", transient=True)
+
     def snapshot(self, force=False):
+        if self.provider == "agy":
+            return self._agy_snapshot(force)
         original = self._read()
         snapshot = guest_credentials(self.provider, original)
         if snapshot["expires_at"] is None and snapshot["kind"] == "oauth-token":

@@ -4,6 +4,8 @@ Firm ([`bmalthi/firm`](https://github.com/bmalthi/firm)) is an experimental mult
 
 It runs with one or more Claude or Codex subscriptions.
 
+Experimental Antigravity CLI (AGY) provider support aims to add another subscription-backed option. See [the tracking issue](https://github.com/bmalthi/firm/issues/1) and [AGY setup and limitations](docs/installation.md#experimental-agy-integration).
+
 I had a lot of fun building this. I wanted to explore what happens when a multi-agent system tries to do real software work without risking my local machine—so I built heavy OS, network, and credential safeguards around a dedicated Linux VM (and an optional macOS VM for Xcode and iOS Simulator work) where you can safely let a dozen or more agents loose and go burn some tokens. See **[what we gave / what we learned](examples/README.md)** for recorded runs, deliverables, and transcripts.
 
 ---

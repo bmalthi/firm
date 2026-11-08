@@ -1,0 +1,34 @@
+{
+  "fixture_kind": "captured_sanitized",
+  "runtime": "1.5.3",
+  "capture": "2026-11-07 isolated HOME, no injected credentials; prose replaced",
+  "events": [
+    {
+      "event": "result",
+      "result": {
+        "conversation_id": "",
+        "status": "ERROR",
+        "response": "",
+        "error": "redacted startup diagnostic",
+        "duration_seconds": 0,
+        "num_turns": 0,
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "thinking_tokens": 0,
+          "cache_read_tokens": 0,
+          "total_tokens": 0
+        },
+        "finished_reason": "redacted"
+      }
+    }
+  ],
+  "exit_code": 1,
+  "expected": {
+    "success": false,
+    "protocol_complete": true,
+    "startup_failure": true,
+    "status": "ERROR",
+    "error": "process_exit"
+  }
+}

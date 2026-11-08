@@ -633,7 +633,9 @@ class Runtime:
                         (attempts, role["employee_id"]),
                     )
                 if (category == "owner_stop"
-                        or (activation["launch_attempted_at"] is None and not setup_retry)):
+                        or (activation["launch_attempted_at"] is None and not setup_retry)
+                        or (outcome == "interrupted"
+                            and category == "transient" and not setup_retry)):
                     if activation["launch_attempted_at"] is not None:
                         db.execute(
                             "UPDATE roles SET attempt_count=MAX(0,attempt_count-1) "

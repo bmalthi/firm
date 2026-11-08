@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 import time
 import tomllib
 import uuid
@@ -26,14 +27,25 @@ from firm_runtime.store import OWNER, Store
 from firm_runtime.task_runner import read_child_logs
 from firm_sandbox import Config, RunSpec, Sandbox
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from provider_checks.acceptance_common import (  # noqa: E402
+    AGY_PROJECTION_CHECK,
+    PROVIDERS,
+    agy_launch_evidence,
+    agy_output_evidence,
+    provider_output,
+    selected_profile,
+)
+
 CHECKS = ("answer", "isolation", "auth_files", "concurrency", "timeout", "scope",
           "parent_stop", "analysis")
 
 # Inspect after the provider exits but before the supervisor removes the task home.
-# Only file metadata is read; neither credential contents nor link targets are emitted.
+# AGY additionally checks its access-only JSON shape; no values or link targets are emitted.
 AUTH_PROBE = r'''
-import json, os, subprocess, sys
+import json, os, stat, subprocess, sys
 from pathlib import Path
+''' + AGY_PROJECTION_CHECK + r'''
 
 def auth_evidence(path, requires_symlink, run_root=Path('/run')):
     try:
@@ -45,13 +57,41 @@ def auth_evidence(path, requires_symlink, run_root=Path('/run')):
             'symlink_into_run': in_run, 'absent': absent,
             'passed': in_run if requires_symlink else absent}
 
+def agy_auth_evidence(path, credential, run_root=Path('/run')):
+    result = {'path': str(path), 'private_file': False, 'projection_into_run': False,
+              'absent': not path.exists() and not path.is_symlink(),
+              **agy_projection_evidence(b'')}
+    try:
+        result['projection_into_run'] = credential.resolve(strict=True).is_relative_to(run_root)
+        details = credential.stat()
+        result['private_file'] = (stat.S_ISREG(details.st_mode)
+                                  and stat.S_IMODE(details.st_mode) == 0o600
+                                  and details.st_uid == os.getuid())
+        if result['projection_into_run'] and result['private_file'] and details.st_size <= 65536:
+            result.update(agy_projection_evidence(credential.read_bytes()))
+        result['passed'] = (result['absent'] and result['projection_into_run']
+                            and result['private_file'] and result['passed'])
+    except (OSError, ValueError):
+        pass
+    return result
+
 if __name__ == '__main__':
     provider = sys.argv[1]
     code = subprocess.run(sys.argv[2:], check=False).returncode
-    name = 'auth.json' if provider == 'codex' else '.credentials.json'
-    path = Path(os.environ['FIRM_STATE_DIR']) / provider / name
-    required = provider == 'codex' or os.environ['FIRM_CLAUDE_AUTH_KIND'] == 'credentials-json'
-    print(json.dumps({'task_auth_files': auth_evidence(path, required)}), flush=True)
+    state = Path(os.environ['FIRM_STATE_DIR'])
+    if provider == 'agy':
+        home = (Path(os.environ['FIRM_PRIVATE_HOME']) / '.firm/agy-sessions'
+                / os.environ['FIRM_RUNTIME_SESSION_ID'])
+        receipt = agy_auth_evidence(
+            home / '.gemini/antigravity-cli/antigravity-oauth-token',
+            Path(os.environ['FIRM_CREDENTIALS_DIR']) / 'agy-auth')
+    elif provider in ('codex', 'claude'):
+        name = {'codex': 'auth.json', 'claude': '.credentials.json'}[provider]
+        required = provider == 'codex' or os.environ['FIRM_CLAUDE_AUTH_KIND'] == 'credentials-json'
+        receipt = auth_evidence(state / provider / name, required)
+    else:
+        raise ValueError('unsupported acceptance provider')
+    print(json.dumps({'task_auth_files': receipt}), flush=True)
     sys.exit(code if code >= 0 else 128 - code)
 '''
 
@@ -89,7 +129,7 @@ if mode == 'parent':
     work.mkdir()
     (work / 'probe.py').write_text(Path(__file__).read_text())
     (work / 'input.json').write_text(os.environ['PROBE_INPUT'])
-    for name in ('AGENTS.md', 'CLAUDE.md'):
+    for name in ('AGENTS.md', 'CLAUDE.md', 'GEMINI.md'):
         Path(name).write_text('Your role instruction marker is ' + os.environ['PROBE_ROLE_MARKER'])
     def stopped(signum, frame):
         target = work / 'stop-target.json'
@@ -190,6 +230,7 @@ class TaskProviders(Providers):
     def __init__(self, runtime, parent):
         super().__init__(runtime)
         self.parent = parent
+        self.launches = {}
 
     def for_session(self, session_id):
         return self.parent
@@ -200,10 +241,22 @@ class TaskProviders(Providers):
 
         def build_with_auth_probe(request, parent):
             spec = build(request, parent)
+            if request.provider == "agy":
+                receipt = agy_launch_evidence(spec)
+                self.launches[request.run_id] = receipt
+                if not receipt["passed"]:
+                    raise ValueError("AGY launch route or access projection failed acceptance")
             return replace(spec, argv=(sandbox.child_layout(parent.role_id, request.run_id).python,
                                        "-c", AUTH_PROBE, request.provider, *spec.argv))
 
         runner.build_spec = build_with_auth_probe
+        parse = getattr(runner, "parse_output", None)
+        if parse is not None:
+            def parse_with_probe(request, logs, *args, **kwargs):
+                if request.provider == "agy":
+                    logs = provider_output(logs)
+                return parse(request, logs, *args, **kwargs)
+            runner.parse_output = parse_with_probe
         return runner
 
 
@@ -227,8 +280,10 @@ def output_evidence(logs, adapter, marker):
             continue
         if isinstance(event, dict):
             events.append(event)
-    tools = adapter.parse_tool_calls(logs)
-    advertised = [tool for e in events if isinstance(e.get("tools"), list)
+    tools = adapter.parse_tool_calls(provider_output(logs))
+    inventories = [e.get("init", {}) if e.get("event") == "init" else e for e in events]
+    advertised = [tool for e in inventories if isinstance(e, dict)
+                  and isinstance(e.get("tools"), list)
                   for tool in e["tools"] if isinstance(tool, str)]
     return {
         "sha256": hashlib.sha256(logs).hexdigest(), "bytes": len(logs),
@@ -245,38 +300,55 @@ def survivors(before, after):
 
 
 def auth_file_evidence(logs, provider, run_id):
-    name = "auth.json" if provider == "codex" else ".credentials.json"
-    path = f"/var/lib/firm/task-homes/{run_id}/state/{provider}/{name}"
+    if provider == "agy":
+        session = uuid.uuid5(uuid.NAMESPACE_URL, run_id)
+        path = (f"/var/lib/firm/task-homes/{run_id}/home/.firm/agy-sessions/{session}"
+                "/.gemini/antigravity-cli/antigravity-oauth-token")
+    else:
+        relative = {"codex": "codex/auth.json", "claude": "claude/.credentials.json"}[provider]
+        path = f"/var/lib/firm/task-homes/{run_id}/state/{relative}"
     for line in reversed(logs.splitlines()):
         try:
             event = json.loads(line)
         except (ValueError, UnicodeDecodeError):
             continue
         receipt = event.get("task_auth_files") if isinstance(event, dict) else None
-        keys = ("requires_symlink", "symlink_into_run", "absent", "passed")
+        keys = (("private_file", "projection_into_run", "absent", "access_only",
+                 "no_refresh_token", "no_email", "passed")
+                if provider == "agy" else
+                ("requires_symlink", "symlink_into_run", "absent", "passed"))
         if (isinstance(receipt, dict) and receipt.get("path") == path
                 and all(type(receipt.get(key)) is bool for key in keys)):
+            if provider == "agy":
+                return {"path": path, "kind": "agy-access",
+                        **{key: receipt[key] for key in keys},
+                        "passed": receipt.get("kind") == "agy-access"
+                        and all(receipt[key] for key in keys)}
             return {"path": path, **{key: receipt[key] for key in keys}}
     return {"path": path, "passed": False}
 
 
-def main():
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True, help="Firm containing sandbox.toml")
     parser.add_argument("--evidence", type=Path, required=True)
-    parser.add_argument("--provider", choices=("codex", "claude"), required=True)
+    parser.add_argument("--provider", choices=PROVIDERS, required=True)
     parser.add_argument("--provider-config", type=Path, required=True)
     parser.add_argument("--profile", required=True)
     parser.add_argument("--timeout", type=int, default=120, help="Task deadline in seconds (>=30)")
+    return parser
+
+
+def main():
+    parser = argument_parser()
     args = parser.parse_args()
     if args.timeout < 30:
         parser.error("--timeout must be at least 30 seconds")
     source = tomllib.loads(args.provider_config.read_text())
-    profile = dict(source["profiles"][args.profile])
-    profile.pop("alternates", None)
-    if profile["provider"] != args.provider:
-        parser.error("--profile must select --provider")
-    accounts = {name: source["accounts"][name] for name in profile["accounts"]}
+    try:
+        profile, accounts = selected_profile(source, args.profile, args.provider)
+    except ValueError as exc:
+        parser.error(str(exc))
     if any(a["max_active"] < 2 for a in accounts.values()):
         parser.error("Each selected account needs max_active >= 2 for the concurrency check")
     config = {
@@ -305,6 +377,8 @@ def main():
     results = {"provider": args.provider, "checks": {}, "observations": {}}
 
     def save():
+        if args.provider == "agy":
+            results["launches"] = dict(providers.launches)
         (args.evidence / "result.json").write_text(json.dumps(results, indent=2))
 
     def check(name, passed, evidence):
@@ -323,9 +397,14 @@ def main():
 
     def capture_outputs(timeline):
         adapter = Providers(runtime).for_session(parent.invocation.session_id)
-        outputs = {r["run_id"]: output_evidence(
-            read_child_logs(box, r["run_id"]), adapter, marker,
-        ) for r in timeline["rows"]}
+        outputs = {}
+        for row in timeline["rows"]:
+            run_id = row["run_id"]
+            logs = read_child_logs(box, run_id)
+            outputs[run_id] = output_evidence(logs, adapter, marker)
+            if args.provider == "agy":
+                outputs[run_id]["agy"] = agy_output_evidence(
+                    logs, expected_model=providers.launches.get(run_id, {}).get("native_model"))
         (args.evidence / "provider-output.json").write_text(json.dumps(outputs, indent=2))
 
     server = LocalServer(lambda port: build_http_app(
@@ -405,8 +484,13 @@ def main():
                 check("auth_files", answer["status"] == "completed" and auth["passed"], auth)
                 observed = output_evidence(logs, adapter, marker)
                 observed["final_answer_matches"] = (
-                    adapter.parse_result(logs, 0).final_text == answer.get("answer")
+                    adapter.parse_result(provider_output(logs), 0).final_text
+                    == answer.get("answer")
                 )
+                if args.provider == "agy":
+                    launch = providers.launches.get(answer_row["run_id"], {})
+                    observed["agy"] = agy_output_evidence(
+                        logs, expected_model=launch.get("native_model"))
                 try:
                     body = json.loads(answer.get("answer", ""))
                 except ValueError:
@@ -418,6 +502,8 @@ def main():
                 proof = {"nonce": fixture["nonce"], "sum": sum(fixture["numbers"])}
                 matched = all(body.get(k) == v for k, v in proof.items())
                 check("answer", answer["status"] == "completed" and matched
+                      and (args.provider != "agy" or
+                           (observed["agy"]["success"] and observed["agy"]["model_matches"]))
                       and answer_row["outcome"] == "completed"
                       and answer_row["provider_started_at"] is not None
                       and bool(stored["resolved_model"])

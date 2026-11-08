@@ -176,6 +176,8 @@ class QuotaObserver:
             if self._stop.is_set():
                 return
             provider = account.get("provider")
+            if provider == "agy":
+                continue  # No supported quota endpoint; never poll AGY.
             fetch = self.fetchers.get(provider)
             if fetch is None:
                 continue
@@ -213,6 +215,8 @@ class QuotaObserver:
 
     def snapshot(self, account_id, stream=None):
         """Show the newer of the polled reading and the latest role-stream reading."""
+        if self.accounts().get(account_id, {}).get("provider") == "agy":
+            return {"state": "unsupported", "windows": [], "polled": False}
         with self._lock:
             value = self._cache.get(account_id)
             if value is not None:

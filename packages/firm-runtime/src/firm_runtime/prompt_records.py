@@ -13,6 +13,8 @@ def record_inputs(root: Path, identifier: str, spec, *, kind: str, metadata: dic
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(directory, 0o700)
     key = "role-instructions" if kind == "activations" else "summary-instructions"
+    if "agy-instructions" in spec.secrets:
+        key = "agy-instructions"
     input_name = {
         "activations": "activation.txt", "tasks": "task.txt",
     }.get(kind, "sources.txt")

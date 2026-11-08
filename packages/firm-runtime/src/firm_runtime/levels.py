@@ -24,6 +24,7 @@ from .summaries import SummaryInputTooLarge, check_prompt_size
 
 CLASSES = ("low", "medium", "high")
 DEFAULT_MODELS = {
+    "agy": ("gemini-3.8-flash", "gemini-3.8-flash", "gemini-4-argon"),
     "codex": ("gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra"),
     "claude": ("sonnet", "opus", "claude-fable-5-1"),
 }
@@ -76,7 +77,7 @@ def with_staffing_defaults(config: dict) -> dict:
         or source["provider"] not in DEFAULT_MODELS
     ):
         raise FirmError(
-            "staffing defaults need a founder_profile with provider codex or claude "
+            "staffing defaults need a founder_profile with provider codex, claude or agy "
             "(or one configured profile); configure [staffing] to choose explicitly, "
             "or staffing = false for fixed-profile hiring"
         )
@@ -95,7 +96,9 @@ def with_staffing_defaults(config: dict) -> dict:
         or route["provider"] not in DEFAULT_MODELS
         for route in routes
     ):
-        raise FirmError("staffing default routes must name configured codex or claude profiles")
+        raise FirmError(
+            "staffing default routes must name configured codex, claude or agy profiles"
+        )
     classes = {}
     for level_index, level in enumerate((*CLASSES, "chooser")):
         names = [f"staffing-{level}" + (f"-{i}" if i else "") for i in range(len(routes))]
@@ -109,7 +112,9 @@ def with_staffing_defaults(config: dict) -> dict:
                 model=DEFAULT_MODELS[route["provider"]][0 if level == "chooser" else level_index],
                 effort=(
                     "medium"
-                    if level == "chooser" or (level == "high" and route["provider"] == "codex")
+                    if level == "chooser"
+                    or (level == "low" and route["provider"] == "agy")
+                    or (level == "high" and route["provider"] in {"codex", "agy"})
                     else "high"
                 ),
             )
@@ -144,7 +149,7 @@ def validate_staffing(config: dict) -> None:
         or not isinstance(chooser.get("provider"), str)
         or chooser["provider"] not in SUPPORTED_EFFORTS
     ):
-        raise FirmError("staffing profile provider must be codex or claude")
+        raise FirmError("staffing profile provider must be codex, claude or agy")
     if not isinstance(chooser.get("model"), str) or not chooser["model"].strip():
         raise FirmError("staffing profile model must be non-empty")
     effort = chooser.get("effort")

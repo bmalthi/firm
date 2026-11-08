@@ -1,0 +1,31 @@
+{
+  "fixture_kind": "captured_sanitized",
+  "cli_version": "1.5.3",
+  "capture_date": "2026-11-07",
+  "case": "models",
+  "label": "gemini-4-argon-high-effort-xhigh",
+  "exit_code": 1,
+  "events": [
+    {
+      "event": "result",
+      "result": {
+        "status": "ERROR",
+        "num_turns": 0,
+        "conversation_id": "",
+        "response": "[synthetic response omitted]",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "thinking_tokens": 0,
+          "cache_read_tokens": 0,
+          "total_tokens": 0
+        },
+        "error": "[native diagnostic omitted]"
+      }
+    }
+  ],
+  "expected": {
+    "success": false,
+    "startup_failure": true
+  }
+}

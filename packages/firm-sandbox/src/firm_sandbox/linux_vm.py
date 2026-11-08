@@ -36,6 +36,8 @@ from .models import VMSettings
 
 INSTANCE = "linux"
 IMAGE = Path(__file__).with_name("assets") / "linux-vm.yaml"
+# The packaged provisioning recipe is the authority for the installed AGY version.
+AGY_VERSION = re.search(r"^\s*AGY_VERSION=(\d+\.\d+\.\d+)$", IMAGE.read_text(), re.MULTILINE)[1]
 PYTHON = "/usr/bin/python3"
 CONTROLLER = "/usr/local/libexec/firm-controller.py"
 PROVISION_MARKER = "/run/firm-provisioned"
@@ -53,6 +55,7 @@ GUEST_DEPENDENCIES = (
     "npm",
     "claude",
     "codex",
+    "agy",
     "gh",
     "git",
     "curl",
@@ -64,6 +67,9 @@ GUEST_DEPENDENCIES = (
 )
 GUEST_DEPENDENCY_CHECK = "set -eu\n" + "\n".join(
     f"command -v {command} >/dev/null" for command in GUEST_DEPENDENCIES
+) + (
+    '\ntest -x /usr/local/lib/agy/agy'
+    f'\ntest "$(cat /usr/local/lib/agy/version)" = "{AGY_VERSION}"'
 )
 CONTROLLER_COMMAND = (PYTHON, "-I", CONTROLLER)
 # ${SUDO_USER} is the control user, known only inside the guest; _install_controller

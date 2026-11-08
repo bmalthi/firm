@@ -16,7 +16,9 @@ export function createTeam({$, api, element, button, number, total, time, syncCh
       ["Settings", execution.source === "retained_session" ? "Retained session" : execution.source === "configured_profile" ? "Configured profile" : "Unavailable"],
       ["Profile", execution.profile || role.execution_profile || "Unavailable"],
       ["Provider", execution.provider || "Unavailable"],
-      ["Model", execution.model || "Unavailable"],
+      ["Model", execution.resolved_model || execution.model || "Unavailable"],
+      ...(execution.resolved_model && execution.resolved_model !== execution.model
+        ? [["Configured model", execution.model || "Unavailable"]] : []),
       ["Effort", execution.effort || "Unavailable"],
       ["Level", role.level ? `${role.level.model_class || "unclassified"} class · ${role.level.effort || "unknown"} effort · ${role.level.state}` : "Unavailable"],
       ["Level reason", role.level?.reason || "None recorded"],

@@ -1760,3 +1760,64 @@ def test_task_launch_gate_closes_before_emergency_poweroff_without_guest_wait(sy
         host.start()
         assert host._task_runner is not runner
         assert not host._task_runner.closed
+
+
+def test_provider_yield_uses_retained_interruption_path(system):
+    from test_agy_provider import encode, stream
+
+    from firm_runtime.agy_provider import parse_result
+
+    runtime, box, provider = system
+    events = stream()
+    events[-1]["result"]["finished_reason"] = "print_timeout"
+    provider.parse_result = lambda *_: parse_result(encode(events), 0)
+    with host(system) as dispatcher:
+        dispatcher.start()
+        invocation = launch(dispatcher, runtime)
+        run = next(iter(box.invocations))
+        box.complete(run)
+        dispatcher.tick()
+        with runtime.store.read() as db:
+            activation = runtime._activation(db, invocation.activation_id)
+            assert activation["state"] == "interrupted"
+            assert activation["failure_category"] == "transient"
+            assert runtime.store.role(db, "founder")["attempt_count"] <= 1
+
+
+def test_expiry_poisoned_agy_resume_uses_existing_bounded_role_retry(system, monkeypatch):
+    from test_agy_provider import FIXTURES, encode
+
+    from firm_runtime.agy_provider import parse_result
+
+    runtime, box, provider = system
+    clock = [runtime.store.clock()]
+    monkeypatch.setattr(runtime.store, "clock", lambda: clock[0])
+    fixture = json.loads((FIXTURES / "captured_expiry_resume_stale_error.json").read_text())
+    logs = encode(fixture["events"])
+    parsed = parse_result(logs, 0)
+    assert not parsed.success and not parsed.interrupted
+    assert parsed.provider_session_id and parsed.error.category == "unknown"
+    provider.parse_result = lambda *_: parse_result(logs, 0)
+    session = None
+    with host(system) as dispatcher:
+        dispatcher.start()
+        for attempt in range(4):
+            invocation = launch(dispatcher, runtime)
+            session = session or invocation.session_id
+            assert invocation.session_id == session
+            run = next(reversed(box.invocations))
+            box.complete(run)
+            assert dispatcher.tick() == []
+            with runtime.store.read() as db:
+                activation = runtime._activation(db, invocation.activation_id)
+                role = runtime.store.role(db, "founder")
+                assert activation["state"] == "failed"
+                assert role["attempt_count"] == attempt + 1
+                if attempt < 3:
+                    assert role["hold_reason"] is None
+                    clock[0] = role["retry_at"]
+                else:
+                    assert role["hold_reason"] == "attempts_exhausted"
+        assert provider.resumed == [None, *([parsed.provider_session_id] * 3)]
+        assert dispatcher.tick() == []
+        assert runtime.accounts.status()["incidents"] == []
