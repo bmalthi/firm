@@ -15,10 +15,11 @@ per run), and machine-wide samples must keep answering while the first run's
 Docker install holds the guest's global lock. The kernel and cgroup facts those
 readings depend on are recorded in the evidence.
 
-Two further periods check disk retention: scratch and stopped containers disappear,
-while a tagged image, named volume, private work and a language cache stay usable.
-Their exit records retain each reclaim category, including any skipped work. A
-top-level scratch symlink is also replaced at settlement without touching its target.
+Further periods check disk retention: scratch, stopped containers, tagged and dangling
+images and ordinary build cache survive pause/resume alongside volumes and home files.
+Explicit disposal then clears scratch and scoped Docker state, preserving tagged images
+and volumes. Settlement preserves a top-level scratch symlink; the next launch replaces it
+without touching its target.
 """
 
 import argparse
@@ -33,7 +34,6 @@ MIB = 1024 * 1024
 
 SCRIPT = r"""set -eux
 command -v docker
-docker buildx version
 id -u; cat /proc/self/cgroup
 test -n "$DOCKER_HOST"
 docker info --format '{{.Name}}'
@@ -111,11 +111,25 @@ printf '\nDOCKER_HELD_300_MIB\n'
 
 SMALL = "set -eux\ndocker run --rm alpine:3.20 echo small\n"
 
-RECLAIM_SEED = r"""set -eux
+RETENTION_SEED = r"""set -eux
+docker rm -f firm-reclaim-stopped firm-reclaim-restart 2>/dev/null || true
+docker version --format '{{.Server.Version}}'
+docker info --format '{{.Driver}} {{.DriverStatus}}'
 docker image inspect firm-role-probe:latest --format '{{.Id}}' > "$HOME/probe/image-id"
 docker volume create firm-reclaim-volume
 docker run --rm -v firm-reclaim-volume:/data alpine:3.20 sh -ec 'echo kept >/data/value'
-docker run --name firm-reclaim-stopped alpine:3.20 echo disposable
+docker run --name firm-reclaim-stopped alpine:3.20 echo retained
+docker run -d --restart=always --name firm-reclaim-restart alpine:3.20 sleep 600
+mkdir -p "$PROBE_SCRATCH/checkout/.git"
+printf 'ref: refs/heads/main\n' > "$PROBE_SCRATCH/checkout/.git/HEAD"
+printf 'FROM alpine:3.20\nCOPY payload /payload\n' > "$PROBE_SCRATCH/checkout/Dockerfile"
+printf first > "$PROBE_SCRATCH/checkout/payload"
+docker build -t firm-retention-build:latest "$PROBE_SCRATCH/checkout"
+docker build --iidfile "$HOME/probe/dangling-id" "$PROBE_SCRATCH/checkout"
+docker image ls -a --no-trunc
+printf second > "$PROBE_SCRATCH/checkout/payload"
+docker build -t firm-retention-build:latest "$PROBE_SCRATCH/checkout"
+docker image ls -a --no-trunc
 mkdir -p "$PROBE_SCRATCH/build" "$HOME/.cache/uv"
 chmod 777 "$PROBE_SCRATCH/build"
 docker run --rm --user 1000 -v "$PROBE_SCRATCH/build:/out" alpine:3.20 touch /out/subuid
@@ -124,16 +138,42 @@ echo kept > "$HOME/work/firm-retain"
 dd if=/dev/zero of="$PROBE_SCRATCH/output" bs=1M count=8
 """
 
-RECLAIM_VERIFY = r"""set -eux
+RETENTION_VERIFY = r"""set -eux
+test -f "$PROBE_SCRATCH/build/subuid"
+test "$(stat -c %s "$PROBE_SCRATCH/output")" = 8388608
+grep 'ref: refs/heads/main' "$PROBE_SCRATCH/checkout/.git/HEAD"
+test "$(cat "$PROBE_SCRATCH/checkout/payload")" = second
+docker ps -a --format '{{.Names}}' | grep -x firm-reclaim-stopped
+dangling=$(cat "$HOME/probe/dangling-id")
+docker image ls -a --no-trunc
+docker image inspect "$dangling"
+docker image ls --no-trunc --quiet --filter dangling=true
+docker image ls --no-trunc --quiet --filter dangling=true | grep -Fx "$dangling"
+docker system df --format '{{.Type}} {{.TotalCount}}' | grep -E '^Build Cache [1-9][0-9]*$'
+image=$(docker image inspect firm-role-probe:latest --format '{{.Id}}')
+test "$(cat "$HOME/probe/image-id")" = "$image"
+docker run --rm --pull=never firm-role-probe:latest cat /built.txt
+docker run --rm --pull=never -v firm-reclaim-volume:/data alpine:3.20 grep kept /data/value
+grep kept "$HOME/.cache/uv/firm-retain" "$HOME/work/firm-retain"
+printf '\nDOCKER_PAUSE_RESUME_RETENTION_PASS\n'
+"""
+
+DISPOSE_VERIFY = r"""set -eux
 test -d "$PROBE_SCRATCH"
 test -z "$(ls -A "$PROBE_SCRATCH")"
 image=$(docker image inspect firm-role-probe:latest --format '{{.Id}}')
 test "$(cat "$HOME/probe/image-id")" = "$image"
 docker run --rm --pull=never firm-role-probe:latest cat /built.txt
 docker run --rm --pull=never -v firm-reclaim-volume:/data alpine:3.20 grep kept /data/value
-if docker container inspect firm-reclaim-stopped; then exit 1; fi
+test -z "$(docker ps -a --quiet --filter status=exited)"
+if docker container inspect firm-reclaim-restart; then exit 1; fi
+test -z "$(docker image ls --quiet --filter dangling=true)"
+if docker image inspect "$(cat "$HOME/probe/dangling-id")"; then exit 1; fi
+# The host checks positive build/prune reclaim; cache shared with kept images may remain.
+docker system df
+docker image inspect firm-retention-build:latest
 grep kept "$HOME/.cache/uv/firm-retain" "$HOME/work/firm-retain"
-printf '\nDOCKER_RECLAIM_RETENTION_PASS\n'
+printf '\nDOCKER_DISPOSAL_RETENTION_PASS\n'
 """
 
 SCRATCH_SYMLINK = r"""set -eux
@@ -152,7 +192,7 @@ test -d "$PROBE_SCRATCH"
 test ! -L "$PROBE_SCRATCH"
 test -z "$(ls -A "$PROBE_SCRATCH")"
 test "$(cat "$HOME/work/firm-scratch-symlink-target/sentinel")" = retained
-printf '\nDOCKER_SCRATCH_SYMLINK_SETTLEMENT_PASS\n'
+printf '\nDOCKER_SCRATCH_SYMLINK_LAUNCH_REPAIR_PASS\n'
 """
 
 KILL_DAEMON = r"""set -eux
@@ -279,29 +319,49 @@ def main():
         }
         if not record["sdk"]["passed"]:
             raise RuntimeError("Docker SDK workload failed; inspect sdk.log")
-        record["reclaim"] = {}
-        reclaim_runs = (
-            ("seed", RECLAIM_SEED),
-            ("verify", RECLAIM_VERIFY),
-            ("scratch-symlink", SCRATCH_SYMLINK),
-            ("scratch-symlink-verify", SCRATCH_SYMLINK_VERIFY),
-        )
-        for name, script in reclaim_runs:
+        record["retention"] = {}
+
+        def period(name, script):
             probe = box.start(RunSpec(
                 args.role, ("/bin/bash", "-lc", script), organization=organization,
                 env={"PROBE_SCRATCH": box.layout(args.role).scratch},
             ))
             result = box.wait(probe, timeout=300)
-            (args.evidence / f"reclaim-{name}.log").write_bytes(box.logs(probe))
-            record["reclaim"][name] = result
+            (args.evidence / f"retention-{name}.log").write_bytes(box.logs(probe))
+            record["retention"][name] = result
             assert result["exit_code"] == 0 and not result.get("unresolved"), result
+            assert "reclaim" not in result
+            return result
+
+        def dispose(name):
+            result = box.dispose(args.role)
+            record["retention"][name] = result
             categories = result["reclaim"]["categories"]
             assert set(categories) == {
                 "scratch", "docker_containers", "docker_image_deletion_records",
                 "docker_build_cache",
             }, categories
             assert all(c["completed"] and not c["skipped"] for c in categories.values()), categories
-        assert record["reclaim"]["seed"]["reclaim"]["categories"]["scratch"]["bytes"] >= 8 * MIB
+            return categories
+
+        period("seed", RETENTION_SEED)
+        period("verify", RETENTION_VERIFY)
+        categories = dispose("dispose")
+        assert categories["scratch"]["bytes"] >= 8 * MIB
+        assert all(categories[name]["count"] > 0 for name in (
+            "docker_containers", "docker_image_deletion_records", "docker_build_cache"))
+        period("disposed-verify", DISPOSE_VERIFY)
+        period("scratch-symlink", SCRATCH_SYMLINK)
+        # Settlement preserves the link; the next launch heals scratch without
+        # touching the target.
+        scratch = box.layout(args.role).scratch
+        preserved = box.linux._shell(
+            "sudo", "-n", "/bin/sh", "-ec",
+            'test -L "$1"; test "$(cat "$1/sentinel")" = retained',
+            "scratch-check", scratch, timeout=30,
+        )
+        assert preserved.returncode == 0
+        period("scratch-symlink-verify", SCRATCH_SYMLINK_VERIFY)
         held = box.start(RunSpec(
             args.role, ("/bin/bash", "-lc", HOLD_MEMORY), organization=organization,
         ))

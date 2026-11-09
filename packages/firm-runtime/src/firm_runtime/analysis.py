@@ -413,8 +413,6 @@ class AnalysisReader:
             "Resolved models are the last non-empty provider-reported identity per execution, "
             "not a per-request accounting or a guarantee of the next execution's model. "
             "Missing reports are unknown, never inferred from configured aliases.",
-            "Linux reclaim counts describe named categories only; timed-out operations may "
-            "have removed unmeasured data. Missing reclaim evidence is unknown, not zero.",
             "Current dispositions, usage and readiness are sampled now, not at window end.",
         ]
         stale_disk = sorted(
@@ -1767,10 +1765,9 @@ class AnalysisReader:
         }
         runs, by_role = [], defaultdict(list)
         for row in db.execute(
-            "SELECT s.activation_id,s.role_id,s.memory_peak_bytes,s.cpu_usec,s.oom_kills,"
-            "r.reclaim_json FROM sandbox_runs s LEFT JOIN sandbox_run_settlements r "
-            "ON r.run_id=s.run_id AND r.rowid<=? WHERE s.rowid<=?",
-            (cutoffs["sandbox_run_settlements"], cutoffs["sandbox_runs"]),
+            "SELECT activation_id,role_id,memory_peak_bytes,cpu_usec,oom_kills "
+            "FROM sandbox_runs WHERE rowid<=?",
+            (cutoffs["sandbox_runs"],),
         ):
             activation = activations.get(row["activation_id"])
             if activation is None:
@@ -1791,7 +1788,6 @@ class AnalysisReader:
                 "cpu_seconds": seconds,
                 "mean_vcpus": seconds / elapsed if seconds is not None and elapsed else None,
                 "oom_kills": row["oom_kills"],
-                "reclaim": json.loads(row["reclaim_json"]) if row["reclaim_json"] else None,
             }
             runs.append(run)
             by_role[activation["employee_id"]].append(run)
@@ -1829,7 +1825,7 @@ class AnalysisReader:
         config = json.loads(db.execute("SELECT config_json FROM firm").fetchone()[0])
         if employee_id is None:
             for row in db.execute(
-                "SELECT q.run_id,q.started_at,q.finished_at,r.role_id,r.usage_json,r.reclaim_json "
+                "SELECT q.run_id,q.started_at,q.finished_at,r.role_id,r.usage_json "
                 "FROM summary_runs q JOIN sandbox_run_settlements r USING(run_id) "
                 "WHERE q.kind!='task' AND q.started_at>=? AND q.started_at<? "
                 "AND q.rowid<=? AND r.rowid<=?",
@@ -1841,7 +1837,6 @@ class AnalysisReader:
                     "run_id": row["run_id"], "role_id": row["role_id"],
                     "started_at": row["started_at"], "finished_at": row["finished_at"],
                     "usage": usage,
-                    "reclaim": json.loads(row["reclaim_json"]),
                 })
         return {
             "rows": rows,

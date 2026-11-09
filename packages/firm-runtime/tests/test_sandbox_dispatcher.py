@@ -2,6 +2,7 @@ import json
 import sqlite3
 import subprocess
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -149,9 +150,9 @@ def test_a_completed_run_stores_what_its_slice_used(system):
     assert usage_row(runtime) == box.usage
 
 
-def test_reclaim_is_stored_with_the_terminal_run(system):
+def test_settlement_stores_usage_without_reclaim(system):
     runtime, box, _ = system
-    box.reclaim = {"categories": {"scratch": {"count": 4, "bytes": 500, "skipped": {}}}}
+    box.usage = {"cpu_usec": 500}
     with host(system) as dispatcher:
         dispatcher.start()
         launch(dispatcher, runtime)
@@ -161,12 +162,12 @@ def test_reclaim_is_stored_with_the_terminal_run(system):
     with runtime.store.read() as db:
         row = db.execute("SELECT * FROM sandbox_run_settlements").fetchone()
         assert row["run_id"] == run_id
-        assert json.loads(row["reclaim_json"]) == box.reclaim
+        assert json.loads(row["usage_json"]) == box.usage
+        assert row["reclaim_json"] is None
 
 
-def test_unresolved_reclaim_keeps_admission_until_cleanup_retries_successfully(system, monkeypatch):
+def test_unresolved_slice_keeps_admission_until_cleanup_retries_successfully(system, monkeypatch):
     runtime, box, _ = system
-    box.reclaim = {"categories": {"scratch": {"completed": False, "skipped": {"deadline": 1}}}}
     with host(system) as dispatcher:
         dispatcher.start()
         invocation = launch(dispatcher, runtime)
@@ -181,8 +182,8 @@ def test_unresolved_reclaim_keeps_admission_until_cleanup_retries_successfully(s
             dispatcher.reconcile()
         assert runtime.status()["active"][0]["activation_id"] == invocation.activation_id
         with runtime.store.read() as db:
-            assert json.loads(db.execute("SELECT reclaim_json FROM sandbox_run_settlements")
-                              .fetchone()[0]) == box.reclaim
+            assert json.loads(db.execute("SELECT usage_json FROM sandbox_run_settlements")
+                              .fetchone()[0]) == box.usage
         monkeypatch.setattr(box, "_status", original_status)
         dispatcher.reconcile()
         assert runtime.status()["active"] == []
@@ -1821,3 +1822,479 @@ def test_expiry_poisoned_agy_resume_uses_existing_bounded_role_retry(system, mon
         assert provider.resumed == [None, *([parsed.provider_session_id] * 3)]
         assert dispatcher.tick() == []
         assert runtime.accounts.status()["incidents"] == []
+
+
+def launched_spec(dispatcher, box, invocation):
+    dispatcher._launches[invocation.activation_id].result(timeout=2)
+    return box.specs[sandbox_run_id(invocation.activation_id)]
+
+
+@pytest.mark.parametrize("clean_up", [False, True])
+def test_completed_handoff_cleanup_is_consumed_by_next_started_period(system, clean_up):
+    runtime, box, _ = system
+    with host(system) as dispatcher:
+        dispatcher.start()
+        actor = launch(dispatcher, runtime)
+        runtime.tools(actor.token).handoff("Continue", "continue", "handoff", clean_up=clean_up)
+        box.complete(sandbox_run_id(actor.activation_id))
+        (next_period,) = dispatcher.tick()
+        assert launched_spec(dispatcher, box, next_period).clean_up is False
+        assert box.disposals == (["r-founder"] if clean_up else [])
+        runtime.begin_execution(next_period.token)
+        box.complete(sandbox_run_id(next_period.activation_id))
+        assert dispatcher.tick() == []
+        runtime.messaging.send(OWNER, ["founder"], "More work", request_id="wake-again")
+        (following,) = dispatcher.tick()
+        assert launched_spec(dispatcher, box, following).clean_up is False
+
+
+def test_idle_handoff_cleanup_repeats_after_dispatcher_reopen(system, monkeypatch):
+    runtime, box, _ = system
+    with host(system) as dispatcher:
+        dispatcher.start()
+        actor = launch(dispatcher, runtime)
+        runtime.tools(actor.token).handoff("Continue", "continue", "handoff", clean_up=True)
+        box.complete(sandbox_run_id(actor.activation_id))
+        with monkeypatch.context() as patch:
+            patch.setattr(runtime, "admit", lambda: None)
+            dispatcher.tick()
+    with host(system) as reopened:
+        (next_period,) = reopened.tick()
+        assert launched_spec(reopened, box, next_period).clean_up is False
+        assert box.disposals == ["r-founder", "r-founder"]
+
+
+def test_prestart_failure_keeps_handoff_cleanup_obligation(system, monkeypatch):
+    runtime, box, _ = system
+    now = [runtime.store.clock()]
+    monkeypatch.setattr(runtime.store, "clock", lambda: now[0])
+    monkeypatch.setattr(box, "dispose", lambda _: (_ for _ in ()).throw(RuntimeError("busy")))
+    with host(system) as dispatcher:
+        dispatcher.start()
+        actor = launch(dispatcher, runtime)
+        runtime.tools(actor.token).handoff("Continue", "continue", "handoff", clean_up=True)
+        box.complete(sandbox_run_id(actor.activation_id))
+        (unstarted,) = dispatcher.tick()
+        assert launched_spec(dispatcher, box, unstarted).clean_up is True
+        # No begin_execution handshake: the failed launch cannot consume the notes.
+        box.complete(sandbox_run_id(unstarted.activation_id), success=False)
+        dispatcher.tick()
+        now[0] += 3600
+        (retry,) = dispatcher.tick()
+        assert launched_spec(dispatcher, box, retry).clean_up is True
+
+
+@pytest.mark.parametrize("cause", ["owner_stop", "timeout", "interrupted", "host_restart"])
+def test_unapplied_handoff_does_not_request_next_launch_cleanup(system, monkeypatch, cause):
+    runtime, box, _ = system
+    now = [runtime.store.clock()]
+    monkeypatch.setattr(runtime.store, "clock", lambda: now[0])
+    with host(system) as dispatcher:
+        dispatcher.start()
+        actor = launch(dispatcher, runtime)
+        runtime.tools(actor.token).handoff("Continue", "continue", "handoff", clean_up=True)
+        box.complete(sandbox_run_id(actor.activation_id), success=False)
+        row = next(r for r in dispatcher._records() if r["activation_id"] == actor.activation_id)
+        run, info = box.inventory()[row["run_id"]]
+        parsed = SimpleNamespace(success=False, interrupted=True, provider_session_id=None)
+        dispatcher._finish_run(
+            {**row, "stop_cause": None if cause == "interrupted" else cause}, run, info,
+            parsed=parsed, logs=box.logs(run),
+        )
+        now[0] += 3600
+        (next_period,) = dispatcher.tick()
+        assert launched_spec(dispatcher, box, next_period).clean_up is False
+        assert box.disposals == []
+
+
+def test_retired_employee_disposes_then_retires_once_and_ledger_survives_reopen(
+    system, monkeypatch,
+):
+    runtime, box, _ = system
+    calls = []
+    dispose, retire = box.dispose, box.retire
+    monkeypatch.setattr(box, "dispose",
+                        lambda role: (calls.append(("dispose", role)), dispose(role)))
+    monkeypatch.setattr(box, "retire", lambda role: (calls.append(("retire", role)), retire(role)))
+    with host(system) as dispatcher:
+        dispatcher.start()
+        child = runtime.lifecycle.hire("founder", "analyst", "Work", "codex", request_id="hire")
+        expected = {"r-founder", sandbox_role_id(child["employee_id"])}
+        with runtime.store.transaction() as db:
+            db.execute("UPDATE roles SET employment='retired'")
+        dispatcher.tick()
+        assert len(calls) == 2
+        assert calls == [("dispose", calls[0][1]), ("retire", calls[0][1])]
+        dispatcher.tick()
+        assert len(calls) == 4
+        assert calls[2:] == [("dispose", calls[2][1]), ("retire", calls[2][1])]
+        assert {calls[0][1], calls[2][1]} == expected
+        dispatcher.tick()
+        assert len(calls) == 4
+    with host(system) as reopened:
+        reopened.tick()
+        assert len(calls) == 4
+
+
+@pytest.mark.parametrize("failure", ["dispose", "retire"])
+def test_retirement_failure_waits_fifteen_minutes_and_does_not_escape_tick(
+    system, monkeypatch, failure, caplog,
+):
+    runtime, box, _ = system
+    attempts = []
+    now = [runtime.store.clock()]
+    monkeypatch.setattr(runtime.store, "clock", lambda: now[0])
+
+    def fail(role):
+        attempts.append(role)
+        raise RuntimeError("cleanup unavailable")
+
+    monkeypatch.setattr(box, failure, fail)
+    with host(system) as dispatcher:
+        dispatcher.start()
+        with runtime.store.transaction() as db:
+            db.execute("UPDATE roles SET employment='retired'")
+        dispatcher.tick()
+        now[0] += 899
+        dispatcher.tick()
+        assert attempts == ["r-founder"]
+        now[0] += 1
+        dispatcher.tick()
+        assert attempts == ["r-founder", "r-founder"]
+        assert "Idle-role cleanup failed for r-founder" in caplog.text
+        if failure == "dispose":
+            assert not box.retirements
+
+
+@pytest.mark.parametrize("gate", ["running", "admitted", "launching", "unresolved"])
+def test_retirement_skips_execution_reservations(system, gate):
+    from concurrent.futures import Future
+
+    runtime, box, _ = system
+    with host(system) as dispatcher:
+        dispatcher.start()
+        actor = launch(dispatcher, runtime)
+        with runtime.store.transaction() as db:
+            db.execute("UPDATE roles SET employment='retired'")
+            db.execute("UPDATE activations SET state=? WHERE activation_id=?",
+                       (gate if gate in {"running", "admitted"} else "completed",
+                        actor.activation_id))
+        if gate == "launching":
+            dispatcher._launches[actor.activation_id] = Future()
+        inventory = box.inventory() if gate == "unresolved" else {}
+        if gate == "unresolved":
+            entry = inventory[sandbox_run_id(actor.activation_id)][1]
+            entry.update(running=False, unresolved=True)
+        dispatcher._clean_idle_roles(inventory)
+        assert not box.disposals and not box.retirements
+        dispatcher._launches.clear()
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_waiting_handoff_is_cleaned_once_without_another_period(
+    system, monkeypatch, caplog, partial,
+):
+    runtime, box, _ = system
+    dispose = box.dispose
+
+    def cleanup(role):
+        receipt = dispose(role)
+        if partial:
+            receipt["reclaim"]["categories"] = {"scratch": {"completed": False}}
+        return receipt
+
+    monkeypatch.setattr(box, "dispose", cleanup)
+    caplog.set_level("INFO")
+    with host(system) as dispatcher:
+        dispatcher.start()
+        actor = launch(dispatcher, runtime)
+        runtime.tools(actor.token).handoff("Finished", "wait", "handoff", clean_up=True)
+        box.complete(sandbox_run_id(actor.activation_id))
+        assert dispatcher.tick() == []
+        assert box.disposals == ["r-founder"]
+        assert actor.activation_id in dispatcher._cleaned
+        assert "Idle-role cleanup for r-founder" in caplog.text
+        assert "reclaim" in caplog.text
+        dispatcher.tick()
+        assert box.disposals == ["r-founder"]
+        runtime.messaging.send(OWNER, ["founder"], "New work", request_id="wake")
+        (next_period,) = dispatcher.tick()
+        assert launched_spec(dispatcher, box, next_period).clean_up is False
+
+
+def test_handoff_disposal_exception_backs_off_but_next_start_still_cleans(system, monkeypatch):
+    runtime, box, _ = system
+    now = [runtime.store.clock()]
+    monkeypatch.setattr(runtime.store, "clock", lambda: now[0])
+    attempts = []
+
+    def fail(role):
+        attempts.append(role)
+        raise RuntimeError("unavailable")
+
+    monkeypatch.setattr(box, "dispose", fail)
+    with host(system) as dispatcher:
+        dispatcher.start()
+        actor = launch(dispatcher, runtime)
+        runtime.tools(actor.token).handoff("Finished", "wait", "handoff", clean_up=True)
+        box.complete(sandbox_run_id(actor.activation_id))
+        dispatcher.tick()
+        assert dispatcher._retire_not_before["r-founder"] == now[0] + 900
+        now[0] += 899
+        dispatcher.tick()
+        assert attempts == ["r-founder"]
+        now[0] += 1
+        dispatcher.tick()
+        assert attempts == ["r-founder", "r-founder"]
+        assert actor.activation_id not in dispatcher._cleaned
+        runtime.messaging.send(OWNER, ["founder"], "New work", request_id="wake")
+        (next_period,) = dispatcher.tick()
+        assert launched_spec(dispatcher, box, next_period).clean_up is True
+        assert len(attempts) == 2
+
+
+def test_one_cleanup_attempt_per_tick_across_retirement_and_handoff_with_start_fallback(
+    system, monkeypatch,
+):
+    runtime, box, _ = system
+    with host(system) as dispatcher:
+        dispatcher.start()
+        founder = launch(dispatcher, runtime)
+        child = runtime.tools(founder.token).hire("analyst", "Work", "hire")
+        analyst = launch(dispatcher, runtime)
+        runtime.tools(analyst.token).handoff("Done", "continue", "handoff", clean_up=True)
+        # Candidate ORDER BY rowid puts the earlier founder before the analyst.
+        # Reverse unordered scans so the test cannot pass by relying on SQLite's default order.
+        connect = runtime.store._connect
+
+        @contextmanager
+        def reversed_scans():
+            with connect() as db:
+                db.execute("PRAGMA reverse_unordered_selects=ON")
+                yield db
+
+        monkeypatch.setattr(runtime.store, "_connect", reversed_scans)
+        with runtime.store.transaction() as db:
+            db.execute("UPDATE roles SET employment='retired' WHERE employee_id='founder'")
+            assert [row[0] for row in db.execute(
+                "SELECT employee_id FROM roles ORDER BY rowid")] == [
+                    "founder", child["employee_id"]]
+        box.complete(sandbox_run_id(founder.activation_id))
+        box.complete(sandbox_run_id(analyst.activation_id))
+        (next_period,) = dispatcher.tick()
+        assert box.disposals == box.retirements == ["r-founder"]
+        assert next_period.employee_id == child["employee_id"]
+        assert launched_spec(dispatcher, box, next_period).clean_up is True
+
+
+@pytest.mark.parametrize("clean_up", [False, True])
+def test_idle_loop_skips_retirement_ledger_without_pending_cleanup(system, monkeypatch, clean_up):
+    runtime, box, _ = system
+    ledger_calls = []
+    retired_roles = box.file_server.retired_roles
+
+    def ledger():
+        ledger_calls.append(True)
+        return retired_roles()
+
+    with host(system) as dispatcher:
+        dispatcher.start()
+        actor = launch(dispatcher, runtime)
+        runtime.tools(actor.token).handoff("Done", "wait", "handoff", clean_up=clean_up)
+        box.complete(sandbox_run_id(actor.activation_id))
+        monkeypatch.setattr(box.file_server, "retired_roles", ledger)
+        assert dispatcher.tick() == []
+        assert len(ledger_calls) == int(clean_up)
+        assert dispatcher.tick() == []
+        assert len(ledger_calls) == int(clean_up)
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_expired_appointment_disposes_once_keeps_identity_and_can_expire_again(
+    system, monkeypatch, partial,
+):
+    runtime, box, _ = system
+    dispose = box.dispose
+
+    def cleanup(role):
+        receipt = dispose(role)
+        if partial:
+            receipt["reclaim"]["categories"] = {"scratch": {"completed": False}}
+        return receipt
+
+    monkeypatch.setattr(box, "dispose", cleanup)
+    with host(system) as dispatcher:
+        dispatcher.start()
+        founder = launch(dispatcher, runtime)
+        tools = runtime.tools(founder.token)
+        hired = tools.hire("analyst", "Work", "hire", temporary_periods=1)
+        analyst = launch(dispatcher, runtime)
+        role_id = sandbox_role_id(hired["employee_id"])
+        box.complete(sandbox_run_id(analyst.activation_id))
+        assert dispatcher.tick() == []
+        assert dispatcher.tick() == []
+        assert box.disposals == [role_id] and box.retirements == []
+        assert analyst.activation_id in dispatcher._cleaned
+        with runtime.store.read() as db:
+            role = runtime.store.role(db, analyst.employee_id)
+            assert role["employment"] == "active" and role["session_id"] == analyst.session_id
+            assert runtime.appointments.terms(db, analyst.employee_id)["remaining_periods"] == 0
+        assert tools.renew_temporary(analyst.employee_id, 1, "renew")["employee_id"] == (
+            analyst.employee_id)
+        (next_period,) = dispatcher.tick()
+        assert next_period.session_id == analyst.session_id
+        assert launched_spec(dispatcher, box, next_period).clean_up is False
+        runtime.begin_execution(next_period.token)
+        box.complete(sandbox_run_id(next_period.activation_id))
+        assert dispatcher.tick() == []
+        assert box.disposals == [role_id, role_id]
+        assert next_period.activation_id in dispatcher._cleaned
+    with host(system) as reopened:
+        assert reopened.tick() == []
+        assert box.disposals == [role_id] * 3
+        assert box.retirements == []
+
+
+@pytest.mark.parametrize("outcome,category,stop_cause,disposes", [
+    ("failed", "unknown", None, True), ("failed", "refusal", None, True),
+] + [
+    ("interrupted", category, None, False) for category in (
+        "unknown", "refusal", "transient", "owner_stop", "host_restart", "auth", "config", "quota"
+    )
+] + [
+    ("failed", category, None, False) for category in (
+        "transient", "owner_stop", "host_restart", "auth", "config", "quota"
+    )
+] + [
+    ("failed", "unknown", cause, False) for cause in ("timeout", "owner_stop", "host_restart")
+])
+def test_expiry_disposal_requires_latest_finished_periods_own_result(
+    system, monkeypatch, outcome, category, stop_cause, disposes,
+):
+    runtime, box, _ = system
+    # These tests classify the result; account incident handling is covered separately.
+    monkeypatch.setattr(runtime.accounts, "record_failure", lambda *_: {})
+    with host(system) as dispatcher:
+        dispatcher.start()
+        founder = launch(dispatcher, runtime)
+        tools = runtime.tools(founder.token)
+        tools.hire("analyst", "Work", "hire", temporary_periods=2)
+        first = launch(dispatcher, runtime)
+        box.complete(sandbox_run_id(first.activation_id))
+        assert dispatcher.tick() == []
+        assert box.disposals == []
+        tools.send([first.employee_id], "Next period", "wake")
+        final = launch(dispatcher, runtime)
+        runtime.finish(final.activation_id, outcome, category=category)
+        with runtime.store.transaction() as db:
+            db.execute("UPDATE sandbox_runs SET stop_cause=? WHERE activation_id=?",
+                       (stop_cause, final.activation_id))
+        box.complete(sandbox_run_id(final.activation_id), success=False)
+        dispatcher.tick()
+        assert box.disposals == ([sandbox_role_id(final.employee_id)] if disposes else [])
+        assert box.retirements == []
+        with runtime.store.read() as db:
+            assert runtime.store.role(db, final.employee_id)["employment"] == "active"
+
+
+@pytest.mark.parametrize("temporary", [False, True])
+def test_durable_or_renewed_during_final_period_does_not_expire(system, temporary):
+    runtime, box, _ = system
+    with host(system) as dispatcher:
+        dispatcher.start()
+        founder = launch(dispatcher, runtime)
+        tools = runtime.tools(founder.token)
+        tools.hire("analyst", "Work", "hire", temporary_periods=1 if temporary else None)
+        analyst = launch(dispatcher, runtime)
+        if temporary:
+            tools.renew_temporary(analyst.employee_id, 1, "renew")
+        box.complete(sandbox_run_id(analyst.activation_id))
+        dispatcher.tick()
+        assert box.disposals == [] and box.retirements == []
+
+
+def test_expiry_exception_backs_off_and_does_not_add_next_launch_fallback(system, monkeypatch):
+    runtime, box, _ = system
+    now, attempts = [runtime.store.clock()], []
+    monkeypatch.setattr(runtime.store, "clock", lambda: now[0])
+
+    def fail(role):
+        attempts.append(role)
+        raise RuntimeError("unavailable")
+
+    monkeypatch.setattr(box, "dispose", fail)
+    with host(system) as dispatcher:
+        dispatcher.start()
+        founder = launch(dispatcher, runtime)
+        tools = runtime.tools(founder.token)
+        tools.hire("analyst", "Work", "hire", temporary_periods=1)
+        analyst = launch(dispatcher, runtime)
+        role_id = sandbox_role_id(analyst.employee_id)
+        box.complete(sandbox_run_id(analyst.activation_id))
+        dispatcher.tick()
+        assert dispatcher._retire_not_before[role_id] == now[0] + 900
+        now[0] += 899
+        dispatcher.tick()
+        assert attempts == [role_id]
+        now[0] += 1
+        dispatcher.tick()
+        assert attempts == [role_id, role_id]
+        assert analyst.activation_id not in dispatcher._cleaned
+        tools.renew_temporary(analyst.employee_id, 1, "renew")
+        (next_period,) = dispatcher.tick()
+        assert launched_spec(dispatcher, box, next_period).clean_up is False
+        assert attempts == [role_id, role_id]
+
+
+def test_one_attempt_per_tick_across_retirement_handoff_and_expiry(system):
+    runtime, box, _ = system
+    with host(system) as dispatcher:
+        dispatcher.start()
+        founder = runtime.admit()
+        runtime.mark_started(founder.activation_id)
+        tools = runtime.tools(founder.token)
+        hired = tools.hire("analyst", "Work", "hire")
+        temporary = tools.hire("temporary", "Work", "temp", temporary_periods=1)
+        runtime.finish(founder.activation_id)
+        analyst = runtime.admit()
+        assert analyst.employee_id == hired["employee_id"]
+        runtime.mark_started(analyst.activation_id)
+        runtime.tools(analyst.token).handoff("Done", "wait", "handoff", clean_up=True)
+        runtime.finish(analyst.activation_id)
+        final = runtime.admit()
+        assert final.employee_id == temporary["employee_id"]
+        runtime.mark_started(final.activation_id)
+        runtime.finish(final.activation_id)
+        with runtime.store.transaction() as db:
+            db.execute("UPDATE roles SET employment='retired' WHERE employee_id='founder'")
+        expected = ["r-founder", sandbox_role_id(analyst.employee_id),
+                    sandbox_role_id(final.employee_id)]
+        for count in range(1, 4):
+            assert dispatcher.tick() == []
+            assert box.disposals == expected[:count]
+            assert box.retirements == ["r-founder"]
+        assert dispatcher.tick() == []
+        assert box.disposals == expected
+
+
+def test_renewal_after_expiry_selection_skips_disposal(system, monkeypatch):
+    runtime, box, _ = system
+    with host(system) as dispatcher:
+        dispatcher.start()
+        founder = launch(dispatcher, runtime)
+        tools = runtime.tools(founder.token)
+        tools.hire("analyst", "Work", "hire", temporary_periods=1)
+        analyst = launch(dispatcher, runtime)
+        box.complete(sandbox_run_id(analyst.activation_id))
+        retired_roles = box.file_server.retired_roles
+
+        def renew_after_selection():
+            tools.renew_temporary(analyst.employee_id, 1, "renew")
+            return retired_roles()
+
+        monkeypatch.setattr(box.file_server, "retired_roles", renew_after_selection)
+        (next_period,) = dispatcher.tick()
+        assert next_period.employee_id == analyst.employee_id
+        assert launched_spec(dispatcher, box, next_period).clean_up is False
+        assert box.disposals == [] and box.retirements == []
+        assert analyst.activation_id not in dispatcher._cleaned

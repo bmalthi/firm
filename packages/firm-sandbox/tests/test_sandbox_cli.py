@@ -534,3 +534,51 @@ def test_mac_verbs_refuse_without_a_mac(monkeypatch, capsys, arguments):
         cli.main()
     assert result.value.code == 1
     assert "add [mac] to sandbox.toml" in capsys.readouterr().err
+
+
+def test_cli_dispose_prints_guest_receipt(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "sandbox.toml"
+    config.write_text('[firm]\nid = "test-firm"\n')
+    calls = []
+    receipt = {"disposed": "analyst", "reclaim": {"categories": {}}}
+
+    def dispose(role):
+        calls.append(role)
+        return receipt
+
+    monkeypatch.setattr(cli, "Sandbox", lambda _: SimpleNamespace(dispose=dispose))
+    monkeypatch.setattr(
+        sys, "argv", ["firm-sandbox", "--config", str(config), "dispose", "analyst"])
+    cli.main()
+    assert calls == ["analyst"]
+    assert json.loads(capsys.readouterr().out) == receipt
+
+
+@pytest.mark.parametrize("role", [None, "analyst"])
+def test_cli_storage_prints_role_measurements(tmp_path, monkeypatch, capsys, role):
+    config = tmp_path / "sandbox.toml"
+    config.write_text('[firm]\nid = "test-firm"\n')
+    calls = []
+    receipt = {"roles": {"analyst": {"retired": False, "scratch": {"bytes": 0}}}}
+
+    def storage(selected):
+        calls.append(selected)
+        return receipt
+
+    monkeypatch.setattr(cli, "Sandbox", lambda _: SimpleNamespace(storage=storage))
+    monkeypatch.setattr(sys, "argv", ["firm-sandbox", "--config", str(config), "storage"]
+                        + ([role] if role else []))
+    cli.main()
+    assert calls == [role]
+    assert json.loads(capsys.readouterr().out) == receipt
+
+
+
+def test_storage_help_explains_category_and_request_budgets(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["firm-sandbox", "storage", "--help"])
+    with pytest.raises(SystemExit) as result:
+        cli.main()
+    assert result.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "du estimates" in help_text and "share 60s" in help_text
+    assert "unknown measurements individually" in help_text

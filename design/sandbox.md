@@ -2,7 +2,7 @@
 
 > **TL;DR — How the Sandbox Works**
 > * **Linux-First + Optional Mac Leases:** Every role is a dedicated Linux user (`firmrole-<hash>`) with its own `systemd` slice and **rootless Docker daemon**. Roles lease Mac desktop stations (`firmstation1..8`) on demand for Xcode and GUI work.
-> * **Kernel-Verified Settlement (`populated 0`):** After each work period, the sandbox prunes disposable Docker state, stops the role's slice, verifies `cgroup.events` reads `populated 0` (all processes dead), and wipes `~/scratch`.
+> * **Kernel-Verified Settlement (`populated 0`):** After each work period, the sandbox stops the role's slice, verifies `cgroup.events` reads `populated 0` (all processes dead, running containers included), and preserves scratch and on-disk Docker state.
 > * **Reporting-Line SMB File Server (`/srv/firm`):** No host folders are mounted into guests. Internal Samba (`smbd`) + POSIX ACLs keep `org/<address>/work` private to that reporting line while `shared/` is firm-wide.
 > * **Fail-Closed Packet Filter & Proxy:** Guest NICs drop all UDP, raw DNS, and direct IP traffic. Outbound HTTP/HTTPS goes through the host allowlist proxy (`egress = "enforce"` by default, or `"observe"` for open public web).
 > * **4-Check Mac Station Sweep:** Releasing a Mac station verifies `access_revoked`, `work_stopped`, `drive_detached`, and `desktop_usable` against the pre-lease snapshot before another role can acquire it.
@@ -23,24 +23,29 @@ Each hired role is provisioned on the Linux VM in two phases (recording the iden
 * **Rootless Docker:** The user manager (`user@<uid>.service`) runs in its default slice (required by `systemd` `OwnerUID` checks so rootless `runc` can allocate container scopes) while all role commands run inside `user-<uid>.slice`.
 * **Task Cgroups:** Short-lived [`task()`](runtime.md#tasks) workers run as child processes inside dedicated root-owned leaf cgroups under the role's slice, killed via `cgroup.kill` on timeout or cancellation.
 
-### 20-Second Settlement & Reclaim
+### 20-Second Settlement & Explicit Disposal
 
 Nothing of a role runs between activations (`logind` lingering is off). When an activation ends, settlement runs under a 20-second deadline:
 1. **Kill task children** and read the slice's `memory.peak`, CPU usage, and OOM counters before removing the cgroup.
-2. **Prune disposable Docker state** via the role's rootless Docker API (2s budget per category).
-3. **Stop the daemon & `user-<uid>.slice`**, then verify `cgroup.events` reads `populated 0` (or the cgroup is absent).
-4. **Wipe `<home>/scratch`** iteratively (without following symlinks or crossing mounts) and recreate it empty (`0700`), then unmount `<home>/drive`.
+2. **Stop the daemon & `user-<uid>.slice`**, then verify `cgroup.events` reads `populated 0` (or the cgroup is absent).
+3. **Unmount `<home>/drive`** and remove temporary run credentials. Settlement does not walk retained storage.
 
-| Category | Reclaimed at Settlement | Preserved Across Activations |
+Ordinary settlement removes nothing in either column.
+
+| Category | Removed by Disposal (`dispose`, fired-role cleanup, a temporary appointment's finished final period, handoff `clean_up`) | Kept by Disposal |
 | :--- | :--- | :--- |
-| **Filesystem** | `<home>/scratch` (recreated empty `0700`) | `<home>` tools, configs, provider transcripts, and `<drive>` (`org/` & `shared/`) |
+| **Filesystem** | `<home>/scratch` (recreated empty `0700`, role-owned) | `<home>` tools, configs, provider transcripts, and `<drive>` (`org/` & `shared/`) |
 | **Language Caches** | *None* | `uv`, `pip`, `npm`, `Cargo`, and `Go` caches in `<home>` (avoids re-downloading) |
-| **Docker** | Stopped containers, dangling images (`dangling=true`), and ordinary build cache | Tagged images, running containers' images, and all named/anonymous volumes |
+| **Docker** | All containers (running ones are stopped first), dangling images (`dangling=true`), and ordinary build cache | Tagged images and all named/anonymous volumes |
 
+* **Explicit disposal:** `firm-sandbox --config PATH dispose ROLE` starts rootless Docker, stops running containers, then prunes stopped containers, dangling images and ordinary build cache, stops and verifies the slice, then recreates scratch empty. The runtime disposes before retiring idle fired roles and when a temporary appointment's final period finishes rather than being cut short, the role staying employed; a completed `handoff` with `clean_up` requests best-effort disposal shortly after completion (or at the role's next launch, if it is woken first). Tagged images, volumes and drive files stay.
+* **On-demand measurement:** `firm-sandbox --config PATH storage [ROLE]` uses `du` for read-only scratch and Docker estimates, including retired accounts, without execution locks. Both forms share a 60-second request budget; missing totals report unknown.
+* **Disk pressure:** A fresh Linux sample at or above 85% used puts a notice in every role's inbox, and every twentieth work period carries a housekeeping notice; owner mail is described in the [runtime design](runtime.md#disk-pressure). Nothing is disposed of by age or quota.
+* **Scratch at launch:** A symlinked or file scratch is replaced without following it, and a foreign-owned scratch directory is re-owned to the role.
 * **Guest journal retention:** Finished guest run journals (`/var/lib/firm/runs/<id>`, which hold up to 64 MiB of raw provider stdout) are kept for **7 days** for postmortem debugging, then swept hourly once the host has committed token, tool, and resource tallies to SQLite.
 
 ### Key Design Trade-offs: Linux Execution
-* **Why stop a `systemd` slice instead of `pkill -u <uid>`?** Killing processes by UID misses rootless Docker containers running under the role's 65,536 subordinate UIDs. Waiting on the slice's recursive `cgroup.events` (`populated 0`) guarantees every container and background subprocess is dead before root cleans `scratch/`.
+* **Why stop a `systemd` slice instead of `pkill -u <uid>`?** Killing processes by UID misses rootless Docker containers running under the role's 65,536 subordinate UIDs. Waiting on the slice's recursive `cgroup.events` (`populated 0`) guarantees every container and background subprocess is dead before the work period is released.
 * **Why tombstone retired Linux UIDs forever instead of deleting the user?** If a retired role's UID or subordinate UID range were recycled for a new hire, the new hire could inherit leftover container layers or files written under those subordinate IDs.
 
 ---

@@ -10,7 +10,7 @@ acted as product lead rather than coding solo, hiring `e1` (`Alex Vale`,
 implementation) and `e2` (`Rowan Ellis`, independent QA) and putting all three in
 a shared participant-set conversation (`c1`) to lock `shared/station/INTERFACE.md`
 before parallel work began. Both specialists recorded reusable `playbooks/` on
-staging edits in ephemeral `~/scratch` so they would not clobber each other's
+staging edits in `~/scratch` so they would not clobber each other's
 files in `shared/station/`, and on running offline Chromium checks in `--network none`
 rootless Docker containers. This speaks directly to the [root README's](../../README.md)
 question about how much structure a self-organizing firm needs: here, the owner

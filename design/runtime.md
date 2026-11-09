@@ -17,14 +17,14 @@
 | **Provider session** | A retained conversation bound to a specific provider, model, and account. May span many activations. |
 | **Activation / work period** | One admitted turn of execution, from delivering a wake prompt until normal completion, `handoff`, or failure. |
 | **Wake** | Starting an activation, either by **resuming** a retained provider session or starting a **fresh session** with saved handoff/recovery notes. |
-| **Handoff** | Saving continuation notes (`handoff(notes=..., next="continue" | "wait")`) so the next activation starts with a clean context window while keeping files and mail intact. |
+| **Handoff** | Saving continuation notes (`handoff(notes=..., next="continue" \| "wait", clean_up=false)`) so the next activation starts with a clean context window while keeping drive files and mail intact; with `clean_up`, scratch and scoped Docker state are disposed of. |
 
 ---
 
 ## Hiring, Appointments, and Automatic Model Tiering
 
 A manager hires direct reports with `hire(slug, mandate, request_id, temporary_periods=...)`, creating the direct report at `<manager_address>/<slug>`.
-* **Durable vs. Temporary Appointments:** Hires are either durable or temporary for `1–1,000` work periods. A temporary work period is deducted at the execution launch gate, not at slot reservation, so pre-launch or provisioning failures do not burn an employee's turns. Managers can extend temporary roles (`renew_temporary`) or make them permanent (`promote`) in place.
+* **Durable vs. Temporary Appointments:** Hires are either durable or temporary for `1–1,000` work periods. A temporary work period is deducted at the execution launch gate, not at slot reservation, so pre-launch or provisioning failures do not burn an employee's turns. Managers can extend temporary roles (`renew_temporary`) or make them permanent (`promote`) in place. When a temporary appointment's final work period ends in completion, or in a refusal or unclassified failure (not a runtime stop — inactivity timeout, owner stop or host restart — nor a transient, quota, auth or configuration failure), the dispatcher's idle-role loop also disposes of the role's scratch and scoped Docker state, once per such period. The role stays employed with identity, drive workspace and working memory unchanged, and can still be renewed or promoted; a renewed role starts with an empty scratch.
 * **Permanent Identities:** The founder is always `founder`; hires receive monotonic IDs (`e1`, `e2`, …) backed by an `fsync`'d high-water file beside SQLite so a rolled-back transaction cannot reuse an ID that already touched the filesystem.
 
 ### Hiring Levels
@@ -67,9 +67,14 @@ Every run mounts the firm's internal SMB file server at `<home>/drive`:
 
 | Space | Guest Path | Access Policy |
 | :--- | :--- | :--- |
-| **Private Home** | `/home/firmrole-<hash>` | **Role only (`0700`).** Persistent tools, language caches, and personal notes. `~/scratch` is wiped after every activation. |
+| **Private Home** | `/home/firmrole-<hash>` | **Role only (`0700`).** Persistent tools, language caches, and personal notes. `~/scratch` persists between activations. |
 | **Role Workspace** | `<drive>/org/<address>/work` | **Reporting line only.** The role and its ancestor managers read/write; descendants read-only; siblings and cousins have zero access. |
 | **Shared Space** | `<drive>/shared` | **Firm-wide.** Every active role can read and write. |
+
+### Disk Pressure
+* **Owner mail from samples:** The latest Linux reading outside the 80–85% band holds the alert state (at or above 85% sets it, below 80% clears it), so sampling gaps and host restarts do not reset it. The mail commits with the sample that flips the state; an unknown sample sends none.
+* **Role notices:** Every role's inbox carries a low-disk notice while the latest fresh Linux sample is at or above 85%, and a housekeeping notice on each twentieth work period, counted over finished activations of any terminal state.
+* **Owner cleanup:** Machine-wide disk views (`firm analyze`, **System → Health**) and `firm-sandbox --config PATH storage [ROLE]` guide a request to the role or `dispose ROLE`.
 
 ### Role-Authored Memory
 Runtime telemetry is never dumped into agent workspaces. Instead, roles maintain three lightweight conventions in their workspace:
@@ -79,6 +84,8 @@ Runtime telemetry is never dumped into agent workspaces. Instead, roles maintain
 
 ### Firing and Retirement
 Firing (`fire`) is direct-report only and refuses if the employee still has live descendants. It stops new admissions, cancels pending reminders, withdraws pending owner requests, and marks pending inbound mail undeliverable—while keeping all workspace files intact (downgraded to read-only `rx` for the reporting line).
+
+After sandbox reconciliation while the firm is running, the dispatcher disposes of scratch and scoped Docker state for idle fired roles, then retires their guest and file-server identities; a failure is retried after fifteen minutes. Drive workspaces, tagged images, volumes and the rest of the home remain.
 
 ---
 
@@ -101,6 +108,8 @@ Scheduling is a deterministic SQLite projection (`scheduling_opportunities`) com
 * **Reminders:** Roles can schedule future wakes with `set_reminder(due_at, note, request_id)` (up to 100 pending reminders per role). When due, a reminder becomes an ordinary Operations message and wake.
 
 ### Handoff and the Next Work Period
+
+The handoff request stores `clean_up` in its payload (default `false`). When a period whose handoff set `clean_up` completes, the dispatcher's idle-role loop disposes of scratch and scoped Docker state (containers, dangling images and ordinary build cache; tagged images and volumes stay) best-effort, one role per tick, shared with retirement and expired temporary appointments; if the role's next launch is admitted first, that launch performs the cleanup instead. A returned receipt, even partial, marks the activation cleaned for this host process; an exception backs off fifteen minutes, and a host restart may repeat cleanup harmlessly.
 
 | How the role stops | Context on next activation | Wake behavior |
 | :--- | :--- | :--- |
@@ -219,7 +228,7 @@ When a role calls a tool that hits an owner-controlled gate, the tool opens a pe
 
 ### Analysis
 * `firm analyze` computes read-only telemetry over a time window (`--from` / `--until`) from SQLite records and guest run journals (`overview`, `inbox`, `readiness`, `conversations`, `timeline`, `usage`, `mac`, `resources`, `network`, or omit `--section` for the full report).
-* Telemetry reports objective execution facts (wake triggers, tool-call counts by name, token usage, message claim delays, cgroup peak memory, and settlement reclaim counts) without using an LLM to judge whether a deliverable meets the mandate.
+* Telemetry reports objective execution facts (wake triggers, tool-call counts by name, token usage, message claim delays, and cgroup peak memory) without using an LLM to judge whether a deliverable meets the mandate.
 
 ### The Local Owner Console (`http://127.0.0.1:8766/`)
 * **Bookmarkable, owner-only auth:** Loopback is shared by local processes, so the console requires an `HttpOnly`, `SameSite=strict` session cookie initialized via `/unlock/<key>`. The key is generated once in `durable/console-key` (`0600`), keeping the console URL stable across restarts.

@@ -333,7 +333,7 @@ class Lifecycle:
         reason: str,
         request_id: str,
     ) -> dict:
-        """Retire one direct report while preserving its execution and files."""
+        """Retire one direct report while preserving its execution and drive workspace."""
         _require_reason(reason, required=True)
         payload = {"employee_id": employee_id, "reason": reason}
         with self.store.transaction() as db:

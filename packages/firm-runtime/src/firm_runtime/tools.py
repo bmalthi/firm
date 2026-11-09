@@ -271,8 +271,15 @@ class RoleTools:
     def retry(self, employee: str, episode: str, request_id: str) -> dict:
         return self._call(self.runtime.retry, employee, episode, request_id)
 
-    def handoff(self, notes: str, next: str, request_id: str) -> dict:
-        return self._call(self.runtime.handoff, notes, next, request_id, with_token=True)
+    def handoff(
+        self, notes: str, next: str, request_id: str,
+        clean_up: Annotated[bool, Field(strict=True, description=(
+            "Before your next work period, stopped Docker containers, dangling images and "
+            "build cache are removed and scratch is emptied; tagged images and volumes stay."
+        ))] = False,
+    ) -> dict:
+        return self._call(
+            self.runtime.handoff, notes, next, request_id, clean_up, with_token=True)
 
     def create_repository(self, name: str, purpose: str, request_id: str) -> dict:
         with self.runtime.authorized(self.token) as actor:

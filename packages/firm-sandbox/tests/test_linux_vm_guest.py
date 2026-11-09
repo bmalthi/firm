@@ -40,6 +40,18 @@ def sim(tmp_path, monkeypatch):
     monkeypatch.setattr(guest, "boot", lambda: "boot-1")
     monkeypatch.setattr(guest.time, "sleep", lambda _seconds: None)
     with guest.simulation() as privileged:
+        privileged.replies[("/usr/bin/setpriv",)] = (0, json.dumps({
+            "ContainersDeleted": [], "ImagesDeleted": [], "CachesDeleted": [], "SpaceReclaimed": 0,
+        }))
+        original = privileged.run
+
+        def run(argv, **options):
+            result = original(argv, **options)
+            if argv[-1] == "http://localhost/containers/json" and result.returncode == 0:
+                return subprocess.CompletedProcess(argv, 0, "[]", "")
+            return result
+
+        monkeypatch.setattr(privileged, "run", run)
         privileged.tree = tmp_path
         yield privileged
 
@@ -68,10 +80,6 @@ PROVISION = [
     *SETTLE,
     ["sync", "-f", "HOME"],
 ]
-
-
-def commands_without_docker_prune(sim):
-    return [argv for argv in sim.commands if argv[0] != "/usr/bin/setpriv"]
 
 
 def provision_commands(sim):
@@ -454,6 +462,7 @@ guest.provision = lambda role: {{"role_id": role, "account": "test", "uid": {UID
                                  "gid": {UID}}}
 guest.settle = lambda info: None
 guest.prepare_run_state = lambda info: None
+guest.heal_scratch = lambda info: None
 guest.boot = lambda: "boot"
 save = guest.save
 def interrupted(path, value):
@@ -486,11 +495,11 @@ def test_boot_change_interrupts_the_run_and_drops_its_request(sim, monkeypatch):
     assert not (directory / "request.json").exists()
     assert sim.commands == []
     # A stop may have recorded evidence before power-off prevented exit publication.
-    receipt = {"usage": {"cpu_usec": 42}, "reclaim": {"categories": {}}, "error": None}
+    receipt = {"usage": {"cpu_usec": 42}, "error": None}
     guest.save(directory / "settlement.json", receipt)
     interrupted = guest.status("run-1")
     assert interrupted["usage"] == receipt["usage"]
-    assert interrupted["reclaim"] == receipt["reclaim"]
+    assert "reclaim" not in interrupted
 
 
 def test_supervisor_identity_is_verified_before_a_run_counts_as_running(sim, monkeypatch):
@@ -551,7 +560,7 @@ def test_supervise_mounts_starts_services_runs_in_the_slice_settles_and_unmounts
     directory = journal("run-1", request)
     sim.processes.append(SimpleNamespace(pid=77, stdout=io.BytesIO(b"hello\n"), wait=lambda: 3))
     guest.supervise("run-1")
-    assert commands_without_docker_prune(sim) == [
+    assert sim.commands == [
         ["mount.cifs", "//127.0.0.1/firm", provisioned["drive"], "-o",
          f"uid={UID},gid={UID},{guest.CIFS_OPTIONS}"],
         ["systemctl", "start", f"user@{UID}.service"],
@@ -594,7 +603,7 @@ def test_the_rootless_daemon_pulls_through_the_runs_proxy_without_it_in_argv(sim
     journal("run-1", request)
     guest.supervise("run-1")
     imported = user_systemctl("import-environment", "HTTPS_PROXY", "NO_PROXY", "http_proxy")
-    commands = commands_without_docker_prune(sim)
+    commands = sim.commands
     assert commands[:3] == [
         ["systemctl", "start", f"user@{UID}.service"], imported,
         user_systemctl("start", "docker.service"),
@@ -650,7 +659,7 @@ def test_a_run_without_a_proxy_leaves_docker_settings_alone(sim, provisioned):
 def test_a_plain_run_works_in_its_private_work_without_a_mount(sim, provisioned):
     directory = journal("run-1", {"role_id": ROLE, "argv": ["/bin/true"]})
     guest.supervise("run-1")
-    assert commands_without_docker_prune(sim) == [
+    assert sim.commands == [
         ["systemctl", "start", f"user@{UID}.service"],
         user_systemctl("start", "docker.service"),
         *SETTLE,
@@ -719,7 +728,7 @@ def test_slice_usage_is_unknown_without_a_cgroup_or_a_readable_counter(sim, prov
     }
 
 
-def test_settlement_waits_for_stop_and_recursive_empty_before_scratch(
+def test_disposal_waits_for_stop_and_recursive_empty_before_scratch(
     sim, provisioned, monkeypatch,
 ):
     root = guest.slice_cgroup(UID)
@@ -743,7 +752,7 @@ def test_settlement_waits_for_stop_and_recursive_empty_before_scratch(
 
     def cleanup(info, deadline):
         assert stopped and guest.slice_empty(UID) and now[0] > 3
-        assert deadline == guest.SETTLE_TIMEOUT
+        assert deadline == now[0] + guest.DISPOSE_SCRATCH_TIMEOUT
         cleaned.append(True)
         return {**guest.reclaim_counts(), "completed": True}
 
@@ -795,7 +804,7 @@ def test_unreadable_events_leave_run_unresolved_until_retry(sim, provisioned, mo
     assert sim.commands[-1] == SETTLE[-1]
     (root / "cgroup.events").write_text("populated 0\n")
     assert not guest.stop_run("run-1")["unresolved"]
-    assert not scratch_file.exists()
+    assert scratch_file.read_text() == "data"
 
 
 def test_stop_hands_the_usage_it_read_to_the_exit_journal(sim, provisioned, monkeypatch):
@@ -958,7 +967,8 @@ def test_docker_prune_reports_scoped_categories(sim, provisioned, monkeypatch):
 
     def run(argv, **options):
         calls.append((argv, options))
-        return SimpleNamespace(stdout=json.dumps(next(replies)))
+        return SimpleNamespace(stdout=("[]" if argv[-1].endswith("containers/json")
+                                       else json.dumps(next(replies))))
 
     monkeypatch.setattr(sim, "run", run)
     result = guest.reclaim_docker(provisioned, guest.time.monotonic() + 10)
@@ -969,6 +979,7 @@ def test_docker_prune_reports_scoped_categories(sim, provisioned, monkeypatch):
     }
     assert all(r["completed"] and not r["skipped"] for r in result.values())
     assert [unquote(argv[-1]) for argv, _ in calls] == [
+        "http://localhost/containers/json",
         "http://localhost/containers/prune",
         'http://localhost/images/prune?filters={"dangling":["true"]}',
         "http://localhost/build/prune?all=false",
@@ -977,7 +988,7 @@ def test_docker_prune_reports_scoped_categories(sim, provisioned, monkeypatch):
         assert argv[:4] == ["/usr/bin/setpriv", f"--reuid={UID}", f"--regid={UID}",
                             "--clear-groups"]
         assert f"/run/user/{UID}/docker.sock" in argv
-        assert options["timeout"] <= guest.DOCKER_RECLAIM_TIMEOUT
+        assert options["timeout"] <= guest.DOCKER_PRUNE_BUDGET
         assert options["env"]["HOME"] == provisioned["home"]
 
 
@@ -996,7 +1007,7 @@ def test_reclaim_and_daemon_timeouts_leave_time_for_slice_stop(sim, provisioned,
     monkeypatch.setattr(sim, "run", run)
     reclaim = {}
     guest.settle(provisioned, reclaim=reclaim)
-    assert now[0] == 8 and now[0] < guest.SETTLE_TIMEOUT
+    assert now[0] == guest.DOCKER_PRUNE_BUDGET + 2
     assert calls[-1] == SETTLE[-1]
     for name, report in reclaim["categories"].items():
         if name != "scratch":
@@ -1011,7 +1022,7 @@ def test_scratch_worker_is_killed_at_its_deadline(sim, provisioned, monkeypatch,
     monkeypatch.setattr(guest, "PYTHON", sys.executable)
     monkeypatch.setattr(guest, "CONTROLLER", str(worker))
     started = guest.time.monotonic()
-    report = guest.scratch_worker(provisioned, started + guest.SETTLE_REPORT_MARGIN + 0.2)
+    report = guest.scratch_worker(provisioned, started + guest.SCRATCH_REPORT_MARGIN + 0.2)
     assert guest.time.monotonic() - started < 2
     assert report == guest.reclaim_skipped("deadline", timed_out=True)
 
@@ -1029,8 +1040,8 @@ def test_scratch_worker_receives_remaining_budget_with_reporting_margin(
 
     monkeypatch.setattr(sim, "run", run)
     assert guest.scratch_worker(provisioned, 20)["completed"]
-    assert calls[0]["timeout"] == 12 - guest.SETTLE_REPORT_MARGIN
-    assert json.loads(calls[0]["input"])["deadline"] == 20 - guest.SETTLE_REPORT_MARGIN - 0.1
+    assert calls[0]["timeout"] == 12 - guest.SCRATCH_REPORT_MARGIN
+    assert json.loads(calls[0]["input"])["deadline"] == 20 - guest.SCRATCH_REPORT_MARGIN - 0.1
 
 
 def test_scratch_symlink_is_replaced_without_touching_target(sim, provisioned):
@@ -1918,3 +1929,353 @@ def test_controller_child_reads_skip_global_lock(sim, live_parent, monkeypatch, 
             assert reply["result"]["running"]
         elif operation == "child-logs":
             assert base64.b64decode(reply["result"]["data"]) == b"answer"
+
+
+@pytest.mark.parametrize("completion", ["supervisor", "stop"])
+def test_simulated_pause_resume_never_prunes_or_clears_and_preserves_files(
+    sim, provisioned, completion, monkeypatch,
+):
+    home = Path(provisioned["home"])
+    files = {"scratch/repo/.git/HEAD": b"ref: refs/heads/main\n",
+             "scratch/repo/src/main.c": b"int main() { return 0; }\n",
+             "scratch/repo/build/main.o": b"\x00object\xff",
+             ".local/share/docker/containers/stopped/config.json": b"container",
+             ".local/share/docker/overlay2/image/diff/built": b"image",
+             ".local/share/docker/buildkit/cache": b"cache"}
+    guest.start({"role_id": ROLE, "run_id": "first", "argv": ["true"]})
+    for name, contents in files.items():
+        path = home / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(contents)
+    sim.commands.clear()
+    if completion == "stop":
+        guest.stop_run("first")
+    else:
+        guest.supervise("first")
+    result = guest.status("first")
+    assert not result["unresolved"] and "reclaim" not in result
+    assert result["usage"] is None
+    assert not any(argv[0] == "du" or any("/prune" in arg for arg in argv)
+                   for argv in sim.commands)
+    assert all((home / name).read_bytes() == contents for name, contents in files.items())
+    guest.start({"role_id": ROLE, "run_id": "second", "argv": ["true"]})
+    assert all((home / name).read_bytes() == contents for name, contents in files.items())
+    assert not any(argv[0] == "du" or any("/prune" in arg for arg in argv)
+                   for argv in sim.commands)
+
+
+@pytest.mark.parametrize("state", ["running", "unresolved"])
+def test_dispose_refuses_active_or_unresolved(sim, provisioned, monkeypatch, state):
+    monkeypatch.setattr(guest, "runs", lambda: [{"role_id": ROLE, state: True}])
+    sim.commands.clear()
+    with pytest.raises(ValueError, match="Stop and resolve.*disposal"):
+        guest.dispose_role(ROLE)
+    assert sim.commands == []
+
+
+@pytest.mark.parametrize("retired", [False, True])
+def test_dispose_prunes_scoped_docker_and_recreates_scratch(sim, provisioned, monkeypatch, retired):
+    if retired:
+        guest.retire_role(ROLE)
+    before = guest.database()
+    scratch = Path(provisioned["home"]) / "scratch"
+    (scratch / "discard").write_text("gone")
+    original = sim.run
+    calls = []
+
+    def reply(argv, **options):
+        if argv[0] == "/usr/bin/setpriv":
+            calls.append((argv, options))
+            if argv[-1].endswith("containers/json"):
+                return SimpleNamespace(stdout="[]")
+            return SimpleNamespace(stdout=json.dumps({"ContainersDeleted": ["container"],
+                "ImagesDeleted": ["image"], "CachesDeleted": ["cache"], "SpaceReclaimed": 100}))
+        return original(argv, **options)
+
+    monkeypatch.setattr(sim, "run", reply)
+    result = guest.dispatch({"operation": "dispose", "role_id": ROLE})
+    assert result["disposed"] == ROLE
+    assert [unquote(argv[-1]) for argv, _ in calls] == [
+        "http://localhost/containers/json",
+        "http://localhost/containers/prune",
+        'http://localhost/images/prune?filters={"dangling":["true"]}',
+        "http://localhost/build/prune?all=false",
+    ]
+    for argv, options in calls:
+        assert argv[:4] == [
+            "/usr/bin/setpriv", f"--reuid={UID}", f"--regid={UID}", "--clear-groups"]
+        assert f"/run/user/{UID}/docker.sock" in argv
+        assert options["env"]["HOME"] == provisioned["home"]
+    assert all(r["completed"] for r in result["reclaim"]["categories"].values())
+    assert list(scratch.iterdir()) == [] and scratch.stat().st_mode & 0o777 == 0o700
+    assert sim.owned[scratch.stat().st_ino] == (UID, UID)
+    assert guest.database() == before
+
+
+def test_dispose_without_account_does_not_provision_or_change_retirement(sim):
+    guest.retire_role(ROLE)
+    before = guest.database()
+    sim.commands.clear()
+    assert guest.dispose_role(ROLE) == {"disposed": ROLE, "reclaim": {"categories": {}}}
+    assert guest.database() == before and sim.commands == []
+
+
+def test_dispose_without_docker_still_clears_scratch(sim, provisioned):
+    scratch = Path(provisioned["home"]) / "scratch"
+    (scratch / "discard").write_text("gone")
+    sim.replies[tuple(user_systemctl("start", "docker.service"))] = (7, "unavailable")
+    sim.replies[("/usr/bin/setpriv",)] = (7, "unavailable")
+    result = guest.dispose_role(ROLE)["reclaim"]["categories"]
+    assert result["scratch"]["completed"] and list(scratch.iterdir()) == []
+    assert all(r["skipped"] == {"docker_unavailable": 1, **({"stop_failed": 1}
+               if n == "docker_containers" else {})} for n, r in result.items() if n != "scratch")
+
+
+def test_settlement_preserves_scratch_symlink_and_disposal_replaces_it(sim, provisioned):
+    home = Path(provisioned["home"])
+    scratch, target = home / "scratch", home / "work"
+    (target / "precious").write_bytes(b"keep")
+    scratch.rmdir()
+    scratch.symlink_to(target, target_is_directory=True)
+    directory = journal("symlink", {"role_id": ROLE, "argv": ["true"]})
+    guest.supervise("symlink")
+    assert not json.loads((directory / "exit.json").read_text())["unresolved"]
+    assert scratch.is_symlink() and (target / "precious").read_bytes() == b"keep"
+    guest.dispose_role(ROLE)
+    assert not scratch.is_symlink() and list(scratch.iterdir()) == []
+    assert (target / "precious").read_bytes() == b"keep"
+
+
+def test_storage_includes_retired_accounts_and_omits_roles_without_accounts(sim, provisioned):
+    other = guest.provision("other")
+    guest.retire_role("other")
+    guest.retire_role("never-started")
+    before = guest.database()
+    result = guest.dispatch({"operation": "storage"})["roles"]
+    assert set(result) == {ROLE, "other"}
+    assert result[ROLE]["retired"] is False and result["other"]["retired"] is True
+    assert set(guest.storage("other")["roles"]) == {"other"}
+    assert guest.storage("never-started") == guest.storage("unknown") == {"roles": {}}
+    assert guest.database() == before and Path(other["home"]).exists()
+
+
+def test_service_start_shares_the_supplied_budget_between_commands(sim, provisioned, monkeypatch):
+    now, timeouts = [0.0], []
+    original = sim.run
+    monkeypatch.setattr(guest.time, "monotonic", lambda: now[0])
+
+    def start(argv, **options):
+        if "start" in argv:
+            timeouts.append(options["timeout"])
+            now[0] += 6 if len(timeouts) == 1 else options["timeout"]
+        return original(argv, **options)
+
+    monkeypatch.setattr(sim, "run", start)
+    guest.start_services(provisioned, timeout=10)
+    assert timeouts == [10, 4] and now[0] == 10
+
+
+def test_storage_main_dispatch_takes_no_execution_locks(sim, provisioned, monkeypatch, capsys):
+    monkeypatch.setattr(guest.sys, "platform", "linux")
+    monkeypatch.setattr(guest.os, "getuid", lambda: 0)
+    monkeypatch.setattr(guest.os, "umask", lambda _: None)
+    monkeypatch.setattr(guest.subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(guest.sys, "argv", ["firm-controller.py"])
+    monkeypatch.setattr(guest.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(
+        json.dumps({"operation": "storage", "role_id": ROLE}).encode())))
+    monkeypatch.setattr(guest, "lock", lambda: pytest.fail("storage took global lock"))
+    monkeypatch.setattr(sim, "run", lambda *a, **kw: SimpleNamespace(returncode=0, stdout="4096 x"))
+    guest.main()
+    reply = json.loads(capsys.readouterr().out)
+    assert reply["ok"] and reply["result"]["roles"][ROLE]["scratch"]["completed"]
+
+
+@pytest.mark.parametrize("kind", ["symlink", "file", "foreign", "normal"])
+def test_launch_heals_only_substituted_scratch(sim, provisioned, kind, capsys):
+    home = Path(provisioned["home"])
+    scratch = home / "scratch"
+    target = home / "work/precious"
+    target.write_bytes(b"keep target")
+    if kind in {"symlink", "file"}:
+        scratch.rmdir()
+        if kind == "symlink":
+            scratch.symlink_to(target)
+        else:
+            scratch.write_bytes(b"substitution")
+    else:
+        (scratch / "precious").write_bytes(b"retained checkout")
+        if kind == "foreign":
+            sim.owned[scratch.stat().st_ino] = (UID + 1, UID + 1)
+            sim.owned[(scratch / "precious").stat().st_ino] = (UID + 2, UID + 2)
+            (scratch / "precious").chmod(0o640)
+    original_inode = scratch.lstat().st_ino
+    guest.start({"role_id": ROLE, "run_id": "healed", "argv": ["true"]})
+    diagnostic = capsys.readouterr().err
+    assert scratch.is_dir() and not scratch.is_symlink()
+    assert scratch.stat().st_mode & 0o777 == 0o700
+    assert sim.owned[scratch.stat().st_ino] == (UID, UID)
+    assert target.read_bytes() == b"keep target"
+    if kind in {"normal", "foreign"}:
+        assert scratch.stat().st_ino == original_inode
+        assert (scratch / "precious").read_bytes() == b"retained checkout"
+        if kind == "normal":
+            assert diagnostic == ""
+        else:
+            assert "reowned_directory" in diagnostic
+            assert sim.owned[(scratch / "precious").stat().st_ino] == (UID + 2, UID + 2)
+            assert (scratch / "precious").stat().st_mode & 0o777 == 0o640
+    else:
+        assert not list(scratch.iterdir())
+        assert "replaced_non_directory" in diagnostic
+
+
+@pytest.mark.parametrize("code,reason", [(7, "docker_unavailable"), (22, "docker_error"),
+                                         (1, "docker_error"), (28, "deadline")])
+def test_docker_prune_distinguishes_connection_and_daemon_errors(sim, provisioned, code, reason):
+    sim.replies[("/usr/bin/setpriv",)] = (code, "synthetic error")
+    reports = guest.reclaim_docker(provisioned, guest.time.monotonic() + 60)
+    assert len(reports) == 3
+    assert all(report["skipped"] == {reason: 1, **({"stop_failed": 1}
+               if name == "docker_containers" else {})} for name, report in reports.items())
+    assert all(report["timed_out"] == (code == 28) for report in reports.values())
+
+
+def test_disposal_stage_budgets_reserve_shutdown_and_scratch(sim, provisioned, monkeypatch):
+    now, prune_timeouts, slice_timeouts, scratch_timeouts = [0.0], [], [], []
+    monkeypatch.setattr(guest.time, "monotonic", lambda: now[0])
+
+    def services(info, *, timeout):
+        assert timeout == 15
+        now[0] += timeout
+
+    def run(argv, **options):
+        if argv[0] == "/usr/bin/setpriv":
+            prune_timeouts.append(options["timeout"])
+            now[0] += options["timeout"]
+            raise subprocess.TimeoutExpired(argv, options["timeout"])
+        if argv == SETTLE[-1]:
+            slice_timeouts.append(options["timeout"])
+        now[0] += options["timeout"]
+        return SimpleNamespace(returncode=0)
+
+    def scratch(info, deadline):
+        scratch_timeouts.append(deadline - now[0])
+        now[0] = deadline
+        return {**guest.reclaim_counts(), "completed": True}
+
+    # Empty verification needs a little of the slice budget after systemctl returns.
+    def run_with_margin(argv, **options):
+        result = run(argv, **options)
+        if argv == SETTLE[-1]:
+            now[0] -= 0.1
+        return result
+
+    monkeypatch.setattr(guest, "start_services", services)
+    monkeypatch.setattr(sim, "run", run_with_margin)
+    monkeypatch.setattr(guest, "scratch_worker", scratch)
+    guest.dispose_role(ROLE)
+    assert prune_timeouts == [30]
+    assert slice_timeouts == [18] and scratch_timeouts == [30]
+    assert now[0] == pytest.approx(94.9)
+
+
+
+
+@pytest.mark.parametrize("failure", [None, "docker_error", "scratch_deadline"])
+def test_next_launch_cleanup_is_best_effort_and_published_retry_does_not_repeat(
+    sim, provisioned, monkeypatch, capsys, failure,
+):
+    scratch = Path(provisioned["home"]) / "scratch"
+    (scratch / "old").write_text("finished")
+    if failure == "docker_error":
+        sim.replies[("/usr/bin/setpriv",)] = (22, "HTTP error")
+    elif failure == "scratch_deadline":
+        monkeypatch.setattr(guest, "scratch_worker", lambda *a: guest.reclaim_skipped(
+            "deadline", timed_out=True))
+    request = {"role_id": ROLE, "run_id": "clean-start", "argv": ["true"], "clean_up": True}
+    guest.start(request)
+    record = json.loads((guest.run_path("clean-start") / "record.json").read_text())
+    categories = record["cleanup"]["categories"]
+    assert (scratch / "old").exists() is (failure == "scratch_deadline")
+    assert categories["scratch"]["completed"] is (failure != "scratch_deadline")
+    if failure == "docker_error":
+        assert categories["docker_containers"]["skipped"] == {"docker_error": 1, "stop_failed": 1}
+    assert ("Incomplete launch cleanup" in capsys.readouterr().err) is (failure is not None)
+    # Work after publication survives a retry of exactly the same immutable request.
+    (scratch / "new").write_text("keep")
+    sim.commands.clear()
+    guest.start(request)
+    assert (scratch / "new").read_text() == "keep"
+    assert not any("/prune" in arg for cmd in sim.commands for arg in cmd)
+    with pytest.raises(ValueError, match="different request"):
+        guest.start({**request, "clean_up": False})
+
+
+@pytest.mark.parametrize("outcome", ["ok", "timeout", "error", "partial"])
+def test_storage_du_arguments_and_unknown_results(sim, provisioned, monkeypatch, outcome):
+    calls = []
+
+    def du(argv, **options):
+        calls.append((argv, options))
+        if outcome == "timeout":
+            raise subprocess.TimeoutExpired(argv, options["timeout"])
+        return SimpleNamespace(returncode=0 if outcome == "ok" else 1,
+                               stdout="" if outcome == "error" else "8192\tpath\n")
+
+    monkeypatch.setattr(sim, "run", du)
+    with guest.lock():  # storage reads do not take execution locks.
+        result = guest.storage(ROLE)["roles"][ROLE]
+    for (argv, options), relative in zip(calls, ("scratch", ".local/share/docker"), strict=True):
+        assert argv == ["du", "-s", "-x", "-B1", str(Path(provisioned["home"]) / relative)]
+        assert options["check"] is False and 0 < options["timeout"] <= 60
+    for category in ("scratch", "docker"):
+        assert result[category]["bytes"] == (8192 if outcome in {"ok", "partial"} else None)
+        assert result[category]["completed"] is (outcome == "ok")
+        assert result[category]["timed_out"] is (outcome == "timeout")
+
+
+@pytest.mark.parametrize("failure", [None, "list", "stop"])
+def test_disposal_stops_running_containers_before_pruning_with_shared_budget(
+    sim, provisioned, monkeypatch, failure,
+):
+    now, calls = [0.0], []
+    monkeypatch.setattr(guest.time, "monotonic", lambda: now[0])
+    original = sim.run
+    ids = ["a" * 64, "b" * 64]
+    scratch = Path(provisioned["home"]) / "scratch"
+    (scratch / "discard").write_text("finished")
+
+    def run(argv, **options):
+        if argv[0] != "/usr/bin/setpriv":
+            return original(argv, **options)
+        endpoint = unquote(argv[-1]).removeprefix("http://localhost/")
+        method = argv[argv.index("--request") + 1]
+        calls.append((method, endpoint, options["timeout"]))
+        now[0] += 1
+        if endpoint == "containers/json":
+            if failure == "list":
+                raise subprocess.CalledProcessError(22, argv)
+            return SimpleNamespace(stdout=json.dumps([{"Id": cid} for cid in ids]))
+        if "/stop?" in endpoint:
+            if failure == "stop" and ids[0] in endpoint:
+                raise subprocess.CalledProcessError(22, argv)
+            return SimpleNamespace(stdout="")
+        return SimpleNamespace(stdout=json.dumps({
+            "ContainersDeleted": ids, "ImagesDeleted": [], "CachesDeleted": [],
+            "SpaceReclaimed": 100,
+        }))
+
+    monkeypatch.setattr(sim, "run", run)
+    categories = guest.dispose_role(ROLE)["reclaim"]["categories"]
+    expected = [("GET", "containers/json")]
+    if failure != "list":
+        expected += [("POST", f"containers/{cid}/stop?t=2") for cid in ids]
+    expected += [("POST", "containers/prune"),
+                 ("POST", 'images/prune?filters={"dangling":["true"]}'),
+                 ("POST", "build/prune?all=false")]
+    assert [(method, endpoint) for method, endpoint, _ in calls] == expected
+    assert [timeout for _, _, timeout in calls] == list(range(30, 30 - len(calls), -1))
+    assert categories["docker_containers"]["skipped"] == (
+        {"stop_failed": 1} if failure else {})
+    assert categories["docker_containers"]["completed"] is (failure is None)
+    assert categories["scratch"]["completed"] and list(scratch.iterdir()) == []

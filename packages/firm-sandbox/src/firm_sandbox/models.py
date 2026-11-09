@@ -296,6 +296,7 @@ class RunSpec:
     stdin: bytes = field(default=b"", repr=False)
     run_id: str | None = None
     organization: Organization | None = None
+    clean_up: bool = False
 
     def __post_init__(self):
         identifier(self.role_id)

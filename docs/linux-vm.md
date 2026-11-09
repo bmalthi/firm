@@ -2,8 +2,8 @@
 
 > **Quick Reference — Linux VM & Sandbox**
 > * **One Persistent Ubuntu VM per Firm:** Every role runs as a dedicated Linux user (`firmrole-<hash>`) with its own `0700` home, `systemd` slice (`user-<uid>.slice`), and **rootless Docker daemon**.
-> * **Scratch vs. Durable Storage:** Build and check out code in `~/scratch` (wiped after every work period). Save durable deliverables on `~/drive` (`/srv/firm`, served via internal Samba with reporting-line POSIX ACLs). Installed tools and language caches (`uv`, `npm`, `Cargo`, `Go`) in `~` persist across runs.
-> * **Two CLIs:** Use `firm` for everyday firm lifecycle and network grants (`firm start`, `firm stop`, `firm network`). Use `firm-sandbox --config PATH` for low-level guest diagnostics (`ps`, `logs`, `data-status`) and Mac image maintenance. (Invoke directly when installed via `uv tool install`, or prefix with `uv run` inside a repo checkout.)
+> * **Scratch vs. Durable Storage:** Build and check out code in `~/scratch` (preserved between work periods). Save durable deliverables on `~/drive` (`/srv/firm`, served via internal Samba with reporting-line POSIX ACLs). Installed tools and language caches (`uv`, `npm`, `Cargo`, `Go`) in `~` persist across runs.
+> * **Two CLIs:** Use `firm` for everyday firm lifecycle and network grants (`firm start`, `firm stop`, `firm network`). Use `firm-sandbox --config PATH` for low-level guest diagnostics (`ps`, `logs`, `storage`, `data-status`), explicit cleanup (`dispose`) and Mac image maintenance. (Invoke directly when installed via `uv tool install`, or prefix with `uv run` inside a repo checkout.)
 
 The [sandbox design](../design/sandbox.md) describes what the model guarantees,
 why, and what it does not.
@@ -98,27 +98,85 @@ time and OOM kills for the whole run, read just before the slice stops. The runt
 stores them on the run and **System → Diagnostics → Resources** shows them; the peak
 counts page cache, so it is an upper bound on what the run needed.
 
-Save work needed again on the drive before finishing a period. When an activation ends, settlement runs under a 20-second deadline:
-1. **Prune disposable Docker state (2s budget per category):** Prunes stopped containers, dangling images, and ordinary builder cache (a timed-out Docker prune does not block slice shutdown).
-2. **Stop the slice & verify quiescence:** Stops the rootless daemon and `user-<uid>.slice`, then confirms the kernel's recursive `cgroup.events` reads `populated 0` (or the slice cgroup is gone).
-3. **Wipe `~/scratch` & unmount `~/drive`:** Recreates `~/scratch` empty (`0700`) using the remaining 20-second budget without following symlinks or crossing mounts, while keeping `work/`, provider transcripts, installed tools, and language caches (`pip`, `uv`, `npm`, `Cargo`, `Go`) intact.
+Keep deliverables and work colleagues need on the drive. Scratch and Docker state persist between work periods. When an activation ends, settlement runs under a 20-second deadline:
+1. **Stop the slice & verify quiescence:** Stops child tasks, captures slice usage, stops the rootless daemon and `user-<uid>.slice`, then confirms the kernel's recursive `cgroup.events` reads `populated 0` (or the slice cgroup is gone).
+2. **Unmount `~/drive`** and remove temporary run credentials. Settlement neither deletes nor walks retained storage.
 
-`exit.json` records `reclaim.categories`:
-`docker_containers`, `docker_image_deletion_records`, `docker_build_cache` and
-`scratch`, each with removed `count` and `bytes`, `skipped` reasons, `completed` and
-`timed_out` (retained on the host in `firm analyze PATH --section resources --json`).
-A failed scratch cleanup keeps execution reserved and
-is retried by the dispatcher before the role can work again; if cleanup repeatedly
-fails without progress (for example, a stuck bind mount inside `scratch`), keep execution stopped, repair the obstacle in the guest, and retry stop/settlement.
+A failed slice stop or emptiness check keeps execution reserved until resolved. Owners
+inspect machine-wide disk state with `firm analyze PATH --section overview` or
+`--section resources`, or **System → Health**. For per-role attribution, use `firm-sandbox --config PATH storage [ROLE]`: without ROLE it includes every account, including
+retired roles. ROLE is the sandbox role ID, `r-` followed by the employee ID (`r-e3`);
+`storage` lists them as keys. Its JSON `roles` map reports `retired`, plus `du -s -x
+-B1` allocated-byte estimates under `scratch` and `docker` (the rootless Docker data
+root, `~/.local/share/docker`). `du` does not follow symlinks inside the measured trees or
+cross filesystem boundaries; the role-controlled path to the Docker data root can
+redirect the estimate. Both forms share one 60-second deadline across sorted roles and
+categories, without execution locks. Timeouts or missing totals report unknown, with
+`completed`, `timed_out` and `skipped` reasons; a nonzero `du` exit with a total marks
+it incomplete. Retry unknown roles individually. Measurements are returned on demand,
+not recorded in run receipts or analysis history.
 
-`stop(run, timeout)` reclaims the Docker categories, then terminates the slice and bounds the guest
-acknowledgement and exit wait (default 30 seconds). `run` follows
-output live while the command executes; `logs` pages through all retained output (up to 64 MiB per run).
-Finished guest journals are retained for **7 days** and swept hourly once the host has committed tool-call tallies, provider usage, slice usage, and reclaim evidence to SQLite (after pruning, `firm analyze` keeps the recorded history while raw stdout is removed from `firm-sandbox logs`).
+Roles remove unwanted scratch files with `rm` and inspect Docker usage
+with `docker system df`; `docker container prune`, `docker image prune` and
+`docker builder prune` remove state they no longer need. At 85% Linux disk usage,
+every role receives a low-disk notice from the latest fresh machine sample.
+Every twentieth work period also carries a housekeeping reminder. Operations mails
+the owner when Linux first reaches 85% used and on recovery below 80%; readings in
+between do not change the alert state, nor do sampling gaps or host restarts.
+Only known new readings send mail. Nothing is removed by age or quota.
 
-Retire a role's guest identity with `firm-sandbox retire ROLE` after the runtime has
-retired the employee; it refuses while the role is running, and keeps the role's
-home.
+Owners explicitly dispose of an idle role's state with `firm-sandbox --config PATH
+dispose ROLE`. It refuses running or unresolved runs, works for active and retired
+accounts, does not change retirement, and does not tell the role; if the role might be
+running or woken meanwhile, pause it first with
+`firm stop-role DIRECTORY EMPLOYEE_ID --request-id ID` (the employee ID, such as `e3`, not
+the sandbox role ID), wait for its run to finish, and resume it with `firm resume-role`
+afterwards. It starts the role's user manager and rootless Docker daemon, stops running
+containers, then prunes stopped containers, dangling images and ordinary build cache, then
+stops and verifies
+the slice and recreates scratch empty (`0700`, role-owned). It returns `reclaim.categories`
+(`scratch`, `docker_containers`, `docker_image_deletion_records`, `docker_build_cache`), each with
+removed `count` and `bytes`, `skipped` reasons, `completed` and `timed_out`; image
+counts are untagging and layer records, not distinct images; if Docker is unavailable
+its categories say so and scratch is still cleared. Containers with a restart policy may
+come back up with the daemon; disposal stops them before pruning. Stopping is best-effort;
+a failure is reported as `stop_failed` under `docker_containers`. A role without
+an account is a no-op.
+
+Handoff preserves files by default. A completed period's `clean_up` requests disposal
+shortly after it ends, while the firm is running (or at the role's next launch, if it is
+woken first). The idle-role loop attempts cleanup for at most one role per tick, shared
+with retirement and expired temporary appointments. Cleanup receipts are logged,
+including partial results; exceptions wait fifteen minutes before another idle attempt,
+with next-launch cleanup still available. Next-launch cleanup is recorded as `cleanup`
+in `record.json` and proceeds if scratch can be prepared and the slice is empty. Tagged
+images and volumes stay. Failed or interrupted periods do not apply their handoff.
+
+Disposal has separate budgets: 15 seconds for user-manager/daemon startup and socket
+wait, 30 seconds shared by Docker stopping and pruning, 20 seconds for slice shutdown,
+and 30 seconds for scratch. Ordinary settlement retains its 20-second budget.
+
+At launch, a symlinked or file scratch is replaced without following it, and a
+foreign-owned scratch directory is re-owned to the role.
+
+`stop(run, timeout)` terminates the slice and bounds the guest acknowledgement and exit
+wait (default 30 seconds). `run` follows output live; `logs` pages through retained
+output (up to 64 MiB per run). Finished guest journals are retained for **7 days** and
+swept hourly once the host has committed tool-call tallies, provider usage, and slice
+usage to SQLite (after pruning, `firm analyze` keeps the recorded history while raw
+stdout is removed from `firm-sandbox logs`).
+
+While the firm is running, the dispatcher disposes then retires idle fired roles,
+retrying failures after fifteen minutes.
+`firm-sandbox --config PATH retire ROLE` only retires the identity and preserves its files;
+it refuses running or unresolved runs. Summary roles retire without disposal.
+
+When a temporary employee's last allocated work period finishes (completed, or failed by a
+refusal or an unclassified failure, not by a runtime stop — inactivity timeout, owner stop
+or host restart — or a transient, quota, auth or configuration failure), the dispatcher
+disposes of its scratch and disposable Docker state the same way, without retiring it: the
+role stays employed, keeps its home, drive files and working memory, and can still be
+renewed or promoted; a renewed role starts its next period with an empty scratch.
 
 ### Lifecycle and diagnostics
 
@@ -164,9 +222,8 @@ VM disks live under `durable/linux/` and, with a Mac, `durable/mac/`, whose
 `stations/<n>/` holds each station's lease records. On the
 Linux disk, `/home/<account>` holds each role's private home and provider
 conversations, `/srv/firm` the shared trees, and each role's rootless Docker
-images and volumes stay in its home. Scratch, stopped containers, dangling images
-and ordinary build cache have the settlement policy above; everything outside
-those named categories stays. Stopping retains the disks.
+images and volumes stay in its home. Scratch, stopped containers, images and ordinary
+build cache persist until explicitly removed. Stopping retains the disks.
 Retiring a role keeps its home inaccessible to later roles until the firm is
 replaced.
 
@@ -230,12 +287,12 @@ writes is owned by the role's account on the host and a uid-1000 container's fil
 by the corresponding subordinate ID. Named volumes live in the role's home across
 restarts and are gone with the firm's replacement.
 
-Reclaim never uses `-a`, prunes volumes or removes tagged images. Anonymous volumes
-stay too. Containers still running when prune starts become candidates at a later
-settlement; stopped-container writable layers are disposable, so keep container
-data in a volume or on the drive. Separate Buildx builders are not swept. Expect
-some rebuild cost after builder-cache reclaim. Tagged images and volumes still
-provide a warm cache across work periods.
+Disposal (`dispose`, fired-role cleanup, a temporary appointment's finished final
+period, handoff `clean_up`) never uses `-a`, prunes volumes or removes tagged images;
+anonymous volumes stay too, and separate Buildx builders are not swept. Container
+writable layers go with disposal, and the owner may dispose without telling the role, so
+keep container data in a volume or on the drive. Expect some rebuild cost after
+disposal.
 
 A published port is bound on the Linux VM's loopback and reachable from the role
 itself; nothing forwards it to the host. **Guest loopback is shared by every role**:

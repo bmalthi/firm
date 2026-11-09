@@ -914,6 +914,20 @@ class Sandbox:
         self.linux.rpc("remove", run_id=run.run_id)
 
     @lifecycle()
+    def storage(self, role_id=None):
+        return self.linux.storage(identifier(role_id) if role_id is not None else None)
+
+    @lifecycle()
+    def dispose(self, role_id):
+        role_id = identifier(role_id)
+        if any(
+            row["role_id"] == role_id and (row.get("running") or row.get("unresolved"))
+            for row in self.states()
+        ):
+            raise ValueError("Stop and resolve a role's runs before disposal")
+        return self.linux.dispose(role_id)
+
+    @lifecycle()
     def retire(self, role_id):
         role_id = identifier(role_id)
         if any(
@@ -1169,6 +1183,7 @@ class Sandbox:
             role_id=spec.role_id,
             run_id=run_id,
             argv=list(spec.argv),
+            clean_up=spec.clean_up,
             env=env,
             stdin=base64.b64encode(spec.stdin).decode(),
             organization=spec.organization.address if spec.organization else None,

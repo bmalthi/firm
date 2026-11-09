@@ -218,6 +218,17 @@ class GuestControl:
         return self._rpc(operation, **payload)
 
     @lifecycle()
+    def storage(self, role_id=None):
+        """Live attribution within a shared 60-second guest budget."""
+        payload = {"role_id": role_id} if role_id is not None else {}
+        return self._rpc("storage", timeout=90, **payload)
+
+    @lifecycle()
+    def dispose(self, role_id):
+        """Explicitly discard a stopped role's scratch and scoped Docker state."""
+        return self._rpc("dispose", role_id=role_id)
+
+    @lifecycle()
     def info(self):
         """Read the VM identity and its guest's state; lifecycle state belongs to Sandbox."""
         state = self._state()
