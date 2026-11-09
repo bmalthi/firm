@@ -212,3 +212,44 @@ def test_saved_handoff_orders_distinct_controls_once_and_omits_checklist():
         },
     )
     assert duplicate.count("Operations: Same instruction.") == 1
+
+
+
+def test_handoff_cleanup_parameter_and_description_contract(tmp_path):
+    from firm_runtime.prompt_records import role_tool_catalog
+
+    runtime = Runtime(Store.scratch(tmp_path / "firm.sqlite3"))
+    tool = next(tool for tool in role_tool_catalog(runtime) if tool["name"] == "handoff")
+    parameter = tool["inputSchema"]["properties"]["clean_up"]
+    assert parameter["type"] == "boolean" and parameter["default"] is False
+    assert "clean_up" not in tool["inputSchema"].get("required", [])
+    assert parameter["description"] == (
+        "Before your next work period, stopped Docker containers, dangling images and "
+        "build cache are removed and scratch is emptied; tagged images and volumes stay.")
+    assert (
+        "Set clean_up only when the work in scratch and Docker is finished: "
+        "before your next work period, "
+        "stopped containers, dangling images and build cache are removed and scratch is emptied "
+        "(tagged images and volumes stay). Leave it unset for a fresh start mid-task, and name "
+        "anything in scratch the next period relies on in your notes. "
+        "Identical retries apply within this period."
+    ) in TOOL_DESCRIPTIONS["handoff"]
+
+
+
+def test_handoff_keeps_baseline_mcp_annotations(tmp_path):
+    from firm_runtime.mcp_server import build_server
+
+    runtime = Runtime(Store.scratch(tmp_path / "firm.sqlite3"))
+    server = build_server(runtime, "")
+    tool = next(t for t in server._tool_manager.list_tools() if t.name == "handoff")
+    assert tool.annotations.readOnlyHint is False
+    assert tool.annotations.destructiveHint is False
+    assert tool.annotations.idempotentHint is True
+    assert tool.annotations.openWorldHint is False
+
+
+def test_disk_owner_mails_are_resource_backed():
+    resources = json.loads(prompt("notices.json"))
+    assert resources["linux_disk_low_subject"] == "Linux disk low"
+    assert resources["linux_disk_recovered_subject"] == "Linux disk recovered"

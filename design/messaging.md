@@ -41,7 +41,7 @@ Each message is stored once (`m1`, `m2`, …), with independent per-recipient de
 
 ### Presentation
 * **Waiting-mail notices:** When new mail arrives while a role is already running, the next runtime tool response attaches a compact `mail_waiting` notice (ordered by Owner, Operations, manager, then oldest arrival) without interrupting the current turn.
-* **Context & report status in `peek`:** Every `peek` response presents waiting conversations alongside the role's current context-window advisory/handoff state, any direct reports nearing their context or temporary-appointment limits, and a low-disk notice if the role currently holds a Mac station that is low on disk.
+* **Context & report status in `peek`:** Every `peek` response presents waiting conversations alongside the role's current context-window advisory/handoff state, any direct reports nearing their context or temporary-appointment limits, and, when they apply, notices for low shared Linux disk (a fresh sample at or above 85% used), housekeeping on every twentieth work period, and low disk on a Mac station the role currently holds.
 
 ---
 

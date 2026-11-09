@@ -502,7 +502,11 @@ class Runtime:
             raise FirmError("unknown activation")
         return dict(result)
 
-    def handoff(self, token: str, notes: str, next: str, request_id: str) -> dict:
+    def handoff(
+        self, token: str, notes: str, next: str, request_id: str, clean_up: bool = False
+    ) -> dict:
+        if type(clean_up) is not bool:
+            raise FirmError("clean_up must be a boolean")
         if next not in {"continue", "wait"}:
             raise FirmError("next must be continue or wait")
         if not isinstance(notes, str) or len(notes.encode()) > 128 * 1024:
@@ -535,7 +539,7 @@ class Runtime:
                     f"activation:{activation['activation_id']}",
                     request_id,
                     "handoff",
-                    {"notes": notes, "next": next},
+                    {"notes": notes, "next": next, "clean_up": clean_up},
                     action,
                     activation_id=activation["activation_id"],
                 )

@@ -19,6 +19,7 @@ and, for an optional Mac station, the [Mac station guide](mac-station.md). The
 - [Generative images](#generative-images)
 - [Start and stop](#start-and-stop) ([Execution boundaries](#execution-boundaries))
 - [Accounts, quota and recovery](#accounts-quota-and-recovery) ([Moving a role to another provider](#moving-a-role-to-another-provider))
+- [Handoff](#handoff)
 - [Context pressure](#context-pressure)
 - [Console](#console)
 - [Analysis](#analysis) ([Sizing a firm from its resource history](#sizing-a-firm-from-its-resource-history))
@@ -809,6 +810,22 @@ The held-role notice, sent to the role's manager (the owner, for the founder), n
 `firm route --fresh` on the current profile for when retained context is unusable. Routing
 discards that conversation and resets the role's effort to the profile default.
 
+## Handoff
+
+`handoff` saves notes for fresh working memory. The first successful handoff in a period
+wins; another distinct call is refused, and an identical retry must include the same
+`clean_up` value. A completed period's `clean_up` requests best-effort disposal shortly
+after it ends, while the firm is running (or at the role's next launch, if it is woken
+first). The dispatcher attempts one idle role per tick, shared with retirement and
+expired temporary appointments. Containers (running ones are stopped first), dangling
+images, ordinary build cache and scratch are removed; tagged images and volumes stay.
+Returned receipts, including partial cleanup, are logged and counted as done for this
+host process; exceptions retry after fifteen minutes without preventing the next-launch
+fallback. That fallback records `cleanup` in `record.json`. Failed or interrupted
+periods do not apply their handoff. Leave cleanup unset when the next period still needs
+its state. Design: [Handoff and the next work
+period](../design/runtime.md#handoff-and-the-next-work-period).
+
 ## Context pressure
 
 Each profile's `context_window`, `context_advisory_fraction` and `handoff_reserve` set its soft
@@ -951,7 +968,7 @@ questions, including for an assistant answering them on your behalf. Querying
 | **`usage`** | Admitted in window | Token usage by role, model, workload, session, and tool, plus provider-reported `resolved_models`. |
 | **`conversations`** | Window (or `--conversation-id`) | Message traffic edges, delivery counts, and claim delays (`while_running`, `before_work_period`, `after_notice`). |
 | **`mac`** | Window | Mac station leases, durations, release check outcomes, busy refusals, and desktop tool timings. |
-| **`resources`** | Window | 1-minute host/Linux/Mac CPU, memory, and disk samples, plus per-run cgroup peak memory and settlement `reclaim` counts. |
+| **`resources`** | Window | 1-minute host/Linux/Mac CPU, memory, and disk samples, plus per-run cgroup peak memory and CPU usage. |
 | **`network`** | Current / last run | Egress mode (`enforce` vs `observe`), active allowlist by source, pending host requests, and per-role proxy byte/request tallies. |
 
 Interpret the evidence by its scope:
@@ -1034,35 +1051,35 @@ Interpret the evidence by its scope:
   every measured peak at once. Host footprints never shrink: a VM keeps the memory it has
   touched, whatever its guest has freed. Runs before this history existed, and runs whose slice
   was already gone, have no reading rather than a zero.
-  Each run's `reclaim` reports Linux settlement by category: stopped Docker containers,
-  dangling-image deletion records, ordinary builder cache and scratch. Image-prune
-  counts include untagging and layer records, rather than distinct images. Removed counts and bytes,
-  skipped reasons and timeout flags survive guest journal pruning. Unknown counts
-  are not zero; a timed-out operation may have deleted some data before its reply
-  was lost. Scratch bytes are unlinked file sizes, excluding other hard links, and
-  Docker bytes are the daemon's report, neither a machine-wide free-space delta.
   Isolated summaries appear as `summary_run` resource rows without an employee and
-  are omitted when filtering by employee. A missing `reclaim` means no evidence is
-  recorded.
+  are omitted when filtering by employee.
 
-Linux roles check out and build in their supplied `scratch` directory and save work
-on the drive before ending a work period; scratch is recreated empty at settlement.
-Cleanup waits for the slice stop and the kernel's recursive empty signal (or an
-absent slice); a failed inspection leaves the run unresolved. Scratch gets the
-remaining settlement budget less a reporting margin, with bounded descriptors and
-progress across retries even for deep trees. Persistent obstacles require owner
-repair with execution stopped; the held reservation can delay other new admissions.
-Their remaining home, provider transcripts, installed tools, language caches,
-tagged Docker images and volumes persist, including retired homes.
+Linux roles check out and build in their supplied `scratch` directory and keep shared
+deliverables on the drive. Settlement stops background processes and containers, waits
+for the slice stop and the kernel's recursive empty signal (or an absent slice), and a
+failed slice inspection leaves execution unresolved; it removes nothing. Scratch and
+Docker state go only when the role deletes them, when the owner runs `firm-sandbox
+--config PATH dispose ROLE`, before the dispatcher retires an idle fired role, when a
+temporary employee's last allocated work period finishes (completed, or failed by a
+refusal or an unclassified failure, not by a runtime stop — inactivity timeout, owner stop
+or host restart — or a transient, quota, auth or configuration failure), or shortly after
+a completed [handoff](#handoff) with `clean_up` (or at the role's next launch, if it is
+woken first). A temporary employee whose last period finished stays employed, with
+identity, drive files and working memory unchanged; its manager can still renew or promote
+it, and a renewed role
+starts its next period with an empty scratch. `firm-sandbox --config PATH storage
+[ROLE]` estimates usage with `du` on demand; its readings are not part of run receipts
+or analysis history.
+
 The dispatcher prunes finished guest run journals after seven days, checked hourly and at startup,
 only once the host has recorded completion and committed tool-call tallies, available
-provider usage, slice usage and reclaim evidence from a complete log snapshot.
+provider usage and slice usage from a complete log snapshot.
 Failed evidence collection keeps the journal. Logs missed at completion backfill
 the old activation without changing live session or subscription state; restarting
 the host also does not refresh old subscription windows. Host history and
 captured prompts stay; exact provider stdout then disappears from `firm-sandbox
 logs`. Read or save it within the week when investigating a provider exit. See the
-[Linux guide](linux-vm.md#roles-on-the-linux-vm) for the categories and failure evidence.
+[Linux guide](linux-vm.md#roles-on-the-linux-vm) for settlement, storage measurement and disposal.
 
 How analysis facts are recorded, and what they cannot show, is in the
 [runtime design](../design/runtime.md#analysis).
@@ -1085,12 +1102,17 @@ actually reached `max_active`:
 - **Linux CPU:** 6 vCPU if CPU p95 stays under 0.5 of capacity and CPU stall under about 5% in
   the busiest hour; keep or grow above about 20%.
 - **Disk:** choose `[firm] disk_gib` for a new Linux VM (default 60 GiB); editing it
-  never resizes an existing firm's disk. Act above 70% used: inspect reclaim's
-  skipped categories and deliberately remove only work or caches you no longer need,
-  or move selected work to a larger new firm. Settlement already reclaims scratch,
-  stopped containers, dangling images and ordinary builder cache; tagged images,
-  volumes, tools and durable homes are kept and can still fill the disk. The
-  runtime itself reports `low_disk` at 85% used, or for the host (the owner's own large
+  never resizes an existing firm's disk. Act above 70% used: read the machine-wide view in
+  `firm analyze PATH --section overview` or `--section resources` or **System → Health**,
+  attribute usage with `firm-sandbox --config PATH storage [ROLE]`, then ask roles to
+  remove work or caches they no longer need, dispose of an idle role's state with
+  `firm-sandbox --config PATH dispose ROLE` (`firm stop-role` first if it might be running
+  or woken), or move selected work to a larger new firm. At 85% used every role gets a
+  low-disk notice and Operations mails you with those commands; a recovery mail follows
+  below 80%, readings in between change nothing, and sampling continues while the VMs run
+  even with admissions stopped (details in the
+  [Linux guide](linux-vm.md#roles-on-the-linux-vm)).
+  The runtime itself reports `low_disk` at 85% used, or for the host (the owner's own large
   disk) below 100 GB free: per machine in the overview and resources
   sections and in the console. It is a fact about the firm, not a reason on a role, since a
   low disk blocks nobody until it is full. A window also reports its own last sample, so a

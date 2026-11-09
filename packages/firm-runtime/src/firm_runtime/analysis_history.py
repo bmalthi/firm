@@ -1,10 +1,14 @@
-"""Best-effort observation hooks. Nothing in the runtime consumes this history."""
+"""Best-effort observations, including sample-derived owner disk notices."""
 
 import json
 import logging
+import math
+import shlex
 import threading
 from functools import wraps
 from uuid import uuid4
+
+from .prompt_resources import render
 
 LOGGER = logging.getLogger(__name__)
 _failures = set()
@@ -47,6 +51,7 @@ CREATE INDEX IF NOT EXISTS resource_samples_by_machine
     ON resource_samples(machine,observed_at);
 """
 RESOURCE_INTERVAL = 60.0
+DISK_RECOVERY_FRACTION = 0.80
 RESOURCE_FIELDS = (
     "boot",
     "cpus",
@@ -297,19 +302,66 @@ def context_observed(db, now, session_id, cause):
         )
 
 
-def record_resources(db, now, machine, sample):
+def _linux_disk_alerted(db):
+    from .analysis import LOW_DISK_FRACTION
+
+    # resource_samples_by_machine(machine, observed_at) scans newest readings first.
+    outside_band = db.execute(
+        "SELECT 1.0*disk_used_bytes/disk_total_bytes AS fraction FROM resource_samples "
+        "WHERE machine='linux' AND disk_used_bytes IS NOT NULL AND disk_total_bytes>0 "
+        "AND (1.0*disk_used_bytes/disk_total_bytes>=? "
+        "OR 1.0*disk_used_bytes/disk_total_bytes<?) "
+        "ORDER BY observed_at DESC,sequence DESC LIMIT 1",
+        (LOW_DISK_FRACTION, DISK_RECOVERY_FRACTION),
+    ).fetchone()
+    return outside_band is not None and outside_band["fraction"] >= LOW_DISK_FRACTION
+
+
+def record_resources(db, now, machine, sample, *, notice=None, sandbox_toml=None):
+    from .analysis import disk_state
+    from .store import OWNER
+
+    state = disk_state({**sample, "observed_at": now, "machine": machine,
+                        "disk_used_bytes": sample.get("disk_used_bytes"),
+                        "disk_total_bytes": sample.get("disk_total_bytes")}, now)
+    notify = (machine == "linux" and notice is not None
+              and not state["unknown"])
+    before = _linux_disk_alerted(db) if notify else None
     columns = ",".join(RESOURCE_FIELDS)
     marks = ",".join("?" for _ in RESOURCE_FIELDS)
     db.execute(
         f"INSERT INTO resource_samples(observed_at,machine,{columns}) VALUES(?,?,{marks})",
         (now, machine, *(sample.get(field) for field in RESOURCE_FIELDS)),
     )
+    if not notify:
+        return
+    after = _linux_disk_alerted(db)
+    if before == after:
+        return
+    used_percent = state["used_bytes"] / sample["disk_total_bytes"] * 100
+    free = state["free_bytes"] / (1024**3)
+    if after:
+        config = shlex.quote(str(sandbox_toml)) if sandbox_toml is not None else "PATH"
+        body = render("notices", "linux_disk_low_body", config=config,
+                      used_percent=f"{used_percent:.0f}", free=f"{free:.1f}")
+        if sandbox_toml is None:
+            body += render("notices", "sandbox_config_path_suffix")
+        subject = render("notices", "linux_disk_low_subject")
+    else:
+        subject = render("notices", "linux_disk_recovered_subject")
+        body = render("notices", "linux_disk_recovered_body",
+                      used_percent=math.floor(used_percent), free=f"{free:.1f}")
+    notice(db, [OWNER], body, subject=subject)
 
 
 class AnalysisObserver:
     """Post-tick samples in separate transactions; errors never alter host control flow."""
 
-    def __init__(self, store, sandbox):
+    def __init__(self, store, sandbox, *, messaging=None, sandbox_toml=None):
+        from .messaging import Messaging
+
+        self.messaging = messaging if messaging is not None else Messaging(store)
+        self.sandbox_toml = sandbox_toml
         self.store = store
         self.sandbox = sandbox
         self.epoch = uuid4().hex
@@ -351,7 +403,10 @@ class AnalysisObserver:
             with self.store.transaction() as db:
                 for machine, sample in samples.items():
                     if sample is not None:
-                        record_resources(db, now, machine, sample)
+                        record_resources(
+                            db, now, machine, sample, notice=self.messaging.notice,
+                            sandbox_toml=self.sandbox_toml,
+                        )
         except Exception:
             LOGGER.exception("Resource sample failed; observation coverage is incomplete")
 

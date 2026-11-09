@@ -278,6 +278,11 @@ class FileServer:
             "group": GROUP,
         }
 
+    def retired_roles(self) -> set[str]:
+        """Atomic local ledger read; no guest call is needed."""
+        return {role for role, account in self._load()["accounts"].items()
+                if account.get("retired")}
+
     def retire_role(self, role_id: str) -> dict:
         identifier(role_id)
         with self._lock():

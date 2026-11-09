@@ -1,7 +1,7 @@
 """Guest controller of the firm's Linux VM, installed root-owned; JSON over the control channel.
 
 One request on stdin, one ``ok``/``error`` reply on stdout, under a global lock, which
-``sample``, ``export``, ``child-status`` and ``child-logs`` skip; only ``export``
+``sample``, ``export``, ``storage``, ``child-status`` and ``child-logs`` skip; only ``export``
 replies with a tar stream instead of JSON. Every role is a Linux account whose work
 runs inside one systemd slice; the file server's steps are the ``files`` operation of
 the same controller. This module is self-contained so the guest needs nothing but its
@@ -55,8 +55,11 @@ MAX_LOG_BYTES = 64 * 1024 * 1024
 CHILD_LOG_BYTES = 4 * 1024 * 1024
 CHILD_STOP_TIMEOUT = 2.0
 SETTLE_TIMEOUT = 20.0
-DOCKER_RECLAIM_TIMEOUT = 2.0  # Per category; leave most of settlement for stopping the slice.
-SETTLE_REPORT_MARGIN = 0.2
+DISPOSE_DAEMON_TIMEOUT = 15.0  # User manager, daemon and socket share this budget.
+DOCKER_PRUNE_BUDGET = 30.0
+DISPOSE_SCRATCH_TIMEOUT = 30.0
+STORAGE_TIMEOUT = 60.0  # Fits inside the host storage RPC's 90 seconds.
+SCRATCH_REPORT_MARGIN = 0.2
 SCRATCH_MAX_DEPTH = 32  # Each level holds a directory fd and a scandir fd, plus the home fd.
 ACCOUNT_PREFIX = "firmrole-"
 UID_START, UID_COUNT = 2000, 48000
@@ -499,14 +502,19 @@ def role_environment(info):
 PROXY_VARIABLES = ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy")
 
 
-def start_services(info, environment=None):
+def start_services(info, environment=None, *, timeout=None):
     """The user manager and the rootless daemon, started at run start under the slice.
 
     The daemon pulls images through the run's egress proxy: the user manager imports the
     proxy variables from this call's environment, never from argv, where every account
     could read the role's proxy credential.
     """
-    privileged.run(["systemctl", "start", f"user@{info['uid']}.service"])
+    deadline = time.monotonic() + timeout if timeout is not None else None
+
+    def remaining():
+        return max(0.001, deadline - time.monotonic()) if deadline is not None else None
+
+    privileged.run(["systemctl", "start", f"user@{info['uid']}.service"], timeout=remaining())
     proxy = {name: value for name, value in (environment or {}).items() if name in PROXY_VARIABLES}
     if proxy:
         privileged.run(
@@ -514,7 +522,7 @@ def start_services(info, environment=None):
             env={**os.environ, **proxy},
         )
         write_docker_proxies(info, proxy)
-    privileged.run(user_systemctl(info, "start", "docker.service"))
+    privileged.run(user_systemctl(info, "start", "docker.service"), timeout=remaining())
 
 
 # Nothing answers DNS here, inside a container as in the guest: a lookup is refused at
@@ -610,12 +618,42 @@ def reclaim_skipped(reason, *, timed_out=False):
     }
 
 
+def docker_request(info, endpoint, deadline, method="POST"):
+    timeout = deadline - time.monotonic()
+    if timeout <= 0:
+        raise subprocess.TimeoutExpired(endpoint, 0)
+    return privileged.run(
+        ["/usr/bin/setpriv", f"--reuid={info['uid']}", f"--regid={info['gid']}",
+         "--clear-groups", "--", "/usr/bin/curl", "--disable", "--silent", "--show-error",
+         "--fail", "--globoff", "--noproxy", "*", "--max-time", str(timeout),
+         "--unix-socket", f"/run/user/{info['uid']}/docker.sock", "--request", method,
+         "http://localhost/" + endpoint],
+        env=role_environment(info), timeout=timeout,
+    )
+
+
 def reclaim_docker(info, deadline):
     """The daemon's prune API gives exact byte counts without parsing CLI prose.
 
-    Only these endpoints are allowed: no volumes, networks or `all` image/build prune.
+    Stop running containers first; never prune volumes, networks or `all` images/cache.
     A request that times out can still be in flight until the slice is stopped below.
     """
+    stop_failed = False
+    errors = (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError)
+    try:
+        containers = json.loads(docker_request(info, "containers/json", deadline, "GET").stdout)
+        if not isinstance(containers, list):
+            raise ValueError("Invalid container list")
+    except errors:
+        containers, stop_failed = [], True
+    for container in containers:
+        try:
+            container_id = container["Id"]
+            if not isinstance(container_id, str) or not re.fullmatch(r"[0-9a-f]{64}", container_id):
+                raise ValueError("Invalid container ID")
+            docker_request(info, f"containers/{container_id}/stop?t=2", deadline)
+        except errors:
+            stop_failed = True
     categories = {}
     for category, endpoint, field in (
         ("docker_containers", "containers/prune", "ContainersDeleted"),
@@ -626,37 +664,12 @@ def reclaim_docker(info, deadline):
         ),
         ("docker_build_cache", "build/prune?all=false", "CachesDeleted"),
     ):
-        timeout = min(DOCKER_RECLAIM_TIMEOUT, deadline - time.monotonic())
+        timeout = deadline - time.monotonic()
         if timeout <= 0:
             categories[category] = reclaim_skipped("deadline", timed_out=True)
             continue
         try:
-            result = privileged.run(
-                [
-                    "/usr/bin/setpriv",
-                    f"--reuid={info['uid']}",
-                    f"--regid={info['gid']}",
-                    "--clear-groups",
-                    "--",
-                    "/usr/bin/curl",
-                    "--disable",
-                    "--silent",
-                    "--show-error",
-                    "--fail",
-                    "--globoff",
-                    "--noproxy",
-                    "*",
-                    "--max-time",
-                    str(timeout),
-                    "--unix-socket",
-                    f"/run/user/{info['uid']}/docker.sock",
-                    "--request",
-                    "POST",
-                    "http://localhost/" + endpoint,
-                ],
-                env=role_environment(info),
-                timeout=timeout,
-            )
+            result = docker_request(info, endpoint, deadline)
             report = json.loads(result.stdout)
             removed = report[field] or []
             size = report["SpaceReclaimed"]
@@ -672,11 +685,15 @@ def reclaim_docker(info, deadline):
             categories[category] = reclaim_skipped("deadline", timed_out=True)
         except subprocess.CalledProcessError as exc:
             categories[category] = reclaim_skipped(
-                "deadline" if exc.returncode == 28 else "docker_unavailable",
+                "deadline" if exc.returncode == 28 else (
+                    "docker_unavailable" if exc.returncode == 7 else "docker_error"),
                 timed_out=exc.returncode == 28,
             )
         except (OSError, ValueError, KeyError, TypeError):
-            categories[category] = reclaim_skipped("docker_unavailable")
+            categories[category] = reclaim_skipped("docker_error")
+    if stop_failed:
+        categories["docker_containers"]["skipped"]["stop_failed"] = 1
+        categories["docker_containers"]["completed"] = False
     return categories
 
 
@@ -688,7 +705,6 @@ def reclaim_scratch(info, deadline):
     """
     counts = reclaim_counts()
     home = Path(info["home"])
-    scratch = home / "scratch"
 
     def check_deadline():
         if time.monotonic() >= deadline:
@@ -766,14 +782,16 @@ def reclaim_scratch(info, deadline):
     try:
         # st_dev alone misses bind mounts on the same filesystem.
         mounts = (PROC / "self/mountinfo").read_text().splitlines()
-        for line in mounts:
-            mount = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), line.split()[4])
-            path = Path(mount)
-            if path == home or path == scratch or scratch in path.parents:
-                counts["skipped"]["mount"] = 1
-                return counts
         fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
+            scratch = home / "scratch"
+            for line in mounts:
+                check_deadline()
+                mount = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), line.split()[4])
+                path = Path(mount)
+                if path == home or path == scratch or scratch in path.parents:
+                    counts["skipped"]["mount"] = 1
+                    return counts
             try:
                 clear(fd, "scratch", os.fstat(fd).st_dev)
             except FileNotFoundError:
@@ -795,7 +813,7 @@ def reclaim_scratch(info, deadline):
 
 
 def scratch_worker(info, deadline):
-    worker_deadline = deadline - SETTLE_REPORT_MARGIN
+    worker_deadline = deadline - SCRATCH_REPORT_MARGIN
     timeout = worker_deadline - time.monotonic()
     if timeout <= 0:
         return reclaim_skipped("deadline", timed_out=True)
@@ -815,17 +833,54 @@ def scratch_worker(info, deadline):
         return reclaim_skipped("worker_failed")
 
 
+def storage_unknown(reason, *, timed_out=False):
+    return {"bytes": None, "completed": False, "timed_out": timed_out, "skipped": {reason: 1}}
+
+
+def storage(role_id=None):
+    """Estimate retained storage without execution locks, within one request budget."""
+    deadline = time.monotonic() + STORAGE_TIMEOUT
+    roles = database()["roles"]
+    if role_id is not None:
+        identifier(role_id)
+        roles = {role_id: roles[role_id]} if role_id in roles else {}
+    result = {}
+    for role, info in sorted(roles.items()):
+        if "uid" not in info:
+            continue
+        row = {"retired": bool(info.get("retired"))}
+        for category, relative in (("scratch", "scratch"), ("docker", ".local/share/docker")):
+            remaining = deadline - time.monotonic()
+            row[category] = storage_unknown("deadline", timed_out=True)
+            if remaining <= 0:
+                continue
+            try:
+                measured = privileged.run(
+                    ["du", "-s", "-x", "-B1", str(Path(info["home"]) / relative)],
+                    timeout=remaining, check=False,
+                )
+                total = int(measured.stdout.split()[0])
+                row[category] = {"bytes": total, "completed": measured.returncode == 0,
+                                 "timed_out": False,
+                                 "skipped": {} if measured.returncode == 0 else {"du_error": 1}}
+            except subprocess.TimeoutExpired:
+                pass
+            except (OSError, ValueError, IndexError):
+                row[category] = storage_unknown("du_error")
+        result[role] = row
+    return {"roles": result}
+
+
 def settle(info, *, reclaim=None):
     """Stop everything of the role and confirm its slice is empty.
 
     The daemon stop may fail; the slice stop is what kills the containers. A slice
     still holding processes after the timeout leaves the run unresolved.
     """
-    deadline = time.monotonic() + SETTLE_TIMEOUT
     if reclaim is not None:
-        # Leave shutdown and scratch half the budget even if a prune call stalls.
-        reclaim["categories"] = reclaim_docker(info, deadline - 10)
+        reclaim["categories"] = reclaim_docker(info, time.monotonic() + DOCKER_PRUNE_BUDGET)
         reclaim["categories"]["scratch"] = reclaim_skipped("slice_not_empty")
+    deadline = time.monotonic() + SETTLE_TIMEOUT
     try:
         privileged.run(
             user_systemctl(info, "stop", "docker.service"),
@@ -845,9 +900,8 @@ def settle(info, *, reclaim=None):
     while time.monotonic() < deadline:
         if slice_empty(info["uid"]):
             if reclaim is not None:
-                reclaim["categories"]["scratch"] = scratch_worker(info, deadline)
-                if not reclaim["categories"]["scratch"]["completed"]:
-                    raise RuntimeError("Role scratch could not be recreated empty")
+                reclaim["categories"]["scratch"] = scratch_worker(
+                    info, time.monotonic() + DISPOSE_SCRATCH_TIMEOUT)
             return
         time.sleep(min(0.05, max(0, deadline - time.monotonic())))
     raise RuntimeError("Role slice emptiness could not be confirmed")
@@ -962,6 +1016,7 @@ def request_fingerprint(request):
         "drive": request.get("drive"),
         "secrets": request.get("secrets", {}),
         "secret_env": request.get("secret_env", {}),
+        "clean_up": request.get("clean_up", False),
     }
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -1013,7 +1068,6 @@ def status(run_id):
             "unresolved": False,
             "log_bytes": log_bytes,
             "usage": settlement.get("usage"),
-            "reclaim": settlement.get("reclaim"),
         }
     supervisor = record.get("supervisor")
     if supervisor and supervisor_identity(supervisor, run_id):
@@ -1099,6 +1153,35 @@ def validate_drive(request):
     return drive
 
 
+def heal_scratch(info):
+    """Caller holds the global lock and has verified that the role slice is empty."""
+    home = os.open(info["home"], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    action = None
+    try:
+        try:
+            entry = os.stat("scratch", dir_fd=home, follow_symlinks=False)
+        except FileNotFoundError:
+            entry = None
+        if entry is not None:
+            if not stat.S_ISDIR(entry.st_mode):
+                os.unlink("scratch", dir_fd=home)
+                action = {"action": "replaced_non_directory"}
+            else:
+                fd = os.open("scratch", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=home)
+                try:
+                    if privileged.owner(fd) != info["uid"]:
+                        privileged.chown(fd, info["uid"], info["gid"])
+                        os.fchmod(fd, 0o700)
+                        action = {"action": "reowned_directory"}
+                finally:
+                    os.close(fd)
+        managed_directory(Path(info["home"]) / "scratch", info["uid"], info["gid"], 0o700)
+    finally:
+        os.close(home)
+    if action:
+        print(f"Scratch repaired for {info['role_id']}: {action['action']}", file=sys.stderr)
+
+
 def prepare_run_state(info):
     """Fresh tmpfs state and credentials directories owned by the account."""
     clean_run_state(info)
@@ -1167,7 +1250,12 @@ def start(request):
             continue
         if existing.get("running") or existing.get("unresolved"):
             raise ValueError(f"Role already has an active or unresolved run: {existing['run_id']}")
-    settle(info)
+    cleanup = dispose_account(info) if request.get("clean_up") else None
+    if cleanup is None:
+        settle(info)
+    elif any(not c["completed"] or c["skipped"] for c in cleanup["categories"].values()):
+        print(f"Incomplete launch cleanup for {role}: {json.dumps(cleanup)}", file=sys.stderr)
+    heal_scratch(info)
     prepare_run_state(info)
     directory.parent.mkdir(mode=0o700, exist_ok=True)
     # main() serializes controller requests. Keep unpublished journals outside
@@ -1187,6 +1275,8 @@ def start(request):
         "fingerprint": fingerprint,
         "phase": "launching",
     }
+    if cleanup is not None:
+        record["cleanup"] = cleanup
     try:
         save(staging / "record.json", record)
         save(staging / "request.json", request)
@@ -1434,7 +1524,6 @@ def supervise(run_id):
                         "unresolved": bool(cleanup_error),
                         "log_truncated": log_truncated,
                         "usage": settlement.get("usage"),
-                        "reclaim": settlement.get("reclaim"),
                     },
                 )
 
@@ -1833,31 +1922,18 @@ def settle_run(info, directory):
     # Stopping the slice removes the cgroup that holds its usage counters.
     receipt = {
         "usage": previous.get("usage") or slice_usage(info["uid"]),
-        "reclaim": {},
         "error": None,
     }
     try:
         # Stopping member units cleans the role's Docker/services even when a
         # foreign task cgroup stays populated; slice stop alone cannot kill tasks.
-        settle(info, reclaim=receipt["reclaim"])
+        settle(info)
         if child_error is not None:
             raise child_error
     except Exception as exc:
         receipt["error"] = str(exc)
         raise
     finally:
-        # Keep removal evidence from failed attempts, even if a retry succeeds.
-        categories = receipt["reclaim"].get("categories", {})
-        for name, before in previous.get("reclaim", {}).get("categories", {}).items():
-            after = categories.setdefault(name, reclaim_counts())
-            for key in ("count", "bytes"):
-                after[key] = (
-                    before[key] + after[key]
-                    if before[key] is not None and after[key] is not None
-                    else None
-                )
-            for reason, count in before["skipped"].items():
-                after["skipped"][reason] = after["skipped"].get(reason, 0) + count
         save(directory / "settlement.json", receipt)
     return receipt
 
@@ -1888,7 +1964,6 @@ def stop_run(run_id):
                         "unresolved": False,
                         "cleanup_error": None,
                         "usage": settlement["usage"],
-                        "reclaim": settlement["reclaim"],
                     },
                 )
     return status(run_id)
@@ -1942,6 +2017,35 @@ def retire_role(role_id):
     data["roles"][role_id].pop("retiring", None)
     save(STATE / "firm.json", data)
     return {"retired": role_id, "private_retained": True}
+
+
+def dispose_account(info):
+    """Explicit disposal under the controller global lock."""
+    receipt = {}
+    if info is not None and "uid" in info:
+        try:
+            deadline = time.monotonic() + DISPOSE_DAEMON_TIMEOUT
+            start_services(info, timeout=DISPOSE_DAEMON_TIMEOUT)
+            socket = Path(f"/run/user/{info['uid']}/docker.sock")
+            while not privileged.simulate and not socket.is_socket():
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+        except (OSError, subprocess.SubprocessError):
+            pass  # The prune API reports docker_unavailable; scratch still clears.
+        settle(info, reclaim=receipt)
+    else:
+        receipt["categories"] = {}
+    return receipt
+
+
+def dispose_role(role_id):
+    if any(
+        (run.get("running") or run.get("unresolved")) and run["role_id"] == role_id
+        for run in runs()
+    ):
+        raise ValueError("Stop and resolve a role's runs before disposal")
+    return {"disposed": role_id, "reclaim": dispose_account(database()["roles"].get(role_id))}
 
 
 # ---- resource sampling -----------------------------------------------------------------
@@ -2383,6 +2487,10 @@ def dispatch(request):
         return stop_run(request["run_id"])
     if operation == "remove":
         return remove_run(request["run_id"])
+    if operation == "storage":
+        return storage(request.get("role_id"))
+    if operation == "dispose":
+        return dispose_role(request["role_id"])
     if operation == "retire":
         return retire_role(request["role_id"])
     if operation == "files":
@@ -2442,7 +2550,7 @@ def main():
         if request["operation"] == "sample":
             # Read-only counters must not wait for long provisioning calls.
             result = sample()
-        elif request["operation"] in {"child-status", "child-logs"}:
+        elif request["operation"] in {"child-status", "child-logs", "storage"}:
             # Journal reads must not queue behind unrelated role operations.
             # Reboot reconciliation in child_status takes the child lock itself.
             result = dispatch(request)

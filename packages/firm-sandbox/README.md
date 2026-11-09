@@ -90,11 +90,17 @@ All operations use `--config PATH` (default `sandbox.toml`), except
 `mac-image-build`, which needs only its destination and `--recipe`.
 
 - Lifecycle: `up`, `down`, `force-down`, `replace`, `mac-replace`, `mac-restart`, `run`, `start`,
-  `stop`, `wait`, `logs`, `remove`, `retire`.
-- Inspection: `status`, `ps`, `resources`, `events`, `state`, `data-status`,
+  `stop`, `wait`, `logs`, `remove`, `retire`, `dispose`.
+  `dispose ROLE` stops a role's containers, removes them with dangling images and ordinary
+  build cache, and empties its scratch while the role has no running or unresolved run,
+  for active and retired accounts alike; tagged images, volumes and the rest of the
+  home stay. `retire` only tombstones the identity and preserves its files.
+- Inspection: `status`, `ps`, `resources`, `storage [ROLE]`, `events`, `state`, `data-status`,
   `network-status`; `network [status|on|off|hosts]` also controls egress and lists the
-  allowed hosts. Hosts are granted through the runtime's `firm network` and
-  `firm requests`, which keep the record.
+  allowed hosts. `storage [ROLE]` estimates scratch and Docker usage with `du` for every account,
+  retired ones included, under one 60-second budget and without blocking runs; see
+  `storage --help` and the [Linux VM guide](../../docs/linux-vm.md#roles-on-the-linux-vm). Hosts are granted
+  through the runtime's `firm network` and `firm requests`, which keep the record.
 - Mac image and accounts: `mac-image-build DEST --recipe R`,
   `mac-prepare APP --recipe R`, `mac-install-helper APP`, `mac-image-apply R`,
   `mac-image-seal DEST --recipe R`, `mac-status [--station N]`,
@@ -105,7 +111,8 @@ All operations use `--config PATH` (default `sandbox.toml`), except
 
 
 `run` and `start` take `ROLE COMMAND...` plus optional `--env`, `--secret`,
-`--secret-env` and `--stdin` flags before the role. `stop`, `wait`, `logs` and
+`--secret-env` and `--stdin` flags before the role. ROLE is the runtime's sandbox
+role ID, `r-` followed by the employee ID. `stop`, `wait`, `logs` and
 `remove` take a role and select its current run. `logs` returns all retained
 output; `run` follows output while the command executes. `replace` discards every
 guest disk; see [retained files](../../docs/linux-vm.md#retained-files) before using

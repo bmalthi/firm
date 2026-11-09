@@ -53,6 +53,9 @@ class SandboxDispatcher:
         # tail instead of paging it from byte 0. Its length is the next read's offset.
         self._logs: dict[str, bytearray] = {}
         self._pool = None
+        self._retired = set()
+        self._cleaned = set()
+        self._retire_not_before = {}
         self._summary_runner = None
         self._task_runner = None
         self._provision_role = None
@@ -356,18 +359,18 @@ class SandboxDispatcher:
         for aid in orphans:
             self.runtime.finish(aid, "interrupted", category="host_restart")
         self._prune_run_journals(inventory)
+        return inventory
 
     def _record_settlement(self, run, info):
         with self.runtime.store.transaction() as db:
             db.execute(
                 "INSERT INTO sandbox_run_settlements "
-                "(run_id,role_id,vm_generation,recorded_at,usage_json,reclaim_json) "
-                "VALUES(?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET "
-                "usage_json=excluded.usage_json,reclaim_json=excluded.reclaim_json "
-                "WHERE usage_json IS NOT excluded.usage_json "
-                "OR reclaim_json IS NOT excluded.reclaim_json",
+                "(run_id,role_id,vm_generation,recorded_at,usage_json) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET "
+                "usage_json=excluded.usage_json "
+                "WHERE usage_json IS NOT excluded.usage_json",
                 (run.run_id, run.role_id, run.vm_generation, self.runtime.store.clock(),
-                 json.dumps(info.get("usage")), json.dumps(info.get("reclaim"))),
+                 json.dumps(info.get("usage"))),
             )
 
     def _prune_run_journals(self, inventory):
@@ -530,6 +533,7 @@ class SandboxDispatcher:
 
     def _forget_log(self, activation_id):
         self._logs.pop(activation_id, None)
+        self._subscription_events.pop(activation_id, None)
 
     def _record_usage(self, activation_id, usage):
         """What the role's slice used, as the guest read it before stopping the slice.
@@ -817,6 +821,96 @@ class SandboxDispatcher:
             )]
         self.runtime.task_service.recover_confirmed(ids)
 
+    def _cleanup_activation(self, db, employee_id):
+        request = db.execute(
+            "SELECT activation_id,payload_json FROM requests WHERE operation='handoff' "
+            "AND activation_id=(SELECT activation_id FROM activations WHERE employee_id=? "
+            "AND state='completed' AND next_intent IS NOT NULL ORDER BY rowid DESC LIMIT 1)",
+            (employee_id,),
+        ).fetchone()
+        if (request and request["activation_id"] not in self._cleaned
+                and json.loads(request["payload_json"]).get("clean_up", False)):
+            return request["activation_id"]
+        return None
+
+    def _clean_up(self, invocation):
+        if invocation.context.get("handoff_notes") is None:
+            return False
+        with self.runtime.store.read() as db:
+            return self._cleanup_activation(db, invocation.employee_id) is not None
+
+    def _expired_cleanup_activation(self, db, employee_id):
+        activation = db.execute(
+            "SELECT a.activation_id,a.state,a.failure_category,s.stop_cause FROM activations AS a "
+            "JOIN appointments AS p USING(employee_id) "
+            "LEFT JOIN sandbox_runs AS s ON s.activation_id=a.activation_id WHERE a.employee_id=? "
+            "AND p.kind='temporary' AND p.remaining_periods=0 AND a.finished_at IS NOT NULL "
+            "ORDER BY a.finished_at DESC,a.rowid DESC LIMIT 1", (employee_id,),
+        ).fetchone()
+        if (activation and activation["activation_id"] not in self._cleaned
+                and activation["stop_cause"] is None
+                and (activation["state"] == "completed" or (
+                    activation["state"] == "failed"
+                    and activation["failure_category"] in {"unknown", "refusal"}))):
+            return activation["activation_id"]
+        return None
+
+    def _clean_idle_roles(self, inventory):
+        now = self.runtime.store.clock()
+        busy = {run.role_id for run, info in inventory.values()
+                if info.get("running") or info.get("unresolved")}
+        with self.runtime.store.read() as db:
+            roles = []
+            for row in db.execute(
+                "SELECT employee_id,employment,handoff_notes FROM roles WHERE "
+                "(employment='retired' OR handoff_notes IS NOT NULL OR "
+                "(employment='active' AND employee_id IN (SELECT employee_id FROM appointments "
+                "WHERE kind='temporary' AND remaining_periods=0))) AND employee_id NOT IN "
+                "(SELECT employee_id FROM activations WHERE state IN ('admitted','running')) "
+                "ORDER BY rowid"
+            ):
+                cleanup = (self._cleanup_activation(db, row["employee_id"])
+                           if row["handoff_notes"] is not None else None)
+                expired = cleanup is None and row["employment"] == "active"
+                if expired:
+                    cleanup = self._expired_cleanup_activation(db, row["employee_id"])
+                if row["employment"] == "retired" or cleanup is not None:
+                    roles.append((row["employee_id"], row["employment"] == "retired",
+                                  cleanup, expired))
+            busy |= {sandbox_role_id(row[0]) for row in db.execute(
+                "SELECT employee_id FROM activations WHERE activation_id IN "
+                f"({','.join('?' for _ in self._launches)})", tuple(self._launches),
+            )}
+        if not roles:
+            return
+        retired = self.sandbox.file_server.retired_roles()
+        for employee_id, retiring, cleanup, expired in roles:
+            role_id = sandbox_role_id(employee_id)
+            if (role_id in busy or now < self._retire_not_before.get(role_id, 0)
+                    or (retiring and role_id in retired | self._retired)):
+                continue
+            try:
+                if expired:
+                    with self.runtime.store.read() as db:
+                        if not db.execute(
+                            "SELECT 1 FROM roles JOIN appointments USING(employee_id) "
+                            "WHERE employee_id=? AND employment='active' "
+                            "AND kind='temporary' AND remaining_periods=0", (employee_id,),
+                        ).fetchone():
+                            continue
+                receipt = self.sandbox.dispose(role_id)
+                if retiring:
+                    self.sandbox.retire(role_id)
+                    self._retired.add(role_id)
+                else:
+                    self._cleaned.add(cleanup)
+                    LOGGER.info("Idle-role cleanup for %s (%s): %s", role_id, cleanup, receipt)
+            except Exception:
+                LOGGER.warning("Idle-role cleanup failed for %s; retrying in 15 minutes", role_id,
+                               exc_info=True)
+                self._retire_not_before[role_id] = now + 15 * 60
+            return
+
     def tick(self):
         self._require_open()
         if self.runtime.status()["state"] == "stopping":
@@ -871,7 +965,7 @@ class SandboxDispatcher:
                 self.reconcile()
             else:
                 self._save_run(aid, run)
-        self.reconcile()
+        inventory = self.reconcile()
         # After reconciliation has ended this tick's exited activations: free their
         # Mac lease before a graceful drain or the next admission.
         self.runtime.mac.refresh()
@@ -895,6 +989,7 @@ class SandboxDispatcher:
             return []
         if state["state"] != "running":
             return []
+        self._clean_idle_roles(inventory)
         if hasattr(self.providers, "preflight"):
             self._preflight()
         # Pending hire levels run as isolated turns off this thread; admission
@@ -952,6 +1047,7 @@ class SandboxDispatcher:
                 spec = replace(
                     spec,
                     organization=grants.organization,
+                    clean_up=self._clean_up(invocation),
                 )
                 for settings in (
                     self.runtime.github.launch_settings(

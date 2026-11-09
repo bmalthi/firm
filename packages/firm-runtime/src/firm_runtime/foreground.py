@@ -364,7 +364,10 @@ def serve(
         runtime, sandbox, providers, mcp_url=f"http://{endpoint}/mcp", execution_timeout=timeout
     ) as dispatcher:
         host_control = HostControl(dispatcher.stop)
-        observer = AnalysisObserver(runtime.store, sandbox)
+        observer = AnalysisObserver(
+            runtime.store, sandbox, messaging=runtime.messaging,
+            sandbox_toml=Path(sandbox_config).resolve(),
+        )
         observer.start()
         try:
             with (

@@ -110,6 +110,16 @@ class FakeLinux:
             return {"path": f"/run/firm/{payload['role_id']}/credentials/{payload['name']}"}
         return {}
 
+    def storage(self, role_id=None):
+        from firm_sandbox.guest_control import GuestControl
+
+        return GuestControl.storage(self, role_id)
+
+    def dispose(self, role_id):
+        from firm_sandbox.guest_control import GuestControl
+
+        return GuestControl.dispose(self, role_id)
+
     def rpc(self, operation, **payload):
         return self._rpc(operation, **payload)
 
@@ -884,7 +894,8 @@ def test_a_run_carries_its_roles_proxy_credential_but_never_the_key_or_the_url_i
         box.start(RunSpec("analyst", ("true",), run_id="run-b",
                           secrets={"egress-proxy": b"mine"}))
 
-def test_lost_start_reply_retries_the_same_run_identity(box):
+@pytest.mark.parametrize("clean_up", [False, True])
+def test_lost_start_reply_retries_the_same_run_identity(box, clean_up):
     from firm_sandbox.guest_control import ControlConnectionError
 
     calls = []
@@ -897,9 +908,10 @@ def test_lost_start_reply_retries_the_same_run_identity(box):
         return original(operation, **payload)
 
     box.linux._rpc = rpc
-    run = box.start(RunSpec("analyst", ("true",)))
+    run = box.start(RunSpec("analyst", ("true",), clean_up=clean_up))
     assert len(calls) == 2 and calls[0] == calls[1]
     assert calls[0][1]["run_id"] == run.run_id
+    assert calls[0][1]["clean_up"] is clean_up
 
     def lost(operation, **payload):
         raise TimeoutError("connection lost")
@@ -2031,3 +2043,26 @@ def test_child_layout_uses_disk_state_and_tmpfs_credentials(box):
     assert layout.state == "/var/lib/firm/task-homes/task-one/state"
     assert layout.credentials == "/run/firm/analyst/tasks/task-one/credentials"
     assert (layout.private_work, layout.drive) == (parent.private_work, parent.drive)
+
+
+def test_disposal_calls_guest_control_without_retiring_files(box):
+    assert box.dispose("analyst") == {}
+    assert ("dispose", {"role_id": "analyst"}) in box.linux.calls
+    assert box._file_server.calls == []
+    box.start(RunSpec("active", ("true",), run_id="run-a"))
+    with pytest.raises(ValueError, match="Stop and resolve"):
+        box.dispose("active")
+    box.linux.rows[0].update(running=False, unresolved=True)
+    with pytest.raises(ValueError, match="Stop and resolve"):
+        box.dispose("active")
+    assert not any(call == ("dispose", {"role_id": "active"}) for call in box.linux.calls)
+
+
+@pytest.mark.parametrize("role", [None, "analyst"])
+def test_storage_rpc_and_sandbox_shape_without_run_checks(box, role):
+    # Even a live run does not block read-only attribution or require inventory.
+    box.linux.rows.append({"role_id": "analyst", "run_id": "run-a", "running": True})
+    box.linux.calls.clear()
+    assert box.storage(role) == {}
+    payload = {"timeout": 90, **({"role_id": role} if role is not None else {})}
+    assert box.linux.calls == [("storage", payload)]

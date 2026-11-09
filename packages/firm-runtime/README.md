@@ -12,6 +12,12 @@ and reply to messages, decide access requests, stop or resume execution, and bro
 or download files there. See the [installation guide](../../docs/installation.md) and
 [runtime operations](../../docs/runtime.md).
 
+Ordinary pauses and handoffs keep Linux scratch and Docker state. Owners can use
+`firm-sandbox --config PATH dispose ROLE`; the runtime also disposes before retiring
+idle fired roles, when a temporary appointment's last period finishes rather than being cut short (the role stays employed and can still be renewed or promoted), or shortly after a completed `handoff` with `clean_up` (or at the role's next launch, if it is woken first).
+Low Linux disk reaches roles as a notice and the owner as Operations mail; see the
+[Linux VM guide](../../docs/linux-vm.md#roles-on-the-linux-vm).
+
 From the repository root:
 
 ```sh

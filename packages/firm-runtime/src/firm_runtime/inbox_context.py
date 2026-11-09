@@ -1,4 +1,4 @@
-"""Read-only context, appointment and Mac-disk notices for self and selected direct reports."""
+"""Read-only context, appointment, disk and housekeeping notices for employees."""
 
 import math
 
@@ -7,6 +7,7 @@ from .store import encoded
 
 # A quiet provider does not make its last measurement a fresh observation.
 STALE_AFTER_SECONDS = 5 * 60
+HOUSEKEEPING_EVERY = 20
 
 
 def overview(db, actor_id: str, now: float, *, byte_limit: int) -> dict | None:
@@ -33,7 +34,8 @@ def overview(db, actor_id: str, now: float, *, byte_limit: int) -> dict | None:
         "relevant_reports": len(relevant),
         "omitted_relevant_reports": len(relevant),
         "other_direct_reports": len(reports) - len(relevant),
-        "notices": _mac_disk_notice(db, actor_id, now),
+        "notices": (_mac_disk_notice(db, actor_id, now) + _linux_disk_notice(db, now)
+                    + _housekeeping_notice(db, actor_id)),
     }
     for _, _, row in relevant:
         result["direct_reports"].append(row)
@@ -48,7 +50,7 @@ def overview(db, actor_id: str, now: float, *, byte_limit: int) -> dict | None:
 def _mac_disk_notice(db, actor_id, now):
     """A notice while the Mac the actor holds is low on disk, from its current sample.
 
-    The first producer for the ``notices`` hook (``role_output._awareness``, rendered
+    A producer for the ``notices`` hook (``role_output._awareness``, rendered
     on inbox peek). It reads the machine's latest resource sample through the one
     disk-state calculation, not the lease's own acquire reading: acquire refuses a full
     Mac, so that figure is never low. Work in any station account can fill their
@@ -71,6 +73,37 @@ def _mac_disk_notice(db, actor_id, now):
     return [
         f"The Mac you hold is low on disk: about {state['free_bytes'] / (1024**3):.1f} GiB "
         "free. Delete what you no longer need in your scratch folder."
+    ]
+
+
+def _linux_disk_notice(db, now):
+    """Every role shares the Linux disk; stale or unknown samples say nothing."""
+    sample = db.execute(
+        "SELECT disk_used_bytes,disk_total_bytes,observed_at FROM resource_samples "
+        "WHERE machine=? ORDER BY sequence DESC LIMIT 1",
+        ("linux",),
+    ).fetchone()
+    state = disk_state(dict(sample), now) if sample is not None else None
+    if state is None or not state["low_disk"]:
+        return []
+    free = state["free_bytes"] / (1024**3)
+    return [
+        f"The Linux disk you share with your colleagues is low: about {free:.1f} GiB free. "
+        "Delete scratch files and Docker containers, images and volumes you no longer need."
+    ]
+
+
+def _housekeeping_notice(db, actor_id):
+    finished = db.execute(
+        "SELECT COUNT(*) FROM activations WHERE employee_id=? AND finished_at IS NOT NULL",
+        (actor_id,),
+    ).fetchone()[0]
+    if (finished + 1) % HOUSEKEEPING_EVERY:
+        return []
+    return [
+        "Housekeeping: see what your scratch directory and Docker hold (du -sh on scratch, "
+        "docker system df) and remove checkouts, containers, images and volumes from finished "
+        "work. Keep what current work still needs."
     ]
 
 

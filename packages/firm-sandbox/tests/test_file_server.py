@@ -543,3 +543,10 @@ def test_owner_browse_listing_stops_after_its_bound(server):
     result = server._remote({"action": "browse-list", "path": root, "limit": 17})[0]
     assert len(result["entries"]) == 17
     assert result["truncated"] is True
+
+
+def test_retired_role_view_reads_local_account_ledger_only(server):
+    assert server.retired_roles() == set()
+    server.retire_role("never-provisioned")
+    assert server.retired_roles() == {"never-provisioned"}
+    assert server.log == []

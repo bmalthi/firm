@@ -19,7 +19,7 @@ from firm_runtime.console import build_console_app
 from firm_runtime.errors import FirmError
 from firm_runtime.provider_contract import ProviderUsage
 from firm_runtime.runtime import Runtime
-from firm_runtime.store import OWNER, Store
+from firm_runtime.store import OPERATIONS, OWNER, Store
 from firm_runtime.summaries import ContextSnapshot, SummaryOutput
 
 
@@ -861,38 +861,18 @@ def test_resources_report_each_run_its_role_and_a_concurrent_peak_bound(system):
     assert rest["rows"][0]["id"] != page["rows"][0]["id"] and rest["next_cursor"] is None
 
 
-def test_resources_keep_reclaim_evidence_without_guest_journals(system):
-    runtime, now, reader = system
-    invocation = start(runtime)
-    add_run(runtime, invocation.activation_id)
-    unknown = read(reader, "resources", row_type="run")["rows"][0]
-    assert unknown["reclaim"] is None
-    reclaim = {"categories": {
-        "scratch": {"count": 8, "bytes": 1024, "skipped": {}, "completed": True},
-        "docker_image_deletion_records": {"count": None, "bytes": None, "skipped": {"deadline": 1},
-                          "timed_out": True},
-    }}
-    with runtime.store.transaction() as db:
-        db.execute("INSERT INTO sandbox_run_settlements VALUES(?,?,?, ?,NULL,?)",
-                   ("run-" + invocation.activation_id, "r-" + invocation.activation_id,
-                    "generation", now[0], json.dumps(reclaim)))
-    data = read(reader, "resources", row_type="run")
-    assert data["rows"][0]["reclaim"] == reclaim
-    assert data["role_labels"]["founder"]["address"] == "founder"
-    assert any("reclaim" in limit for limit in data["coverage"]["limits"])
-
-
 def test_resources_include_isolated_settlements_without_inventing_an_employee(system):
     runtime, now, reader = system
+    usage = {"cpu_usec": 50}
     with runtime.store.transaction() as db:
         db.execute("INSERT INTO summary_runs(run_id,started_at,finished_at,state,input_bytes) "
                    "VALUES('summary-one',990,999,'summarized',10)")
-        db.execute("INSERT INTO sandbox_run_settlements VALUES(?,?,?, ?,?,?)",
-                   ("summary-one", "s-summary-one", "generation", now[0],
-                    '{"cpu_usec": 50}', '{"categories": {}}'))
+        db.execute("INSERT INTO sandbox_run_settlements "
+                   "(run_id,role_id,vm_generation,recorded_at,usage_json) VALUES(?,?,?,?,?)",
+                   ("summary-one", "s-summary-one", "generation", now[0], json.dumps(usage)))
     data = read(reader, "resources", row_type="summary_run")
-    assert data["rows"][0]["usage"] == {"cpu_usec": 50}
-    assert data["rows"][0]["reclaim"] == {"categories": {}}
+    assert data["rows"][0]["usage"] == usage
+    assert "reclaim" not in data["rows"][0]
     assert data["role_labels"] == {}
     assert not read(reader, "resources", row_type="summary_run", employee_id="founder")["rows"]
 
@@ -1628,3 +1608,134 @@ def test_new_evidence_never_carries_bodies_notes_or_tool_arguments(system):
     assert set(timeline["tool_calls"]) == {"Bash", "mcp__firm__send"}
     # The owner's own send carries no work period, so only the role's operations are here.
     assert timeline["operations"] == {"handoff": 1, "hire": 1}
+
+
+
+def disk_mails(runtime):
+    with runtime.store.read() as db:
+        return [dict(row) for row in db.execute(
+            "SELECT * FROM messages WHERE subject LIKE 'Linux disk %' ORDER BY sequence")]
+
+
+def record_linux_disk(runtime, now, used, *, config=None):
+    with runtime.store.transaction() as db:
+        analysis_history.record_resources(
+            db, now, "linux",
+            {"disk_used_bytes": used * 1024**3 if used is not None else None,
+             "disk_total_bytes": 100 * 1024**3},
+            notice=runtime.messaging.notice, sandbox_toml=config,
+        )
+
+
+def test_linux_owner_disk_mail_hysteresis_and_reentry(system):
+    runtime, now, _ = system
+    for used, subjects in [
+        (84, []), (85, ["low"]), (90, ["low"]), (83, ["low"]), (80, ["low"]),
+        (84, ["low"]), (85, ["low"]), (79, ["low", "recovered"]),
+        (81, ["low", "recovered"]), (85, ["low", "recovered", "low"]),
+    ]:
+        record_linux_disk(runtime, now[0], used, config="/firm/sandbox.toml")
+        assert [m["subject"] for m in disk_mails(runtime)] == [
+            "Linux disk " + subject for subject in subjects]
+        now[0] += 600
+    low, recovery, _ = disk_mails(runtime)
+    assert [r["employee_id"] for r in json.loads(low["recipients_json"])] == ["owner"]
+    assert low["author_id"] == OPERATIONS
+    assert low["body"] == (
+        "The firm's Linux disk is 85% used (15.0 GiB free). Roles have been told and asked "
+        "to delete what they no longer need; give them a work period or two before acting "
+        "yourself. To see each role's usage with its sandbox role ID (r- followed by the "
+        "employee ID), run `firm-sandbox --config /firm/sandbox.toml storage`. To empty a "
+        "role's scratch and remove its containers, dangling images and build cache, "
+        "run `firm-sandbox --config /firm/sandbox.toml dispose ROLE` with that ID while the "
+        "role is not in a work period; the role is not told, so anything it kept in scratch "
+        "is gone."
+    )
+    assert recovery["body"] == (
+        "The firm's Linux disk is back to 79% used (21.0 GiB free). No action is needed.")
+
+
+def test_linux_owner_disk_mail_ignores_unknown_and_other_machines(system):
+    runtime, now, _ = system
+    record_linux_disk(runtime, now[0], None)
+    with runtime.store.transaction() as db:
+        analysis_history.record_resources(
+            db, now[0], "mac", {"disk_used_bytes": 95, "disk_total_bytes": 100},
+            notice=runtime.messaging.notice)
+    assert disk_mails(runtime) == []
+    record_linux_disk(runtime, now[0], 90)
+    assert disk_mails(runtime)[0]["body"].endswith(" PATH is the firm's sandbox.toml.")
+    record_linux_disk(runtime, now[0], None)
+    assert len(disk_mails(runtime)) == 1
+    # Persisted alert state survives a gap in sampling.
+    now[0] += 181
+    record_linux_disk(runtime, now[0], 90)
+    assert [m["subject"] for m in disk_mails(runtime)] == ["Linux disk low"]
+
+
+def test_linux_owner_disk_notice_and_sample_commit_together(system):
+    runtime, now, _ = system
+    with pytest.raises(RuntimeError, match="rollback"):
+        with runtime.store.transaction() as db:
+            analysis_history.record_resources(
+                db, now[0], "linux", {"disk_used_bytes": 90, "disk_total_bytes": 100},
+                notice=runtime.messaging.notice)
+            assert db.execute("SELECT COUNT(*) FROM resource_samples").fetchone()[0] == 1
+            assert db.execute(
+                "SELECT COUNT(*) FROM messages WHERE subject='Linux disk low'"
+            ).fetchone()[0] == 1
+            raise RuntimeError("rollback")
+    assert disk_mails(runtime) == []
+    with runtime.store.read() as db:
+        assert db.execute("SELECT COUNT(*) FROM resource_samples").fetchone()[0] == 0
+    record_linux_disk(runtime, now[0], 90)
+    assert len(disk_mails(runtime)) == 1
+
+
+
+def test_observer_disk_mail_uses_config_and_survives_observer_restart(system):
+    runtime, now, _ = system
+    sample = {"linux": {"disk_used_bytes": 90 * 1024**3, "disk_total_bytes": 100 * 1024**3}}
+    machines = FakeMachines(sample)
+    # Even with admissions stopped, a running VM supplies resource samples.
+    assert runtime.status()["state"] == "stopped"
+    for _ in range(2):
+        observer = analysis_history.AnalysisObserver(
+            runtime.store, machines, messaging=runtime.messaging,
+            sandbox_toml="/firm/sandbox.toml")
+        observer.resources()
+        now[0] += 60
+    assert len(disk_mails(runtime)) == 1
+    assert "--config /firm/sandbox.toml storage" in disk_mails(runtime)[0]["body"]
+    machines.samples = STOPPED
+    observer.resources()
+    assert len(recorded_samples(runtime)) == 2
+
+
+
+def test_disk_alert_survives_hours_in_band_and_restart_then_recovers_and_reenters(system):
+    runtime, now, _ = system
+    record_linux_disk(runtime, now[0], 86, config="/firm path/sandbox.toml")
+    assert "--config '/firm path/sandbox.toml' storage" in disk_mails(runtime)[0]["body"]
+    for index in range(180):
+        now[0] += 60
+        record_linux_disk(runtime, now[0], 80 + index % 5)
+    assert [m["subject"] for m in disk_mails(runtime)] == ["Linux disk low"]
+    now[0] += 86400
+    sample = {"linux": {"disk_used_bytes": 90 * 1024**3, "disk_total_bytes": 100 * 1024**3}}
+    analysis_history.AnalysisObserver(
+        runtime.store, FakeMachines(sample), messaging=runtime.messaging).resources()
+    assert len(disk_mails(runtime)) == 1
+    now[0] += 600
+    record_linux_disk(runtime, now[0], 79.6)
+    assert disk_mails(runtime)[-1]["body"] == (
+        "The firm's Linux disk is back to 79% used (20.4 GiB free). No action is needed.")
+    now[0] += 600
+    record_linux_disk(runtime, now[0], 90)
+    record_linux_disk(runtime, now[0], None)
+    assert [m["subject"] for m in disk_mails(runtime)] == [
+        "Linux disk low", "Linux disk recovered", "Linux disk low"]
+    with runtime.store.read() as db:
+        assert analysis_history._linux_disk_alerted(db)
+        index = db.execute("PRAGMA index_info(resource_samples_by_machine)").fetchall()
+        assert [column["name"] for column in index] == ["machine", "observed_at"]

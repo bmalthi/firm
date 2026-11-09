@@ -48,14 +48,23 @@ class FakeSandbox:
         self.start_created = threading.Event()
         self.release_start = threading.Event()
         self.stops = []
+        self.disposals = []
+        self.retirements = []
         self.force_downs = 0
         self.usage = None
-        self.reclaim = None
         self.ended = {}
         self.status_calls = 0
         self.inventory_calls = 0
         self.log_calls = []
         self.allowed_hosts = []
+
+    def dispose(self, role_id):
+        self.disposals.append(role_id)
+        return {"disposed": role_id, "reclaim": {"categories": {}}}
+
+    def retire(self, role_id):
+        self.retirements.append(role_id)
+        self.file_server.retire_role(role_id)
 
     def set_allowed_hosts(self, hosts):
         self.allowed_hosts = list(hosts)
@@ -118,7 +127,6 @@ class FakeSandbox:
             "exit_code": state[3],
             "usage": self.usage,
             "log_bytes": len(state[2]),
-            "reclaim": self.reclaim,
             "ended": self.ended.get(state[0].run_id, time.time()),
         }
 

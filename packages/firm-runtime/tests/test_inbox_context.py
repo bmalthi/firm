@@ -248,3 +248,74 @@ def test_unicode_identity_keeps_self_and_reports_within_context_budget(tmp_path)
     assert result["self"]["address_truncated"] is True
     assert result["omitted_relevant_reports"] > 0
     assert len(encoded(result).encode()) <= 10 * 1024 // 3
+
+
+def test_linux_disk_notice_reaches_every_role_and_ignores_stale_unknown_samples(tmp_path):
+    from firm_runtime import analysis_history
+
+    runtime = make_runtime(tmp_path)
+    founder = start(runtime)
+    runtime.tools(founder.token).hire("analyst", "Own work", "hire")
+    other = start(runtime)
+    for free, total, age, expected in (
+        (None, None, 0, []),
+        (16 * GIB, 100 * GIB, 0, []),
+        (15 * GIB, 100 * GIB, 0, [
+            "The Linux disk you share with your colleagues is low: about 15.0 GiB free. "
+            "Delete scratch files and Docker containers, images and volumes you no longer need."
+        ]),
+        (1 * GIB, 100 * GIB, 3600, []),
+        (None, 100 * GIB, 0, []),
+    ):
+        with runtime.store.transaction() as db:
+            analysis_history.record_resources(db, runtime.store.clock() - age, "linux", {
+                "disk_used_bytes": total - free if free is not None else None,
+                "disk_total_bytes": total,
+            })
+        for actor in (founder, other):
+            assert runtime.messaging.peek(actor.employee_id)["context"]["notices"] == expected
+
+
+
+def test_housekeeping_counts_finished_periods_for_only_this_employee(tmp_path):
+    from firm_runtime.inbox_context import HOUSEKEEPING_EVERY
+
+    runtime = make_runtime(tmp_path)
+    actor = start(runtime)
+    expected = (
+        "Housekeeping: see what your scratch directory and Docker hold (du -sh on scratch, "
+        "docker system df) and remove checkouts, containers, images and volumes from finished "
+        "work. Keep what current work still needs."
+    )
+    for finished in range(2 * HOUSEKEEPING_EVERY + 1):
+        notices = runtime.messaging.peek(actor.employee_id)["context"]["notices"]
+        assert notices == ([expected] if (finished + 1) % HOUSEKEEPING_EVERY == 0 else [])
+        with runtime.store.transaction() as db:
+            db.execute(
+                "INSERT INTO activations(activation_id,employee_id,session_id,state,"
+                "wake_snapshot,context_json,created_at,finished_at) VALUES(?,?,?,?,'{}','{}',0,1)",
+                (f"old-{finished}", actor.employee_id, actor.session_id,
+                 ("completed", "failed", "interrupted")[finished % 3]),
+            )
+    assert "context" not in runtime.messaging.peek(OWNER)
+
+
+
+def test_housekeeping_does_not_count_other_roles_or_unfinished_activations(tmp_path):
+    from firm_runtime.inbox_context import HOUSEKEEPING_EVERY
+
+    runtime = make_runtime(tmp_path)
+    actor = start(runtime)
+    child = runtime.tools(actor.token).hire("analyst", "Work", "hire")
+    with runtime.store.transaction() as db:
+        for index in range(HOUSEKEEPING_EVERY - 1):
+            for employee, finished in [(actor.employee_id, None), (child["employee_id"], 1)]:
+                db.execute(
+                    "INSERT INTO activations(activation_id,employee_id,session_id,state,"
+                    "wake_snapshot,context_json,created_at,finished_at) "
+                    "VALUES(?,?,?,'interrupted','{}','{}',0,?)",
+                    (f"old-{employee}-{index}", employee, actor.session_id, finished),
+                )
+    assert runtime.messaging.peek(actor.employee_id)["context"]["notices"] == []
+    assert runtime.messaging.peek(child["employee_id"])["context"]["notices"][0].startswith(
+        "Housekeeping:")

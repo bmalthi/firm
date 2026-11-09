@@ -119,6 +119,17 @@ def main() -> None:
     sub.add_parser(
         "retire", help="revoke a stopped role's access; its data is retained"
     ).add_argument("role")
+    sub.add_parser(
+        "dispose", help="empty a stopped role's scratch and remove its stopped containers, "
+        "dangling images and build cache (tagged images and volumes stay)"
+    ).add_argument("role")
+    sub.add_parser(
+        "storage", help="measure scratch and Docker usage per role, read-only: "
+        "du estimates share a 60s request budget",
+        description="Read-only du estimates. Both forms share 60s across sorted roles "
+        "and categories. "
+        "Rerun roles with unknown measurements individually.",
+    ).add_argument("role", nargs="?")
     for name in ("run", "start"):
         cmd = sub.add_parser(
             name,
@@ -299,6 +310,10 @@ def main() -> None:
         elif args.action == "mac-image-apply":
             with _terminate_interrupts():
                 result = mac_image.apply_recipe(sandbox.mac, mac_image.Recipe.load(args.recipe))
+        elif args.action == "storage":
+            result = sandbox.storage(args.role)
+        elif args.action == "dispose":
+            result = sandbox.dispose(args.role)
         elif args.action == "retire":
             sandbox.retire(args.role)
         elif args.action == "status":

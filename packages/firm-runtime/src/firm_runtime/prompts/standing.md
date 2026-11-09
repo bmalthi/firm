@@ -90,14 +90,16 @@ without sudo. You have git, build tools, curl, Python through uv (use a
 project-local environment), Node and npm, and your own rootless Docker with
 Compose; use containers for system packages and services. Install other tools into
 your home, which is private to you and persists. Check out and build in your Linux
-`scratch` directory, named above: it is local disk, and is emptied at the end of
-each work period. Save work you need again on the firm drive before finishing.
-Everything you start also ends with your work period: background jobs, servers and
+`scratch` directory, named above: it is private local disk and keeps its contents
+between work periods. Keep deliverables and anything colleagues need on the firm drive.
+Everything you start ends with your work period: background jobs, servers and
 watchers are stopped when it finishes, and nothing reports back or wakes you afterwards.
 Wait for a result you need before you finish; do not end a work period promising to
 act when a job completes.
-Your installed tools, language download caches, tagged Docker images and volumes
-stay; stopped containers, dangling images and Docker build cache are reclaimed.
+Nothing on disk is reclaimed for you: stopped containers, Docker images, volumes and
+build cache stay until you remove them. The Linux disk is shared with your colleagues,
+so when a piece of work is done, remove the checkouts, containers and images it no
+longer needs.
 The network reaches only hosts the firm allows, and the owner may cut it off. Software here
 is often newer than you remember it: a tool or app that is not where you expect has
 usually moved, not gone, and the vendor's current documentation says where.

@@ -850,3 +850,53 @@ def test_mail_notice_orders_owner_operations_manager_then_oldest(system):
         f"1 from founder/early ({peers[0]}), 1 from founder/late ({peers[1]})."
     )
     assert pending(runtime, child) == before
+
+
+
+def test_handoff_cleanup_intent_replays_only_the_applied_request(system):
+    runtime, _, _ = system
+    runtime.start()
+    actor = run(runtime)
+    tools = runtime.tools(actor.token)
+    saved = tools.handoff("Done", "continue", "first", clean_up=True)
+    assert tools.handoff("Done", "continue", "first", clean_up=True) == saved
+    with pytest.raises(FirmError, match="request_id"):
+        tools.handoff("Done", "continue", "first", clean_up=False)
+    with pytest.raises(FirmError, match="already has a handoff"):
+        tools.handoff("Other", "wait", "second", clean_up=False)
+    with runtime.store.read() as db:
+        rows = db.execute("SELECT * FROM requests WHERE operation='handoff'").fetchall()
+        assert len(rows) == 1 and rows[0]["activation_id"] == actor.activation_id
+        assert json.loads(rows[0]["payload_json"]) == {
+            "notes": "Done", "next": "continue", "clean_up": True}
+        activation = runtime._activation(db, actor.activation_id)
+        assert activation["handoff_notes"] == "Done" and activation["next_intent"] == "continue"
+    # Non-sandbox completion ignores the flag and performs normal handoff.
+    runtime.finish(actor.activation_id)
+    assert run(runtime).context["handoff_notes"] == "Done"
+
+
+@pytest.mark.parametrize("value", [None, 1, "true", []])
+def test_handoff_cleanup_requires_a_boolean(system, value):
+    runtime, _, _ = system
+    runtime.start()
+    actor = run(runtime)
+    with pytest.raises(FirmError, match="clean_up must be a boolean"):
+        runtime.tools(actor.token).handoff("Done", "wait", "bad", clean_up=value)
+
+
+
+def test_handoff_default_cleanup_is_saved_and_cannot_be_replaced(system):
+    runtime, _, _ = system
+    runtime.start()
+    actor = run(runtime)
+    tools = runtime.tools(actor.token)
+    saved = tools.handoff("Keep work", "wait", "first")
+    assert tools.handoff("Keep work", "wait", "first", clean_up=False) == saved
+    with pytest.raises(FirmError, match="already has a handoff"):
+        tools.handoff("Delete work", "wait", "second", clean_up=True)
+    with runtime.store.read() as db:
+        request = db.execute(
+            "SELECT payload_json FROM requests WHERE operation='handoff'"
+        ).fetchone()
+        assert json.loads(request[0])["clean_up"] is False

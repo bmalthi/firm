@@ -29,5 +29,10 @@
   "access_denied": "The owner declined your request for ${resource}. Reason: ${reason}\n\nDo not ask for it again; work without it or tell your manager what you could not do.",
   "access_denied_subject": "Access declined: ${resource}",
   "access_requested_title": "${address} asks for access",
-  "owner_mail_title": "Mail from ${address}"
+  "owner_mail_title": "Mail from ${address}",
+  "sandbox_config_path_suffix": " PATH is the firm's sandbox.toml.",
+  "linux_disk_low_subject": "Linux disk low",
+  "linux_disk_low_body": "The firm's Linux disk is ${used_percent}% used (${free} GiB free). Roles have been told and asked to delete what they no longer need; give them a work period or two before acting yourself. To see each role's usage with its sandbox role ID (r- followed by the employee ID), run `firm-sandbox --config ${config} storage`. To empty a role's scratch and remove its containers, dangling images and build cache, run `firm-sandbox --config ${config} dispose ROLE` with that ID while the role is not in a work period; the role is not told, so anything it kept in scratch is gone.",
+  "linux_disk_recovered_subject": "Linux disk recovered",
+  "linux_disk_recovered_body": "The firm's Linux disk is back to ${used_percent}% used (${free} GiB free). No action is needed."
 }
