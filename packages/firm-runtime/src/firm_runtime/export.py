@@ -73,6 +73,7 @@ def write(directory: Path, firm_id: str, *, destination=None, homes=False, boot=
             "compatibility_generation": release_record["compatibility_generation"],
             "exported_at": datetime.now(UTC).isoformat(),
             "homes": homes,
+            "drive_missing": not os.path.lexists(staging / "drive"),
             "refused": refused,
             "files": sum(section["files"] for section in totals.values()),
             "bytes": sum(section["bytes"] for section in totals.values()),
@@ -105,6 +106,8 @@ def verify(directory: Path, *, expected_firm_id: str | None = None) -> dict:
             or not all(isinstance(path, str) for path in recorded)
             or not isinstance(manifest["firm_id"], str)
             or type(manifest["homes"]) is not bool
+            # Exports from before this field always held the drive.
+            or type(manifest.setdefault("drive_missing", False)) is not bool
             or not isinstance(manifest.get("created_with_release"), str)
             or type(manifest.get("compatibility_generation")) is not int
             or manifest["compatibility_generation"] <= 0
@@ -113,6 +116,8 @@ def verify(directory: Path, *, expected_firm_id: str | None = None) -> dict:
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise FirmError(f"{directory} has no readable export manifest") from exc
     actual = _entries(directory)
+    if manifest["drive_missing"] != (not os.path.lexists(directory / "drive")):
+        raise FirmError("export drive presence does not match its manifest")
     for path in sorted(set(recorded) | set(actual)):
         if recorded.get(path) != actual.get(path):
             raise FirmError(f"export does not match its manifest at {path}")

@@ -232,7 +232,7 @@ class Sandbox:
                 self._force_stopped.clear()
             try:
                 self._check_admission()
-                result = self.linux.up()
+                result = self.linux.up(checkpoint=self._check_admission)
                 self._check_admission()
                 if self.mac is not None:
                     self.mac.up(checkpoint=self._check_admission)
@@ -881,6 +881,7 @@ class Sandbox:
             argv=list(argv), seconds_remaining=seconds_remaining, env=env,
             secrets={key: base64.b64encode(value).decode() for key, value in secrets.items()},
             secret_env=secret_env, stdin=base64.b64encode(stdin).decode(),
+            host_time=time.time(),
         )
 
     @lifecycle()
@@ -1067,6 +1068,10 @@ class Sandbox:
                 raise RuntimeError("The Linux VM is stopped, and this export may not boot it")
             return self.linux.export(destination, root=TREE, homes=homes)
         with lifecycle_locked(self.firm_locks, exclusive=True):
+            # An unfinished first boot has no role data to export.
+            if self.linux._state().get("ready") is not True:
+                (destination / "drive").mkdir(parents=True, exist_ok=True)
+                return []
             started = not self.linux._running()
             if started:
                 self.linux.up()
@@ -1191,13 +1196,15 @@ class Sandbox:
             secrets={key: base64.b64encode(value).decode() for key, value in secrets.items()},
             secret_env=secret_env,
         )
+        # The guest steps its clock to the host's before each launch; the time is read
+        # at each send, so a retry never carries a stale one.
         try:
-            self.linux._rpc("start", **payload)
+            self.linux._rpc("start", **payload, host_time=time.time())
         except (TimeoutError, OSError, ControlConnectionError):
             # A lost reply is not a failed launch. The guest reconciles the same
             # immutable request by run ID, without executing it twice.
             try:
-                self.linux._rpc("start", **payload)
+                self.linux._rpc("start", **payload, host_time=time.time())
             except Exception as exc:
                 raise ControlConnectionError(
                     f"Launch outcome unknown for {run_id}; recover with ps/stop or down"

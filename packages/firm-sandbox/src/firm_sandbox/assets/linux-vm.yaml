@@ -1,22 +1,15 @@
-# The firm's Linux VM: every role's home and rootless Docker daemon, and the file server.
-# CPUs, memory and disk are set at creation from [firm] in sandbox.toml.
+# The firm's Linux VM, cloned from the local base image at creation.
+# CPUs, memory, disk and the image path are set by linux_vm.py.
 vmType: vz
 os: Linux
 arch: aarch64
-cpus: 8
-memory: 24GiB
-images:
-  - location: https://cloud-images.ubuntu.com/releases/resolute/release-20260720/ubuntu-26.04-server-cloudimg-arm64.img
-    arch: aarch64
-    digest: sha256:7bcf159e29ad0000bfed9c57875908c39268f5ed1257f4958fa6a9f5f60edd54
 mounts: []
 mountInotify: false
 networks:
   - lima: user-v2
 hostResolver:
   enabled: false
-# The guest resolves nothing: the egress proxy resolves names on the host. A resolver
-# with no listener refuses at once, so a tool that resolves before proxying fails fast.
+# The host's egress proxy resolves names; guest DNS refuses immediately.
 dns: [127.0.0.1]
 propagateProxyEnv: false
 ssh:
@@ -34,120 +27,25 @@ provision:
     script: |
       #!/bin/bash
       set -euo pipefail
-      # The only way out is the host's egress proxy; the sandbox passes its address and
-      # this provisioning's credentials when it creates the VM. Set before tracing starts.
-      if [ -n "${PARAM_FIRM_PROXY:-}" ]; then
-        export http_proxy="$PARAM_FIRM_PROXY" https_proxy="$PARAM_FIRM_PROXY"
-        export HTTP_PROXY="$PARAM_FIRM_PROXY" HTTPS_PROXY="$PARAM_FIRM_PROXY"
-        export no_proxy=localhost,127.0.0.1,::1 NO_PROXY=localhost,127.0.0.1,::1
-      fi
-      # The host waits for this per-boot marker before treating a new VM as ready.
-      # /run is a tmpfs, so a prior boot cannot satisfy the current provisioning check.
       rm -f /run/firm-provisioned /run/firm-provisioned.new
-      set -x
-      export DEBIAN_FRONTEND=noninteractive
-      # No DNS leaves the guest: a resolver that refuses at once beats one that times out.
       if [ -L /etc/resolv.conf ] || ! grep -qx 'nameserver 127.0.0.1' /etc/resolv.conf; then
         rm -f /etc/resolv.conf
         printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1\n' > /etc/resolv.conf
       fi
-      # Pinned tool versions; change them deliberately.
-      NODE_VERSION=24.21.0
-      CLAUDE_CODE_VERSION=2.1.281
-      CODEX_VERSION=0.165.0
-      AGY_VERSION=1.5.3
-      AGY_URL=https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.3-6604829099950080/linux-arm/cli_linux_arm64.tar.gz
-      # Vendor SHA-512 from the linux_arm64 (glibc) manifest, resolved at release time:
-      # https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_arm64.json
-      AGY_SHA512=c2fac818b3c1bb224079df03a714ccba99728b6a3a41d86d247ab2feb8582a43840c5032f1c2b75e72667623d5503e7ffda2712c4f37b6ee19f99c3fcfb25bae
-      export AGY_CLI_DISABLE_AUTO_UPDATE=true
-      # This script runs on every boot. Each step is skipped once its result is
-      # already on the disk, so a restart needs no apt or npm registry: a stall
-      # there otherwise outlives the VM's readiness window and the start fails.
-      PACKAGES="cifs-utils acl samba samba-vfs-modules uidmap dbus-user-session
-        curl xz-utils git gh build-essential"
-      if ! dpkg -s $PACKAGES >/dev/null 2>&1; then
-        apt-get -o Acquire::Retries=3 update
-        apt-get -o Acquire::Retries=3 install -y $PACKAGES
-      fi
-      if ! command -v docker >/dev/null; then
-        curl -fsSL https://get.docker.com | sh
-      fi
-      # Every role runs its own rootless daemon under its slice; there is no shared
-      # daemon, and the privileged system units stay off.
-      systemctl unmask docker.service docker.socket containerd.service || true
-      systemctl disable --now docker.service docker.socket containerd.service || true
-      printf 'ip_tables\niptable_nat\nnf_tables\n' > /etc/modules-load.d/firm.conf
       modprobe -a ip_tables iptable_nat nf_tables
-      # The file server; the guest controller writes its configuration on every start.
-      systemctl disable --now nmbd || true
-      if [ ! -x /usr/local/bin/uv ]; then
-        curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin \
-          UV_NO_MODIFY_PATH=1 sh
+      install -d -o root -g root -m 0755 /var/lib/samba /var/cache/samba /var/log/samba
+      install -d -o root -g root -m 0700 /var/lib/samba/private
+      if [ ! -f /var/lib/samba/private/secrets.tdb ]; then
+        net getlocalsid
       fi
-      if [ ! -x /usr/local/bin/node ]; then
-        curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-arm64.tar.xz" \
-          | tar -xJ -C /usr/local --strip-components=1 --no-same-owner
+      if [ ! -s /etc/ssl/private/ssl-cert-snakeoil.key ] \
+        || [ ! -s /etc/ssl/certs/ssl-cert-snakeoil.pem ]; then
+        make-ssl-cert generate-default-snakeoil --force-overwrite
       fi
-      installed() {
-        /usr/local/bin/node -p \
-          "try{require('/usr/local/lib/node_modules/$1/package.json').version}catch(e){''}" \
-          2>/dev/null || true
-      }
-      if [ "$(installed @anthropic-ai/claude-code)" != "${CLAUDE_CODE_VERSION}" ] \
-        || [ "$(installed @openai/codex)" != "${CODEX_VERSION}" ]; then
-        npm install -g --prefix /usr/local \
-          "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@openai/codex@${CODEX_VERSION}"
-      fi
-      # Like npm's package metadata above, inspect installation metadata without
-      # starting the provider. Publish it only after the verified install succeeds.
-      if [ ! -x /usr/local/lib/agy/agy ] \
-        || [ "$(cat /usr/local/lib/agy/version 2>/dev/null || true)" != "${AGY_VERSION}" ]; then
-        agy_stage=$(mktemp -d)
-        trap 'rm -rf "$agy_stage"' EXIT
-        curl -fsSL "$AGY_URL" -o "$agy_stage/agy.tar.gz"
-        printf '%s  %s\n' "$AGY_SHA512" "$agy_stage/agy.tar.gz" | sha512sum --check --status
-        tar -xzf "$agy_stage/agy.tar.gz" -C "$agy_stage" --no-same-owner antigravity
-        install -d -o root -g root -m 0755 /usr/local/lib/agy
-        rm -f /usr/local/lib/agy/version
-        install -o root -g root -m 0755 "$agy_stage/antigravity" /usr/local/lib/agy/agy
-        printf '%s\n' "$AGY_VERSION" > "$agy_stage/version"
-        install -o root -g root -m 0644 "$agy_stage/version" /usr/local/lib/agy/version
-        rm -rf "$agy_stage"
-        trap - EXIT
-      fi
-      # Enforce the vendor's opt-out for every invocation, including role shells.
-      cat > /usr/local/bin/agy <<'AGY'
-      #!/bin/sh
-      export AGY_CLI_DISABLE_AUTO_UPDATE=true
-      exec /usr/local/lib/agy/agy "$@"
-      AGY
-      chmod 0755 /usr/local/bin/agy
-      # GitHub credentials come from the runtime during a role's run (github-credential in
-      # the run's credentials directory); outside a run git and gh behave as installed.
-      cat > /etc/gitconfig <<'GITCONFIG'
-      [credential "https://github.com"]
-        helper = "!f() { test -r \"$FIRM_CREDENTIALS_DIR/github-credential\" && exec /usr/bin/python3 \"$FIRM_CREDENTIALS_DIR/github-credential\" git \"$@\"; }; f"
-        useHttpPath = true
-      GITCONFIG
-      cat > /usr/local/bin/gh <<'GH'
-      #!/bin/sh
-      if [ -r "$FIRM_CREDENTIALS_DIR/github-credential" ]; then
-        exec /usr/bin/python3 "$FIRM_CREDENTIALS_DIR/github-credential" gh "$@"
-      fi
-      exec /usr/bin/gh "$@"
-      GH
-      chmod 0755 /usr/local/bin/gh
-      chown -R root:root /usr/local/lib/node_modules /usr/local/bin
-      # A successful Lima/cloud-init invocation is not sufficient evidence that the
-      # provision script reached every dependency. set -e/pipefail above keeps this
-      # marker absent when any required setup step fails.
       for command in mount.cifs setfacl smbpasswd smbd newuidmap newgidmap dbus-run-session \
         docker uv node npm claude codex agy gh git curl xz gcc g++ make modprobe; do
         command -v "$command" >/dev/null
       done
-      dpkg -s $PACKAGES >/dev/null
       test -x /usr/local/lib/agy/agy
-      test "$(cat /usr/local/lib/agy/version)" = "$AGY_VERSION"
       printf 'firm-linux-provisioned-v1\n' > /run/firm-provisioned.new
       mv /run/firm-provisioned.new /run/firm-provisioned

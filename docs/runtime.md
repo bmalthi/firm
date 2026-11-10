@@ -64,9 +64,16 @@ cpus = 8
 memory_gib = 16
 
 [network]
-egress = "enforce"
+egress = "observe"
 allow_hosts = []
 ```
+
+Network egress defaults to `"observe"`: all public HTTP/HTTPS hosts are allowed,
+private/loopback/LAN ranges stay blocked, and per-role traffic is logged. The stricter
+opt-in `"enforce"` limits hosts to the baseline, `allow_hosts` and owner grants.
+Observe is the default because the baseline already includes GitHub, PyPI, npm and
+Docker Hub, which can receive data, so hostname allowlisting offers little protection
+while blocking legitimate sites. See [network access](linux-vm.md#network-access-and-cutoff).
 
 Each profile names its provider, model, effort and allowed accounts. Optional
 `alternates = ["another_profile"]` join selection for fresh conversations, which go to the
@@ -175,7 +182,7 @@ class entries are ordered low, medium, high. Quota and context depend on provide
 | [Web search](installation.md#4-default-firewall-web-search-and-network-egress) | Provider-side `web_search` | Provider-side `WebSearch` | Provider-side `search_web` for roles/tasks |
 | [Page fetch](linux-vm.md#network-access-and-cutoff) | Shell `curl` through firewall | `WebFetch` through firewall | Shell `curl` through firewall; native page fetch denied |
 | [Quota](#accounts-quota-and-recovery) / [context](#context-pressure) | Quota polling/stream; context from rollout | Quota stream (OAuth JSON also polling); context from stream | Unavailable |
-| [Provider network hosts](linux-vm.md#network-access-and-cutoff) | `*.openai.com`, `chatgpt.com`, `*.chatgpt.com` | `*.anthropic.com`, `*.claude.com` | `www.googleapis.com`, `daily-cloudcode-pa.googleapis.com`; `storage.googleapis.com` for setup only |
+| [Provider network hosts](linux-vm.md#network-access-and-cutoff) | `*.openai.com`, `chatgpt.com`, `*.chatgpt.com` | `*.anthropic.com`, `*.claude.com` | `www.googleapis.com`, `daily-cloudcode-pa.googleapis.com` |
 | Status | Supported | Supported | Experimental subscription provider |
 
 ### Claude

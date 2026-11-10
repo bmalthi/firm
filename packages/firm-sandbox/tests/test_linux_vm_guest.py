@@ -1391,7 +1391,78 @@ def test_dispatch_rejects_unknown_operations(sim):
         guest.dispatch({})
 
 
+# ---- clock -----------------------------------------------------------------------------
+
+
+def test_launch_steps_a_lagging_guest_clock_to_the_host_time(monkeypatch):
+    stepped = []
+    monkeypatch.setattr(guest.time, "time", lambda: 1_000.0)
+    monkeypatch.setattr(guest.time, "clock_settime", lambda clock, value: stepped.append(
+        (clock, value)))
+    request = {"operation": "start", "host_time": 1_000.0 + 3_600}
+    guest.step_clock(request)
+    assert stepped == [(guest.time.CLOCK_REALTIME, 4_600.0)]
+    assert "host_time" not in request  # never part of the launch fingerprint
+    stepped.clear()
+    guest.step_clock({"host_time": 1_000.0 + guest.CLOCK_TOLERANCE})
+    guest.step_clock({})
+    assert stepped == []
+    for invalid in ("1000", float("nan"), -1, True):
+        with pytest.raises(ValueError, match="Invalid host time"):
+            guest.step_clock({"host_time": invalid})
+
+
+@pytest.mark.parametrize("operation", ["start", "start-child"])
+def test_a_launch_steps_the_clock_before_it_waits_for_the_global_lock(
+    monkeypatch, capsys, operation
+):
+    order = []
+
+    @contextlib.contextmanager
+    def lock():
+        order.append("lock")
+        yield
+
+    def step(request):
+        order.append(("step", request.pop("host_time")))
+
+    def dispatch(request):
+        order.append(("dispatch", "host_time" in request))
+        return {}
+
+    monkeypatch.setattr(guest, "lock", lock)
+    monkeypatch.setattr(guest, "step_clock", step)
+    monkeypatch.setattr(guest, "dispatch", dispatch)
+    request = json.dumps({"operation": operation, "host_time": 1234.5}).encode()
+    monkeypatch.setattr(guest.sys, "argv", ["firm-controller.py"])
+    monkeypatch.setattr(guest.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(request)))
+    # main()'s root-in-a-VM guards, and its umask, which must not change this process's.
+    monkeypatch.setattr(guest.sys, "platform", "linux")
+    monkeypatch.setattr(guest.os, "getuid", lambda: 0)
+    monkeypatch.setattr(guest.os, "umask", lambda mask: mask)
+    monkeypatch.setattr(guest.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
+    guest.main()
+    assert order == [("step", 1234.5), "lock", ("dispatch", False)]
+    assert json.loads(capsys.readouterr().out) == {"ok": True, "result": {}}
+
+
 # ---- export ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("present", [False, True])
+@pytest.mark.parametrize("homes", [False, True])
+def test_export_distinguishes_a_missing_drive_from_an_empty_drive(sim, present, homes):
+    import tarfile
+
+    root = sim.tree / "srv" / "firm"
+    if present:
+        root.mkdir(parents=True)
+    stream = io.BytesIO()
+    guest.export({"operation": "export", "root": str(root), "homes": homes}, stream)
+    stream.seek(0)
+    with tarfile.open(fileobj=stream, mode="r|") as archive:
+        assert [member.name for member in archive] == (["drive"] if present else [])
+    assert root.exists() is present
 
 
 def test_export_streams_the_drive_and_only_requested_home_directories(sim):

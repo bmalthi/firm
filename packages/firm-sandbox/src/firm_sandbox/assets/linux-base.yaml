@@ -1,0 +1,92 @@
+# Trusted software installation on ordinary Apple Virtualization networking.
+# Builder resources are set by linux_base.py.
+vmType: vz
+os: Linux
+arch: aarch64
+images:
+  - location: https://cloud-images.ubuntu.com/releases/resolute/release-20260720/ubuntu-26.04-server-cloudimg-arm64.img
+    arch: aarch64
+    digest: sha256:7bcf159e29ad0000bfed9c57875908c39268f5ed1257f4958fa6a9f5f60edd54
+mounts: []
+mountInotify: false
+networks:
+  - vzNAT: true
+propagateProxyEnv: false
+ssh:
+  forwardAgent: false
+  forwardX11: false
+  forwardX11Trusted: false
+  loadDotSSHPubKeys: false
+containerd:
+  system: false
+  user: false
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+      set -x
+      export DEBIAN_FRONTEND=noninteractive
+      NODE_VERSION=24.21.0
+      CLAUDE_CODE_VERSION=2.1.281
+      CODEX_VERSION=0.165.0
+      AGY_URL=https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.3-6604829099950080/linux-arm/cli_linux_arm64.tar.gz
+      # Vendor SHA-512 from the linux_arm64 (glibc) manifest, resolved at release time:
+      # https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_arm64.json
+      AGY_SHA512=c2fac818b3c1bb224079df03a714ccba99728b6a3a41d86d247ab2feb8582a43840c5032f1c2b75e72667623d5503e7ffda2712c4f37b6ee19f99c3fcfb25bae
+      CURL="curl --retry 10 --retry-all-errors --retry-max-time 600 -fsSL"
+      PACKAGES="cifs-utils acl samba samba-vfs-modules uidmap dbus-user-session
+        curl xz-utils git gh build-essential ssl-cert"
+      printf 'Acquire::Retries "3";\n' > /etc/apt/apt.conf.d/80firm-retries
+      apt-get update
+      apt-get -y dist-upgrade
+      apt-get install -y $PACKAGES
+      $CURL https://get.docker.com | sh
+      # Roles run rootless daemons; the privileged system units stay off.
+      systemctl disable --now docker.service docker.socket containerd.service
+      printf 'ip_tables\niptable_nat\nnf_tables\n' > /etc/modules-load.d/firm.conf
+      systemctl disable --now nmbd
+      $CURL https://astral.sh/uv/install.sh \
+        | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+      node_archive=$(mktemp)
+      $CURL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-arm64.tar.xz" \
+        -o "$node_archive"
+      tar -xJf "$node_archive" -C /usr/local --strip-components=1 --no-same-owner
+      rm -f "$node_archive"
+      npm install -g --prefix /usr/local \
+        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@openai/codex@${CODEX_VERSION}"
+      agy_stage=$(mktemp -d)
+      trap 'rm -rf "$agy_stage"' EXIT
+      $CURL "$AGY_URL" -o "$agy_stage/agy.tar.gz"
+      printf '%s  %s\n' "$AGY_SHA512" "$agy_stage/agy.tar.gz" | sha512sum --check --status
+      tar -xzf "$agy_stage/agy.tar.gz" -C "$agy_stage" --no-same-owner antigravity
+      install -d -o root -g root -m 0755 /usr/local/lib/agy
+      install -o root -g root -m 0755 "$agy_stage/antigravity" /usr/local/lib/agy/agy
+      rm -rf "$agy_stage"
+      trap - EXIT
+      # Enforce the vendor's opt-out for every invocation, including role shells.
+      cat > /usr/local/bin/agy <<'AGY'
+      #!/bin/sh
+      export AGY_CLI_DISABLE_AUTO_UPDATE=true
+      exec /usr/local/lib/agy/agy "$@"
+      AGY
+      chmod 0755 /usr/local/bin/agy
+      # GitHub credentials are supplied only during a role's run.
+      cat > /etc/gitconfig <<'GITCONFIG'
+      [credential "https://github.com"]
+        helper = "!f() { test -r \"$FIRM_CREDENTIALS_DIR/github-credential\" && exec /usr/bin/python3 \"$FIRM_CREDENTIALS_DIR/github-credential\" git \"$@\"; }; f"
+        useHttpPath = true
+      GITCONFIG
+      cat > /usr/local/bin/gh <<'GH'
+      #!/bin/sh
+      if [ -r "$FIRM_CREDENTIALS_DIR/github-credential" ]; then
+        exec /usr/bin/python3 "$FIRM_CREDENTIALS_DIR/github-credential" gh "$@"
+      fi
+      exec /usr/bin/gh "$@"
+      GH
+      chmod 0755 /usr/local/bin/gh
+      chown -R root:root /usr/local/lib/node_modules /usr/local/bin
+      for command in mount.cifs setfacl smbpasswd smbd newuidmap newgidmap dbus-run-session \
+        docker uv node npm claude codex agy gh git curl xz gcc g++ make modprobe; do
+        command -v "$command" >/dev/null
+      done

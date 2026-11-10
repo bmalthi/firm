@@ -26,12 +26,16 @@ cpus = 8
 memory_gib = 16
 
 [network]
-egress = "enforce"
+egress = "observe"
 allow_hosts = []
 ```
 
-`[network]` names hosts the VMs may reach beyond the built-in baseline; `observe` logs
-every host without refusing any. See the Linux VM guide's
+`[network] egress` defaults to `"observe"`, allowing all public HTTP/HTTPS hosts while
+blocking private/loopback/LAN ranges and logging per-role traffic. The stricter opt-in
+`"enforce"` limits hosts to the baseline, `allow_hosts` and owner grants. Observe is
+the default because the baseline already includes GitHub, PyPI, npm and Docker Hub,
+which can receive data, so hostname allowlisting offers little protection while
+blocking legitimate sites. See the Linux VM guide's
 [network section](../../docs/linux-vm.md#network-access-and-cutoff).
 
 To add a Mac, add a `[mac]` table naming an enrolled Mac image by absolute path. The
@@ -64,19 +68,17 @@ Sandbox-only `init` is for a new empty-state firm (such as image enrollment); it
 refuses to mark existing unversioned VM state as compatible.
 
 The guest recipe pins AGY CLI **1.5.3** (experimental, Linux ARM64 glibc) and
-verifies its vendor SHA-512 before extraction. `src/firm_sandbox/assets/linux-vm.yaml`
+verifies its vendor SHA-512 before extraction. `src/firm_sandbox/assets/linux-base.yaml`
 records the URL/checksum from the
 [official installer's](https://antigravity.google/cli/install.sh)
 [ARM64 manifest](https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_arm64.json).
-Boots reuse matching installations without a manifest lookup. `/usr/local/bin/agy`
+`/usr/local/bin/agy`
 wraps root-owned `/usr/local/lib/agy/agy`, enforcing `AGY_CLI_DISABLE_AUTO_UPDATE=true`, the
 [documented opt-out](https://antigravity.google/docs/cli/troubleshooting/).
-Readiness checks the executable and root-owned `/usr/local/lib/agy/version` stamp,
-written after verified installation; metadata-only boot checks do not launch providers.
+Readiness checks the executable without launching providers.
 
 Subscription egress allows exact hosts `www.googleapis.com` and
-`daily-cloudcode-pa.googleapis.com`. Archive host `storage.googleapis.com` is setup-only:
-authenticated `_provision` requests before guest readiness; roles need an owner grant.
+`daily-cloudcode-pa.googleapis.com`.
 OAuth/login, updater manifests, avatars and telemetry are excluded from the baseline.
 Under the launcher's HOME, `.gemini/antigravity-cli/` holds access-only
 `antigravity-oauth-token` and CLI `settings.json`; `.gemini/config/` holds shared

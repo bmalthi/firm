@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from firm_sandbox import lima_paths
+from firm_sandbox import lima_paths, linux_base
 
 
 @pytest.fixture(autouse=True)
@@ -18,6 +18,10 @@ def disposable_host_runtime(request, tmp_path, tmp_path_factory, monkeypatch):
     only the runtimes their own firms own.
     """
     if not request.node.get_closest_marker("integration"):
+        monkeypatch.setattr(
+            linux_base, "cache_directory", lambda: tmp_path / "cache" / "linux-base"
+        )
+        monkeypatch.setenv("LIMA_HOME", str(tmp_path / "lima-home"))
         monkeypatch.setattr(
             lima_paths, "RUNTIME_PARENT", tmp_path_factory.mktemp("runtime") / "lima"
         )

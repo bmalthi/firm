@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import shutil
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -67,7 +68,8 @@ class FakeLinux:
         if run.vm_generation != self.generation:
             raise ValueError("Run belongs to a discarded VM generation")
 
-    def up(self):
+    def up(self, *, checkpoint=lambda: None):
+        checkpoint()
         self.calls.append("up")
         self.running = True
         return {"running": True}
@@ -292,6 +294,12 @@ def test_linux_disk_size_must_be_a_positive_integer(tmp_path, value):
         Config(tmp_path, disk_gib=value)
 
 
+def test_linux_disk_cannot_be_smaller_than_the_base_image(tmp_path):
+    with pytest.raises(ValueError, match="at least 20"):
+        Config(tmp_path, disk_gib=19)
+    assert Config(tmp_path, disk_gib=20).disk_gib == 20
+
+
 def test_linux_disk_size_is_configured_and_passed_to_the_vm(tmp_path):
     path = tmp_path / "sandbox.toml"
     path.write_text("[firm]\ndisk_gib = 120\n")
@@ -310,7 +318,7 @@ def test_config_reads_the_egress_mode_and_allowed_hosts(tmp_path):
     assert box.linux.settings.allow_hosts == config.allow_hosts
     assert box.linux.settings.egress_mode == "observe"
     path.write_text("")
-    assert (Config.load(path).egress_mode, Config.load(path).allow_hosts) == ("enforce", ())
+    assert (Config.load(path).egress_mode, Config.load(path).allow_hosts) == ("observe", ())
 
 
 @pytest.mark.parametrize(("setting", "message"), [
@@ -475,7 +483,7 @@ def test_file_forwards_start_only_after_both_vm_generations_exist(box, monkeypat
 
 
 def test_linux_failure_during_up_powers_off_partial_boot(box):
-    def broken():
+    def broken(**_):
         box.linux.running = True
         raise RuntimeError("guest initialization failed")
 
@@ -783,7 +791,7 @@ def test_network_status_reports_the_firm_and_each_vm(box):
                                   "overflow": 1}
     status = box.network_status()
     assert set(status) == {"enabled", "mode", "allowed_hosts", "egress", "vms"}
-    assert (status["enabled"], status["mode"]) == (True, "enforce")
+    assert (status["enabled"], status["mode"]) == (True, "observe")
     assert status["egress"] == {
         "live": True, "overflow": 4,
         "entries": [{**entry, "vm": "linux"}, {**entry, "role": "mac", "vm": "mac"}],
@@ -909,6 +917,9 @@ def test_lost_start_reply_retries_the_same_run_identity(box, clean_up):
 
     box.linux._rpc = rpc
     run = box.start(RunSpec("analyst", ("true",), clean_up=clean_up))
+    # The same request, but each send carries the host's clock as of that send.
+    times = [payload.pop("host_time") for _, payload in calls]
+    assert times[0] <= times[1] <= time.time()
     assert len(calls) == 2 and calls[0] == calls[1]
     assert calls[0][1]["run_id"] == run.run_id
     assert calls[0][1]["clean_up"] is clean_up
@@ -1137,7 +1148,7 @@ def test_sandbox_and_station_share_one_firm_lifecycle_lock(box):
     )
     linux_up = box.linux.up
 
-    def up():
+    def up(**_):
         held.append(("sandbox", lifecycle_lock_held(box.config)))
         station.helper_status()
         return linux_up()
@@ -1204,7 +1215,7 @@ def test_emergency_shutdown_drains_boot_and_stops_a_late_start(box):
     booting, release, first_stop = Event(), Event(), Event()
     events = []
 
-    def boot():
+    def boot(**_):
         booting.set()
         assert release.wait(2)
         events.append("boot")
@@ -1371,6 +1382,13 @@ def test_export_without_boot_uses_only_the_running_linux_vm(box):
     box.linux.running = True
     assert box.export(Path("/export")) == []
     assert box.linux.calls == ["export"]
+
+
+def test_never_ready_vm_exports_empty_drive_without_boot(box, tmp_path):
+    box.linux._state = lambda: {"ready": False}
+    assert box.export(tmp_path, homes=True, boot=True) == []
+    assert (tmp_path / "drive").is_dir()
+    assert box.linux.calls == []
 
 
 def test_discard_removes_both_guests_for_good_and_keeps_host_records(box, monkeypatch):
@@ -2016,6 +2034,7 @@ def test_child_rpc_facade_carries_worker_launch_settings(box, monkeypatch):
     assert box.child_logs("task-one", offset=2, limit=4) == b"answer"
     assert box.stop_child("task-one")["confirmed"]
     url = base64.b64encode(box.linux.network.proxy_url("analyst").encode()).decode()
+    assert calls[0][1].pop("host_time") <= time.time()
     assert calls == [
         ("start-child", {"parent_run_id": "parent", "run_id": "task-one",
                          "argv": ["sh", "-c", "printf answer"], "seconds_remaining": 123,

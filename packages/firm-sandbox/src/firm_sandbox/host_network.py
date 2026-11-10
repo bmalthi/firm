@@ -25,7 +25,7 @@ import threading
 import time
 from pathlib import Path
 
-from .egress_proxy import PROVISION, EgressProxy, RequestLog, read_hosts, token
+from .egress_proxy import EgressProxy, RequestLog, read_hosts, token
 from .models import EGRESS_MODES, host_entries, identifier
 from .network_observation import Traffic
 from .packet_policy import MAX_FRAME, PacketPolicy
@@ -54,8 +54,6 @@ def locations(root: Path, socket_root: Path) -> dict[str, Path]:
         "egress": root / "egress.json",
         "hosts": hosts_file(root),
         "key": root / "proxy.key",
-        # Present only while a new VM provisions; the provisioning credential holds while it does.
-        "provisioning": root / "provisioning",
         "traffic": scratch / "traffic.json",
         "requests": scratch / "egress.jsonl",
         "summary": scratch / "egress-summary.json",
@@ -238,7 +236,7 @@ class HostNetwork:
 
     def create_key(self) -> None:
         """Make the proxy key if there is none. Only while no filter runs: ``start`` calls
-        it before launching one, and a new VM's creation before it has ever had one."""
+        it before launching one."""
         if self.proxy_role is None:
             create_proxy_key(self.paths["key"])
 
@@ -250,8 +248,7 @@ class HostNetwork:
         """
         if self.proxy_role is not None:
             raise RuntimeError("This VM's proxy takes no credentials")
-        if identity != PROVISION:
-            identifier(identity)
+        identifier(identity)
         secret = token(read_proxy_key(self.paths["key"]), identity)
         return f"http://{identity}:{secret}@{self.gateway}:{self.proxy_port}"
 
@@ -505,7 +502,7 @@ def serve(configuration: Path) -> None:
         port=port, mode=mode, log=RequestLog(paths["requests"]),
         allow_hosts=host_entries(settings["allow_hosts"]), role=proxy_role,
         key=None if proxy_role is not None else read_proxy_key(paths["key"]),
-        provisioning=paths["provisioning"].exists, hosts_path=paths["hosts"],
+        hosts_path=paths["hosts"],
     )
     proxy.refresh()
     stop = threading.Event()

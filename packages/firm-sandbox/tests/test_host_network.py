@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import pytest
 
-from firm_sandbox.egress_proxy import PROVISION, token
+from firm_sandbox.egress_proxy import token
 from firm_sandbox.host_network import (
     Boundary,
     HostNetwork,
@@ -145,8 +145,7 @@ def test_proxy_url_names_the_role_and_its_token_but_never_the_key(tmp_path):
         f"http://analyst:{token(key, 'analyst')}@192.168.94.2:{network.proxy_port}"
     )
     assert key.hex() not in url and base64.b64encode(key).decode() not in url
-    assert network.proxy_url(PROVISION).startswith(f"http://{PROVISION}:")
-    for invalid in ("Analyst", "role:x", "", "unknown@x"):
+    for invalid in ("Analyst", "_internal", "role:x", "", "unknown@x"):
         with pytest.raises(ValueError):
             network.proxy_url(invalid)
     mac = HostNetwork(

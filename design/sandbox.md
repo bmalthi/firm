@@ -4,7 +4,7 @@
 > * **Linux-First + Optional Mac Leases:** Every role is a dedicated Linux user (`firmrole-<hash>`) with its own `systemd` slice and **rootless Docker daemon**. Roles lease Mac desktop stations (`firmstation1..8`) on demand for Xcode and GUI work.
 > * **Kernel-Verified Settlement (`populated 0`):** After each work period, the sandbox stops the role's slice, verifies `cgroup.events` reads `populated 0` (all processes dead, running containers included), and preserves scratch and on-disk Docker state.
 > * **Reporting-Line SMB File Server (`/srv/firm`):** No host folders are mounted into guests. Internal Samba (`smbd`) + POSIX ACLs keep `org/<address>/work` private to that reporting line while `shared/` is firm-wide.
-> * **Fail-Closed Packet Filter & Proxy:** Guest NICs drop all UDP, raw DNS, and direct IP traffic. Outbound HTTP/HTTPS goes through the host allowlist proxy (`egress = "enforce"` by default, or `"observe"` for open public web).
+> * **Fail-Closed Packet Filter & Proxy:** Guest NICs drop all UDP, raw DNS, and direct IP traffic. Outbound HTTP/HTTPS goes through the host egress proxy (`egress = "observe"` by default for open public web, or `"enforce"` as the stricter opt-in).
 > * **4-Check Mac Station Sweep:** Releasing a Mac station verifies `access_revoked`, `work_stopped`, `drive_detached`, and `desktop_usable` against the pre-lease snapshot before another role can acquire it.
 
 ---
@@ -15,6 +15,14 @@
 * **`firm-runtime`** calls `Sandbox` to provision role accounts, launch uniquely identified runs, broker Mac desktop actions, update allowed network hosts, and sample VM resource counters.
 
 ---
+
+## Linux Base Image
+
+The shared Linux base builder runs the trusted installation recipe on ordinary
+Apple Virtualization NAT, outside the firm boundary. It has no roles, firm data,
+credentials or host mounts. This permits software downloads without exposing
+untrusted work to that network. Its generalized disk supplies new firm VMs, which
+boot behind the packet filter and egress proxy before any role runs.
 
 ## Roles on the Linux VM
 
@@ -75,17 +83,18 @@ Each VM's network interface is spliced through a host-owned userspace packet fil
 [ Host Userspace Packet Filter ]  <-- Drops all UDP, raw DNS, LAN/loopback, and direct IPs;
         |                             only passes DHCP, management SSH, and TCP to proxy.
         v
-[ Host Egress Proxy ]             <-- Resolves DNS on host, checks hostname allowlist + TLS SNI,
-        |                             blocks private IP ranges, logs {role, host, port, bytes}.
+[ Host Egress Proxy ]             <-- Resolves DNS on host, checks TLS SNI in both modes;
+        |                             enforces allowlist in enforce mode, blocks private IPs,
+        |                             logs {role, host, port, bytes}.
         v
 [ Public Internet ]
 ```
 
 1. **Fail-closed packet filter:** Rather than relying on macOS host `pf` firewall rules (which fail *open* if flushed or reloaded), the filter process holds the upstream socket directly; if the filter dies, the guest's network link is severed.
 2. **Hostname validation without TLS MITM:** For HTTPS (`CONNECT :443`), the proxy resolves the hostname on the host, dials only public IPs, and inspects the initial TLS `ClientHello` SNI to verify it matches the `CONNECT` hostname (preventing domain fronting) without terminating TLS or installing a root CA in the guest. For plain HTTP (`:80`), it forwards one request per connection with a rewritten `Host` header and fixed `Content-Length`.
-3. **Two Egress Modes (`[network] egress`):**
-   * **`"enforce"` (Default):** Allows `BASELINE_HOSTS` (Anthropic/Claude, OpenAI/ChatGPT, including provider-native **Web Search**, plus GitHub, GHCR, Docker Hub, PyPI, Astral/uv, npm, Node, Ubuntu/Debian apt, Homebrew, and Apple CDNs), `[network] allow_hosts`, and owner-granted domains in `hosts.json` (reloaded live on disk change; revoking a host immediately closes open tunnels).
-   * **`"observe"`:** Allows all public HTTP/HTTPS hosts while still blocking private/loopback IP ranges and recording per-role traffic in the proxy log.
+3. **Two Egress Modes (`[network] egress`):** Observe is the default because the baseline already includes GitHub, PyPI, npm and Docker Hub, which can receive data, so hostname allowlisting offers little protection while blocking legitimate sites.
+   * **`"observe"` (Default):** Allows all public HTTP/HTTPS hosts while still blocking private/loopback/LAN IP ranges and recording per-role traffic in the proxy log.
+   * **`"enforce"` (Stricter opt-in):** Allows `BASELINE_HOSTS` (Anthropic/Claude, OpenAI/ChatGPT, including provider-native **Web Search**, plus GitHub, GHCR, Docker Hub, PyPI, Astral/uv, npm, Node, Ubuntu/Debian apt, Homebrew, and Apple CDNs), `[network] allow_hosts`, and owner-granted domains in `hosts.json` (reloaded live on disk change; revoking a host immediately closes open tunnels).
 4. **Live Egress Cutoff (`firm network DIR off`):** Closes the proxy exception across all VMs while keeping the host's management SSH channels open so the owner can still inspect or shut down the firm.
 
 ---

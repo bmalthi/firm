@@ -437,6 +437,7 @@ def main(argv=None):
         "status", help="Report company state, roles and whether infrastructure is running"
     )
     status.add_argument("directory", type=Path)
+    status.add_argument("--json", action="store_true", help="Emit JSON (the default)")
     network = commands.add_parser(
         "network",
         help="Inspect firm traffic, switch egress off or on, or allow or revoke a host",
@@ -796,7 +797,12 @@ def main(argv=None):
             elif args.command == "delete":
                 result = fleet.delete(args.directory, args.confirm, runtime)
             elif args.command == "status":
+                from .foreground import startup_error
+
                 result = runtime.status()
+                error = startup_error(args.directory)
+                if error is not None:
+                    result["startup_error"] = error
                 sandbox_config = args.directory / "sandbox.toml"
                 if sandbox_config.is_file():
                     state, error = fleet.sandbox_status(sandbox_config)

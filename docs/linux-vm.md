@@ -18,12 +18,10 @@ why, and what it does not.
 - [Network access and cutoff](#network-access-and-cutoff)
 - [Development limits](#development-limits)
 
-The first boot trusts the configured Ubuntu image and package repositories, Docker's
-installation script, Astral's uv installer, and the pinned Node/provider CLI downloads
-in `assets/linux-vm.yaml`. Docker and uv installers execute as guest root and are not
-pinned by content digest. The egress allowlist limits destinations; it does not verify
-publisher content. Review the recipe before provisioning where that supply-chain
-trust is unacceptable.
+The base image trusts the pinned Ubuntu cloud image, Ubuntu package repositories,
+Docker's installation script, Astral's uv installer, and the pinned Node/provider CLI
+downloads in `assets/linux-base.yaml`. Docker and uv installers execute as guest root
+and are not pinned by content digest.
 
 ## Create and start a firm
 
@@ -38,21 +36,43 @@ memory_gib = 16
 disk_gib = 60
 
 [network]
-egress = "enforce"
+egress = "observe"
 allow_hosts = []
 ```
 
-`[firm]` sizes the Linux VM; there is no image to build for it. Edit `cpus` or
+`[firm]` sizes the Linux VM. Edit `cpus` or
 `memory_gib` later and the stopped VM takes the new size on its next boot, keeping its
 disk; size them from
 [its resource history](runtime.md#sizing-a-firm-from-its-resource-history) after a week
-of real use. `disk_gib` is a positive integer in GiB, default 60, used only when
+of real use. `disk_gib` is an integer in GiB, at least 20 (the base image's size), default 60, used only when
 creating the Linux VM. Editing it leaves an existing firm's disk unchanged.
-Its first boot
-downloads the Ubuntu cloud image and installs Docker, Samba, cifs-utils, uv, Node,
-Claude Code and Codex, which takes several minutes. `[network]` names the hosts the
-firm's VMs may reach beyond the built-in baseline, and `egress = "observe"` logs every
-host without refusing any, for finding out what a new workload needs; see
+
+New VMs clone a shared software base image cached at
+`~/Library/Caches/firm/linux-base/`. Firm builds it once per Mac on ordinary Apple
+Virtualization networking, outside the firm's network and egress proxy. The base
+contains Docker, Samba, cifs-utils, uv, Node, Claude Code, Codex and AGY. Each firm's
+boot performs only offline configuration behind its sandbox network and creates
+its own machine ID, SSH host keys, Samba SID and certificate.
+
+Firm builds a new base when there is none or its recipe or generalize script
+changed, and then deletes images from earlier recipes. It never rebuilds an image
+just because it is old: once the image is over 30 days old, `firm check` on a firm
+without a VM yet says so, and you choose when to rebuild by deleting
+`~/Library/Caches/firm/linux-base/`. The next new firm then builds a fresh image with
+current updates. Existing VMs keep the tool versions they were created with; discard
+the VM or create a new firm to get newer versions. Build failures keep cloud-init and Lima logs in
+`~/Library/Caches/firm/linux-base/build-logs/`.
+
+If a firm's first boot fails, Firm copies the end of `cloud-init-output.log` and
+`cloud-init.log` to `durable/linux/provision.log` before powering off; the error
+names that file.
+
+The guest has no time source (Lima's plain mode runs no guest agent, and no time
+server is reachable), so each run's launch sets the guest clock to the host's when
+they differ by more than 2 seconds, for example after the host slept.
+`[network]` defaults to `egress = "observe"`, allowing all public HTTP/HTTPS hosts
+and logging per-role traffic while blocking private/loopback/LAN ranges. The stricter
+opt-in `egress = "enforce"` restricts hosts to the baseline, `allow_hosts` and owner grants; see
 [network access](#network-access-and-cutoff). An optional `[mac]` table names an enrolled
 Mac image; that image records its one to eight station accounts (see
 [the Mac station guide](mac-station.md)); without it the firm has one VM.
@@ -272,8 +292,13 @@ channels, so the share never crosses a network interface or the packet filter. T
 owner login `firmowner` is a Samba admin user. Use **Results** in the console to
 browse and download deliverables directly, or inspect the SMB URL and password with
 `firm-sandbox --config PATH data-status` and run
-`mount_smbfs //firmowner@127.0.0.1:<port>/firm <directory>` (or open the URL in Finder)
-when you want a host mount; see [runtime operations](runtime.md#start-and-stop).
+`mount_smbfs //firmowner@firm-<port>.localhost:<port>/firm <directory>` (or open the
+URL in Finder) when you want a host mount; see
+[runtime operations](runtime.md#start-and-stop). The URL names the host as
+`firm-<port>.localhost`, which macOS resolves to loopback, rather than `127.0.0.1`:
+macOS keeps one SMB session per server name and user, so with a shared name a second
+firm's drive is refused with "Authentication error" while another firm's is mounted.
+Mount each firm with its own URL and several can be open at once.
 The port and password are chosen once per firm and survive stop, start and host
 restarts; only discarding the VMs replaces them.
 
@@ -302,20 +327,21 @@ other roles can reach published ports and compete to bind them.
 
 A guest reaches the internet only by name, through a proxy the host runs beside each
 VM's packet filter. The filter lets nothing else out: no direct connection to any
-address, no UDP, no DNS. The proxy resolves names itself and admits a request when
+address, no UDP, no DNS. The proxy resolves names itself and defaults to
+`egress = "observe"`: all public HTTP/HTTPS hosts are allowed, private/loopback/LAN
+ranges stay blocked, and per-role traffic is logged. Observe is the default because
+the baseline already includes GitHub, PyPI, npm and Docker Hub, which can receive
+data, so hostname allowlisting offers little protection while blocking legitimate sites.
+
+The stricter opt-in `egress = "enforce"` admits a request when
 its host is on the firm's allowlist: the built-in baseline (the provider APIs, GitHub,
-the package registries, the image's package mirrors, `astral.sh` and its installer
+the package registries, Ubuntu and Debian package mirrors, `astral.sh` and its installer
 redirect host `releases.astral.sh`, and, for a Mac, Apple's download hosts),
 `[network] allow_hosts` in `sandbox.toml`, and the hosts the owner granted while the
 firm ran. An entry is an exact lower-case name or `*.example.com` for every subdomain.
 Anything else is refused with `403`, which a role reads as a host the firm has not
 allowed yet and asks for with `request_access`; see
 [owner requests](runtime.md#owner-requests).
-
-The separate setup-only list contains `storage.googleapis.com`, for the pinned AGY
-archive. Only the authenticated `_provision` identity can use that list, until the
-guest controller is first ready. Roles need an ordinary owner grant for this host;
-it is omitted from the role baseline shown by status, analysis and the console.
 
 Every role's run carries the proxy in its environment with a credential that names
 the role, so `curl`, `git`, `uv`, `npm`, `apt`, Claude Code and Codex go through it
@@ -324,11 +350,11 @@ through it, and its Docker client configuration passes the same settings into ev
 container and build. A tool that resolves names itself fails fast, because the guest's
 resolver points nowhere. Web search needs none of this: Claude Code's WebSearch and
 Codex's web search run on the provider's side, so only the provider API has to be
-reachable. WebFetch and `curl` reach allowed hosts only.
+reachable. WebFetch and `curl` reach public hosts, subject to the allowlist in enforce mode.
 
-`egress = "observe"` in `sandbox.toml` lets every host through and logs it. Run a new
-kind of workload under it once, read the hosts from `firm analyze --section network`,
-and put the ones it needs in `allow_hosts`. The mode is recorded in the filter's policy
+When opting into enforce, read the hosts a workload uses from
+`firm analyze --section network` and put the ones it needs in `allow_hosts`.
+The mode is recorded in the filter's policy
 and changes on the next VM start. In observe mode, host-access requests return granted
 without asking the owner; hostname, port and public-address checks still apply. This
 mode permits outbound actions as well as reads.

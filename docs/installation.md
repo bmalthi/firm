@@ -146,7 +146,7 @@ Write three files inside `"$FIRM_DIR"`:
    disk_gib = 60
 
    [network]
-   egress = "enforce"   # "enforce" (default baseline + approved hosts) or "observe" (allow all public web)
+   egress = "observe"   # Default: all public HTTP/HTTPS; "enforce" is the stricter opt-in
    allow_hosts = []     # e.g. ["api.example.com", "*.example.org"]
    ```
 
@@ -165,7 +165,7 @@ Write three files inside `"$FIRM_DIR"`:
 ~/.local/bin/firm start "$FIRM_DIR" --sandbox-config "$FIRM_DIR/sandbox.toml"
 ```
 
-When `firm start "$FIRM_DIR"` returns JSON, give the user the `unlock_url` so they can watch the **Owner Console** in their browser (`http://127.0.0.1:8766/`). The first boot provisions the Ubuntu Linux VM in the background, which takes a few minutes before the Founder's first work period starts.
+When `firm start "$FIRM_DIR"` returns JSON, give the user the `unlock_url` so they can watch the **Owner Console** in their browser (`http://127.0.0.1:8766/`). The Linux VM starts in the background. The first firm on a Mac builds the shared Linux base image before the Founder's first work period starts.
 
 #### Step 6 — Monitor, message, and operate the firm via JSON CLI
 
@@ -216,12 +216,13 @@ Firm stores owner data under `firms/` in the current directory by default. Run t
 Every guest VM's network interfaces are locked down at the host boundary: there is no direct internet route, no UDP/DNS, and no access to your Mac's loopback or private LAN. All outbound HTTP/HTTPS traffic from roles goes through the host's egress proxy (`packages/firm-sandbox/src/firm_sandbox/egress_proxy.py`).
 
 * **Web Search works out of the box:** Provider-native web search (`web_search` in Codex, `WebSearch` in Claude Code, and `search_web` in AGY roles and tasks) is enabled by default and executes on the provider's servers over the pre-allowed provider API hosts. Firm denies AGY's native page fetch (`read_url`); AGY tool-free runs do not enable search.
-* **Default mode (`egress = "enforce"`):** Allows a built-in baseline of essential hosts out of the box:
+* **Default mode (`egress = "observe"`):** Allows all public HTTP/HTTPS hosts while blocking private/loopback/LAN ranges and logging per-role traffic. Observe is the default because the baseline already includes GitHub, PyPI, npm and Docker Hub, which can receive data, so hostname allowlisting offers little protection while blocking legitimate sites.
+* **Stricter opt-in (`egress = "enforce"`):** Allows the built-in baseline, `[network] allow_hosts`, and owner-granted hosts:
   * **Providers & Web Search:** `*.anthropic.com`, `*.claude.com`, `*.openai.com`, `chatgpt.com`, `*.chatgpt.com`
   * **GitHub & Containers:** `github.com`, `*.github.com`, `*.githubusercontent.com`, `ghcr.io`, `*.docker.com`, `*.docker.io`
   * **Package Registries & OS Mirrors:** `pypi.org`, `files.pythonhosted.org`, `astral.sh`, `releases.astral.sh`, `registry.npmjs.org`, `nodejs.org`, `*.ubuntu.com`, `*.debian.org`, `formulae.brew.sh`, `*.apple.com`, `*.cdn-apple.com`
   * Unlisted third-party domains return HTTP `403`. When a role needs an unlisted host for `curl`, `WebFetch`, or an SDK call, it calls `request_access(kind="network_host", resource="...", purpose="...")`, which creates a pending **Owner Request** you can grant in the console or via `firm requests DIRECTORY grant <id>` / `firm network DIRECTORY allow <host>`.
-* **Open public web mode (`egress = "observe"`):** If you prefer agents to reach any public HTTP/HTTPS domain directly without prompting for host approvals (while still blocking private/loopback IP ranges and recording every hostname in the proxy log), configure `sandbox.toml` (changes to `egress` take effect on the next VM start):
+* Set the mode in `sandbox.toml` (an absent setting means `"observe"`; an explicit `"enforce"` stays enforced). Changes to `egress` take effect on the next VM start:
   ```toml
   [network]
   egress = "observe"
@@ -232,9 +233,9 @@ Every guest VM's network interfaces are locked down at the host boundary: there 
 
 ## 5. First Boot, Provider Sign-In & Daily Use
 
-The first start downloads the Ubuntu cloud image and provisions the Linux guest, which can take several minutes. Keep the Mac connected to power and ensure enough free disk space for the VM. The owner console opens in your browser (`http://127.0.0.1:8766/` by default) and the local host continues running in the background after `firm start` returns and after its terminal closes. Bookmark the console URL to reconnect to the same firm.
+The first firm on a Mac builds the shared [Linux base image](linux-vm.md#create-and-start-a-firm), which can take several minutes. Later firms clone it and configure their guests offline. Keep the Mac connected to power and ensure enough free disk space for the VM. The owner console opens in your browser (`http://127.0.0.1:8766/` by default) and the local host continues running in the background after `firm start` returns and after its terminal closes. Bookmark the console URL to reconnect to the same firm.
 
-The console can be ready before the Linux VM finishes starting. If startup fails, the console stays available and shows the cause. Firm retries brief package-download problems and leaves incomplete setup safe to resume. Before clicking **Resume**, wait until the console confirms the VM has stopped; then retry from the console. If shutdown is still in progress, wait and check again.
+The console can be ready before the Linux VM finishes starting. If startup fails, the console stays available and shows the cause. Before clicking **Resume**, wait until the console confirms the VM has stopped; then retry from the console. If shutdown is still in progress, wait and check again.
 
 ### Provider sign-in and model defaults
 
@@ -272,6 +273,8 @@ passing check does not prove remote model access.
 
 Use `firm status DIRECTORY` for a command-line state summary and
 `firm analyze DIRECTORY --section inbox` to inspect pending owner mail and requests.
+`firm status DIRECTORY` (also with `--json`) includes `startup_error` while the execution
+host records a startup failure, until the next successful start clears it.
 Neither a process exit nor a plausible output filename proves that the task is
 complete; open and inspect the artifact, then send follow-up instructions through
 the console when it needs changes.
@@ -421,8 +424,9 @@ change inference billing. `gemini` is not a provider alias.
 Long turns yield after roughly 45–55 minutes and resume the same conversation
 with fresh credentials. AGY reads its token once; replacing it mid-turn cannot
 extend its lifetime. Expiry can leave a conversation reporting persistent ERROR.
-The VM clock must track the host; skew over roughly 300 seconds can defeat the
-pre-expiry yield bound. See [runtime policy](runtime.md#experimental-agy-configuration)
+The yield bound reads the VM's clock. The VM has no time source of its own and its
+clock falls behind while the host sleeps, so the sandbox sets it to the host's time at
+the start of every run when the two differ by more than 2 seconds. See [runtime policy](runtime.md#experimental-agy-configuration)
 for configuration, retry limits and experimental tool isolation.
 
 If a retained conversation keeps failing, route it fresh on its current profile,

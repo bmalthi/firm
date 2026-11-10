@@ -146,6 +146,7 @@ def generated_files(directory: Path, provider: str, mandate: str) -> dict[Path, 
         "max_active = 1\n"
     )
     sandbox_toml = f'[firm]\nid = "{firm_id}"\ncpus = 4\nmemory_gib = 8\ndisk_gib = 60\n'
+    sandbox_toml += '\n[network]\negress = "observe"\nallow_hosts = []\n'
     return {
         Path(directory) / "mandate.md": mandate.rstrip() + "\n",
         Path(directory) / "firm.toml": firm_toml,

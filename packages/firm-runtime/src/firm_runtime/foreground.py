@@ -179,11 +179,11 @@ def _read_host_record(path: Path) -> dict | None:
         return None
 
 
-def _console_alive(record: dict, durable: Path) -> bool:
+def _console_read(record: dict, durable: Path, endpoint: str) -> dict | None:
     try:
         os.kill(record["pid"], 0)
     except (OSError, TypeError):
-        return False
+        return None
     key_path = durable / "console-key"
     try:
         descriptor = os.open(key_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -194,34 +194,51 @@ def _console_alive(record: dict, durable: Path) -> bool:
                 or info.st_uid != os.getuid()
                 or stat.S_IMODE(info.st_mode) & 0o077
             ):
-                return False
+                return None
             key = stream.read(128).strip()
     except (OSError, UnicodeError):
-        return False
+        return None
     if re.fullmatch(r"[A-Za-z0-9_-]{43}", key) is None:
-        return False
+        return None
     expected_scope = console_scope(durable / "firm.sqlite3", record["firm_id"])
     if record.get("console_scope") != expected_scope:
-        return False
+        return None
     port = record["console_port"]
     cookie = f"firm_owner_console_127.0.0.1_{port}={key}"
     request = urllib.request.Request(
-        f"http://127.0.0.1:{port}/api/session",
+        f"http://127.0.0.1:{port}{endpoint}",
         headers={"Host": f"127.0.0.1:{port}", "Cookie": cookie},
     )
     try:
         with urllib.request.urlopen(request, timeout=0.5) as response:
-            value = json.loads(response.read(4096))
-            return (
-                response.status == 200
-                and value.get("principal") == "owner"
-                and value.get("firm_id") == record["firm_id"]
-                and value.get("console_scope") == expected_scope
-            )
+            # A startup error carries its cause's text, such as a command's stderr.
+            value = json.loads(response.read(256 * 1024))
+            return value if response.status == 200 and isinstance(value, dict) else None
     except urllib.error.HTTPError:
-        return False
+        return None
     except (OSError, TimeoutError, ValueError, AttributeError):
-        return False
+        return None
+
+
+def _console_alive(record: dict, durable: Path) -> bool:
+    value = _console_read(record, durable, "/api/session")
+    return bool(
+        value
+        and value.get("principal") == "owner"
+        and value.get("firm_id") == record["firm_id"]
+        and value.get("console_scope") == record["console_scope"]
+    )
+
+
+def startup_error(directory: Path) -> str | None:
+    """Read the live host's startup failure from its authenticated console."""
+    durable = directory / "durable"
+    record = _read_host_record(durable / HOST_RECORD)
+    if record is None or not _console_alive(record, durable):
+        return None
+    value = _console_read(record, durable, "/api/control/status")
+    error = value.get("startup_error") if value else None
+    return error if isinstance(error, str) else None
 
 
 def _host_lock_active(directory: Path) -> bool:

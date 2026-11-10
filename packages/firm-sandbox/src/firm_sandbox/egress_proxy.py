@@ -51,22 +51,15 @@ BASELINE_HOSTS = tuple(sorted({
     # Language registries and uv's installer bootstrap plus its redirect download host.
     "astral.sh", "files.pythonhosted.org", "pypi.org", "registry.npmjs.org",
     "releases.astral.sh",
-    # Container images: Docker Hub (and get.docker.com, the image's Docker install) and
-    # GitHub's registry.
+    # Container images and Docker installs: Docker Hub, get.docker.com and GitHub's registry.
     "*.docker.com", "*.docker.io", "ghcr.io",
-    # The Linux image: Ubuntu's apt mirrors (ports.ubuntu.com on arm64) and Node.js.
+    # Role container builds: Debian/Ubuntu apt mirrors, plus Node.js downloads.
     "*.debian.org", "*.ubuntu.com", "nodejs.org",
     # The Mac: Homebrew's formula API (bottles come from ghcr.io), and Apple's developer
     # downloads that mac-image-apply's simulator runtimes need.
     "*.apple.com", "*.cdn-apple.com", "formulae.brew.sh",
 }))
 
-# First-boot downloads only; never part of a role's baseline host list.
-PROVISION_HOSTS = ("storage.googleapis.com",)
-
-# The Linux image's own boot provisioning (apt, Docker, uv, Node, npm). Not a role ID,
-# so it can never be one role's name.
-PROVISION = "_provision"
 UNKNOWN = "unknown"
 PORTS = {"https": 443, "http": 80}
 HEAD_LIMIT = 64 * 1024
@@ -408,14 +401,13 @@ class EgressProxy:
     (the Linux VM); with ``role`` every request is that role's (the Mac).
 
     ``mode`` ``observe`` allows every host and still logs and summarizes; port, address
-    and credential checks hold in both modes. ``provisioning`` answers, per request,
-    whether the ``PROVISION`` credential still holds. ``resolver``, ``acceptable`` and
-    ``opener`` are the network seams tests replace.
+    and credential checks hold in both modes. ``resolver``, ``acceptable`` and ``opener``
+    are the network seams tests replace.
     """
 
     def __init__(
-        self, *, port, log: RequestLog, mode="enforce", allow_hosts=(), key=None, role=None,
-        provisioning=lambda: False, hosts_path=None, address="127.0.0.1", resolver=resolve,
+        self, *, port, log: RequestLog, mode="observe", allow_hosts=(), key=None, role=None,
+        hosts_path=None, address="127.0.0.1", resolver=resolve,
         acceptable=public_address, opener=asyncio.open_connection, idle=IDLE_TIMEOUT,
     ):
         if mode not in EGRESS_MODES:
@@ -423,7 +415,7 @@ class EgressProxy:
         if (key is None) == (role is None):
             raise ValueError("The proxy needs a key for role credentials, or one fixed role")
         self.address, self.port, self.mode = address, port, mode
-        self.key, self.role, self.log, self.provisioning = key, role, log, provisioning
+        self.key, self.role, self.log = key, role, log
         self.configured = BASELINE_HOSTS + tuple(allow_hosts)
         self.granted = ()
         self.resolver, self.acceptable, self.opener = resolver, acceptable, opener
@@ -475,8 +467,7 @@ class EgressProxy:
     def set_granted(self, hosts) -> None:
         """Replace the granted hosts; open relays to a host no longer allowed are closed."""
         self.granted = tuple(hosts)
-        self._close_relays("revoked", lambda record: not self.allowed(
-            record["host"], record["role"]))
+        self._close_relays("revoked", lambda record: not self.allowed(record["host"]))
 
     def close_relays(self) -> None:
         """End every open relay: egress was cut off."""
@@ -496,13 +487,12 @@ class EgressProxy:
             except RuntimeError:
                 pass  # The loop closed meanwhile, and its relays with it.
 
-    def listed(self, host: str, identity: str | None = None) -> bool:
+    def listed(self, host: str) -> bool:
         """Whether the host is on the firm's list, as enforce mode decides it."""
-        setup = PROVISION_HOSTS if identity == PROVISION and self.provisioning() else ()
-        return permitted(host, self.configured + self.granted + setup)
+        return permitted(host, self.configured + self.granted)
 
-    def allowed(self, host: str, identity: str | None = None) -> bool:
-        return self.mode == "observe" or self.listed(host, identity)
+    def allowed(self, host: str) -> bool:
+        return self.mode == "observe" or self.listed(host)
 
     @property
     def alive(self) -> bool:
@@ -602,16 +592,10 @@ class EgressProxy:
             return None
         if not separator:
             return None
-        if user == PROVISION:
-            # The image's provisioning credential travels in Lima's cidata, which a role
-            # may read: it holds only until the new VM's guest controller is first ready.
-            if not self.provisioning():
-                return None
-        else:
-            try:
-                identifier(user)
-            except ValueError:
-                return None
+        try:
+            identifier(user)
+        except ValueError:
+            return None
         return user if hmac.compare_digest(secret, token(self.key, user)) else None
 
     def _finish(self, record):
@@ -653,7 +637,7 @@ class EgressProxy:
                 [("Proxy-Authenticate", 'Basic realm="firm"')],
             )
         record["role"] = role
-        record["listed"] = self.listed(host, role)
+        record["listed"] = self.listed(host)
         if port != PORTS[scheme]:
             return await self._deny(
                 writer, record, 403, "port", f"Only {scheme} on port {PORTS[scheme]} is allowed"
@@ -666,7 +650,7 @@ class EgressProxy:
             hostname(host)
         except ValueError:
             return await self._deny(writer, record, 400, "bad_host", f"Invalid host: {host}")
-        if not self.allowed(host, role):
+        if not self.allowed(host):
             return await self._deny(
                 writer, record, 403, "not_allowed", f"Host not allowed by the firm: {host}"
             )
@@ -709,7 +693,7 @@ class EgressProxy:
                 else:
                     reason = None if name == host else "sni_mismatch"
                     # The grant may have gone while the client was sending its hello.
-                    if reason is None and not self.allowed(host, role):
+                    if reason is None and not self.allowed(host):
                         reason = "revoked"
                 if reason is not None:
                     record["allowed"], logged = False, True
