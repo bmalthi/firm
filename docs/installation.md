@@ -165,7 +165,7 @@ Write three files inside `"$FIRM_DIR"`:
 ~/.local/bin/firm start "$FIRM_DIR" --sandbox-config "$FIRM_DIR/sandbox.toml"
 ```
 
-When `firm start "$FIRM_DIR"` returns JSON, give the user the `unlock_url` so they can watch the **Owner Console** in their browser (`http://127.0.0.1:8766/`). The first boot provisions the Ubuntu Linux VM in the background, which takes a few minutes before the Founder's first work period starts.
+When `firm start "$FIRM_DIR"` returns JSON, give the user the `unlock_url` so they can watch the **Owner Console** in their browser (`http://127.0.0.1:8766/`). The Linux VM starts in the background. The first firm on a Mac builds the shared Linux base image before the Founder's first work period starts.
 
 #### Step 6 — Monitor, message, and operate the firm via JSON CLI
 
@@ -232,9 +232,9 @@ Every guest VM's network interfaces are locked down at the host boundary: there 
 
 ## 5. First Boot, Provider Sign-In & Daily Use
 
-The first start downloads the Ubuntu cloud image and provisions the Linux guest, which can take several minutes. Keep the Mac connected to power and ensure enough free disk space for the VM. The owner console opens in your browser (`http://127.0.0.1:8766/` by default) and the local host continues running in the background after `firm start` returns and after its terminal closes. Bookmark the console URL to reconnect to the same firm.
+The first firm on a Mac builds the shared [Linux base image](linux-vm.md#create-and-start-a-firm), which can take several minutes. Later firms clone it and configure their guests offline. Keep the Mac connected to power and ensure enough free disk space for the VM. The owner console opens in your browser (`http://127.0.0.1:8766/` by default) and the local host continues running in the background after `firm start` returns and after its terminal closes. Bookmark the console URL to reconnect to the same firm.
 
-The console can be ready before the Linux VM finishes starting. If startup fails, the console stays available and shows the cause. Firm retries brief package-download problems and leaves incomplete setup safe to resume. Before clicking **Resume**, wait until the console confirms the VM has stopped; then retry from the console. If shutdown is still in progress, wait and check again.
+The console can be ready before the Linux VM finishes starting. If startup fails, the console stays available and shows the cause. Before clicking **Resume**, wait until the console confirms the VM has stopped; then retry from the console. If shutdown is still in progress, wait and check again.
 
 ### Provider sign-in and model defaults
 

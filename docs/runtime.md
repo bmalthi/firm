@@ -175,7 +175,7 @@ class entries are ordered low, medium, high. Quota and context depend on provide
 | [Web search](installation.md#4-default-firewall-web-search-and-network-egress) | Provider-side `web_search` | Provider-side `WebSearch` | Provider-side `search_web` for roles/tasks |
 | [Page fetch](linux-vm.md#network-access-and-cutoff) | Shell `curl` through firewall | `WebFetch` through firewall | Shell `curl` through firewall; native page fetch denied |
 | [Quota](#accounts-quota-and-recovery) / [context](#context-pressure) | Quota polling/stream; context from rollout | Quota stream (OAuth JSON also polling); context from stream | Unavailable |
-| [Provider network hosts](linux-vm.md#network-access-and-cutoff) | `*.openai.com`, `chatgpt.com`, `*.chatgpt.com` | `*.anthropic.com`, `*.claude.com` | `www.googleapis.com`, `daily-cloudcode-pa.googleapis.com`; `storage.googleapis.com` for setup only |
+| [Provider network hosts](linux-vm.md#network-access-and-cutoff) | `*.openai.com`, `chatgpt.com`, `*.chatgpt.com` | `*.anthropic.com`, `*.claude.com` | `www.googleapis.com`, `daily-cloudcode-pa.googleapis.com` |
 | Status | Supported | Supported | Experimental subscription provider |
 
 ### Claude

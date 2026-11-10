@@ -68,7 +68,8 @@ class FakeLinux:
         if run.vm_generation != self.generation:
             raise ValueError("Run belongs to a discarded VM generation")
 
-    def up(self):
+    def up(self, *, checkpoint=lambda: None):
+        checkpoint()
         self.calls.append("up")
         self.running = True
         return {"running": True}
@@ -293,6 +294,12 @@ def test_linux_disk_size_must_be_a_positive_integer(tmp_path, value):
         Config(tmp_path, disk_gib=value)
 
 
+def test_linux_disk_cannot_be_smaller_than_the_base_image(tmp_path):
+    with pytest.raises(ValueError, match="at least 20"):
+        Config(tmp_path, disk_gib=19)
+    assert Config(tmp_path, disk_gib=20).disk_gib == 20
+
+
 def test_linux_disk_size_is_configured_and_passed_to_the_vm(tmp_path):
     path = tmp_path / "sandbox.toml"
     path.write_text("[firm]\ndisk_gib = 120\n")
@@ -476,7 +483,7 @@ def test_file_forwards_start_only_after_both_vm_generations_exist(box, monkeypat
 
 
 def test_linux_failure_during_up_powers_off_partial_boot(box):
-    def broken():
+    def broken(**_):
         box.linux.running = True
         raise RuntimeError("guest initialization failed")
 
@@ -1141,7 +1148,7 @@ def test_sandbox_and_station_share_one_firm_lifecycle_lock(box):
     )
     linux_up = box.linux.up
 
-    def up():
+    def up(**_):
         held.append(("sandbox", lifecycle_lock_held(box.config)))
         station.helper_status()
         return linux_up()
@@ -1208,7 +1215,7 @@ def test_emergency_shutdown_drains_boot_and_stops_a_late_start(box):
     booting, release, first_stop = Event(), Event(), Event()
     events = []
 
-    def boot():
+    def boot(**_):
         booting.set()
         assert release.wait(2)
         events.append("boot")
@@ -1375,6 +1382,13 @@ def test_export_without_boot_uses_only_the_running_linux_vm(box):
     box.linux.running = True
     assert box.export(Path("/export")) == []
     assert box.linux.calls == ["export"]
+
+
+def test_never_ready_vm_exports_empty_drive_without_boot(box, tmp_path):
+    box.linux._state = lambda: {"ready": False}
+    assert box.export(tmp_path, homes=True, boot=True) == []
+    assert (tmp_path / "drive").is_dir()
+    assert box.linux.calls == []
 
 
 def test_discard_removes_both_guests_for_good_and_keeps_host_records(box, monkeypatch):

@@ -18,17 +18,18 @@ import subprocess
 import tarfile
 import tempfile
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
 
+from . import linux_base
 from .commands import Commands, VMStateError, lima_status, parse_lima_list, resize_instance
 from .compatibility import (
     COMPATIBILITY_GENERATION,
     release_identifier,
     validate_retained_vm,
 )
-from .egress_proxy import PROVISION
 from .guest_control import GuestControl, lifecycle, private_directory, read_record, save
 from .host_network import HostNetwork
 from .lima_paths import lima_paths
@@ -36,8 +37,6 @@ from .models import VMSettings
 
 INSTANCE = "linux"
 IMAGE = Path(__file__).with_name("assets") / "linux-vm.yaml"
-# The packaged provisioning recipe is the authority for the installed AGY version.
-AGY_VERSION = re.search(r"^\s*AGY_VERSION=(\d+\.\d+\.\d+)$", IMAGE.read_text(), re.MULTILINE)[1]
 PYTHON = "/usr/bin/python3"
 CONTROLLER = "/usr/local/libexec/firm-controller.py"
 PROVISION_MARKER = "/run/firm-provisioned"
@@ -72,10 +71,7 @@ GUEST_DEPENDENCIES = (
 )
 GUEST_DEPENDENCY_CHECK = "set -eu\n" + "\n".join(
     f"command -v {command} >/dev/null" for command in GUEST_DEPENDENCIES
-) + (
-    '\ntest -x /usr/local/lib/agy/agy'
-    f'\ntest "$(cat /usr/local/lib/agy/version)" = "{AGY_VERSION}"'
-)
+) + '\ntest -x /usr/local/lib/agy/agy'
 CONTROLLER_COMMAND = (PYTHON, "-I", CONTROLLER)
 # ${SUDO_USER} is the control user, known only inside the guest; _install_controller
 # substitutes it for this placeholder without expanding $msg or $programname there.
@@ -264,7 +260,7 @@ class LinuxVM(GuestControl):
         temporary.chmod(0o600)
         temporary.replace(path)
 
-    def _prepare(self) -> None:
+    def _prepare(self, *, checkpoint=lambda: None) -> None:
         if self.record.exists():
             validate_retained_vm(self._state())
         private_directory(self.root)
@@ -280,11 +276,7 @@ class LinuxVM(GuestControl):
             return
         if self.instance.exists() or self.paths.instance.exists():
             raise RuntimeError("Incomplete Linux VM exists; inspect it before recovery")
-        # The image's provisioning installs through the egress proxy like everything
-        # else in the guest; Lima hands the setting to it as $PARAM_FIRM_PROXY. Its
-        # credential holds until the guest provisioning script confirms its dependencies.
-        self.network.paths["provisioning"].touch(mode=0o600)
-        self.network.create_key()
+        base = linux_base.base_image(self.lima, checkpoint)
         self._lima(
             "create",
             f"--name={INSTANCE}",
@@ -294,7 +286,7 @@ class LinuxVM(GuestControl):
             "--mount-none",
             "--plain",
             "--tty=false",
-            f'--set=.param.FIRM_PROXY = "{self.network.proxy_url(PROVISION)}"',
+            f'--set=.images = {json.dumps([{"location": str(base), "arch": "aarch64"}])}',
             str(IMAGE),
             timeout=600,
         )
@@ -310,6 +302,10 @@ class LinuxVM(GuestControl):
                 "created_with_release": release_identifier(),
                 "compatibility_generation": COMPATIBILITY_GENERATION,
                 "image_id": hashlib.sha256(IMAGE.read_bytes()).hexdigest(),
+                "base_image": {
+                    "key": base.stem,
+                    "built": datetime.fromtimestamp(base.stat().st_mtime, UTC).isoformat(),
+                },
                 "cpus": self.settings.cpus,
                 "memory_gib": self.settings.memory_gib,
                 "subnet": self.subnet,
@@ -449,22 +445,12 @@ sync
             raise ValueError("Run belongs to a discarded VM generation")
 
     @lifecycle(exclusive=True)
-    def up(self) -> dict:
-        self._prepare()
+    def up(self, *, checkpoint=lambda: None) -> dict:
+        self._prepare(checkpoint=checkpoint)
+        checkpoint()
         state = self._state()
-        provisioning_pending = (
-            state.get("ready") is not True or self.network.paths["provisioning"].exists()
-        )
+        provisioning_pending = state.get("ready") is not True
         running = self._running()
-        if running and provisioning_pending:
-            # A previous first boot may have returned from Lima with an incomplete
-            # provisioning script. Restart it so cloud-init gets a fresh attempt while
-            # the host-side provisioning credential is still valid.
-            self._lima("stop", "--force", "--tty=false", INSTANCE)
-            if self._running():
-                raise RuntimeError("Linux VM shutdown was not confirmed")
-            self.paths.preserve_logs()
-            running = False
         if running and not self.network.ready():
             # A direct Lima restart can attach its own usernet instead of our
             # filter. Stop that NIC before rebuilding the boundary.
@@ -483,7 +469,8 @@ sync
                 # PID, never the controlling runtime's PID.
                 self.network.publish_lima_pid()
                 started = True  # From here a guest may be running, whatever Lima returns.
-                self._lima("start", "--tty=false", INSTANCE, timeout=1200)
+                # Lima's own startup wait is ten minutes; never cut it shorter.
+                self._lima("start", "--tty=false", INSTANCE, timeout=600)
                 if not self._running():
                     raise RuntimeError("Linux VM startup was not confirmed")
                 self.paths.mark_running()
@@ -518,8 +505,6 @@ sync
         state = self._state()
         state.update({"ready": True, "network_ready": self.network.ready()})
         save(self.record, state)
-        # Provisioning is over: from now on its credential is refused like any wrong one.
-        self.network.paths["provisioning"].unlink(missing_ok=True)
         return self.status()
 
     def status(self) -> dict:
@@ -691,5 +676,4 @@ sync
             raise RuntimeError("Linux VM was not removed")
         self.paths.remove_instance()
         self.record.unlink(missing_ok=True)
-        self.network.paths["provisioning"].unlink(missing_ok=True)
         return {"removed": True}

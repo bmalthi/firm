@@ -232,7 +232,7 @@ class Sandbox:
                 self._force_stopped.clear()
             try:
                 self._check_admission()
-                result = self.linux.up()
+                result = self.linux.up(checkpoint=self._check_admission)
                 self._check_admission()
                 if self.mac is not None:
                     self.mac.up(checkpoint=self._check_admission)
@@ -1068,6 +1068,10 @@ class Sandbox:
                 raise RuntimeError("The Linux VM is stopped, and this export may not boot it")
             return self.linux.export(destination, root=TREE, homes=homes)
         with lifecycle_locked(self.firm_locks, exclusive=True):
+            # An unfinished first boot has no role data to export.
+            if self.linux._state().get("ready") is not True:
+                (destination / "drive").mkdir(parents=True, exist_ok=True)
+                return []
             started = not self.linux._running()
             if started:
                 self.linux.up()

@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from firm_sandbox.linux_vm import IMAGE
+from firm_sandbox.linux_base import RECIPE
 
 from firm_runtime import github_credential
 from firm_runtime.github_credential import repository
@@ -59,7 +59,7 @@ def run(tmp_path, route):
     credentials.mkdir()
     shutil.copy(github_credential.__file__, credentials / "github-credential")
     (credentials / "activation-token").write_text(ACTIVATION_TOKEN)
-    template = IMAGE.read_text()
+    template = RECIPE.read_text()
     start = template.index("cat > /etc/gitconfig <<'GITCONFIG'\n")
     block = template[template.index("\n", start) + 1 : template.index("      GITCONFIG\n", start)]
     gitconfig = tmp_path / "gitconfig"

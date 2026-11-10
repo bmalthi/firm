@@ -14,7 +14,7 @@ import subprocess
 import tomllib
 from pathlib import Path
 
-from firm_sandbox import Config
+from firm_sandbox import Config, linux_base
 from firm_sandbox.compatibility import validate_firm_directories
 from firm_sandbox.host_paths import read_text_file
 
@@ -344,6 +344,30 @@ def _check_lima() -> dict:
     return _result(
         "lima", "good", f"Lima {'.'.join(map(str, version))} meets Firm's tested baseline."
     )
+
+
+def _check_linux_base(directory: Path) -> dict:
+    # Only a firm without a Linux VM yet is created from the base image.
+    if (directory / "durable" / "linux" / "vm.json").exists():
+        return _result("linux_base", "skipped", "This firm's Linux VM already exists.")
+    age = linux_base.image_age_days()
+    if age is None:
+        return _result(
+            "linux_base",
+            "good",
+            "No Linux base image yet; creating this firm's VM builds one (about 5 minutes).",
+        )
+    if age > linux_base.MAX_AGE_DAYS:
+        return _result(
+            "linux_base",
+            "warning",
+            f"The Linux base image is {age:.0f} days old; this firm's VM will start from it.",
+            action=(
+                f"To start from current updates instead, delete {linux_base.cache_directory()} "
+                "before starting the firm; it is rebuilt then (about 5 minutes)."
+            ),
+        )
+    return _result("linux_base", "good", f"The Linux base image is {age:.0f} days old.")
 
 
 def _host_memory_gib() -> float | None:
@@ -706,6 +730,7 @@ def check_setup(
 
     checks.append(_check_host_platform())
     checks.append(_check_lima())
+    checks.append(_check_linux_base(directory))
     if sandbox_settings is not None:
         checks.extend(
             _check_vm_resources(directory, sandbox_settings.memory_gib, sandbox_settings.disk_gib)

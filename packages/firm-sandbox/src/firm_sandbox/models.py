@@ -61,6 +61,8 @@ def firm_identifier(value: str) -> str:
 
 EGRESS_MODES = ("enforce", "observe")
 MAX_HOSTS = 256
+# The Linux base image's disk size; every firm's Linux VM disk starts as a clone of it.
+MIN_DISK_GIB = 20
 _LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 _HOSTNAME = re.compile(rf"{_LABEL}(?:\.{_LABEL})+")
 
@@ -149,6 +151,9 @@ class Config:
         resources = (self.cpus, self.memory_gib, self.disk_gib, self.mac_cpus, self.mac_memory_gib)
         if any(type(v) is not int or v <= 0 for v in resources):
             raise ValueError("VM resource values must be positive")
+        if self.disk_gib < MIN_DISK_GIB:
+            # The Linux VM is cloned from the base image, and Lima cannot shrink a disk.
+            raise ValueError(f"firm.disk_gib must be at least {MIN_DISK_GIB}")
         _absolute_image(self.mac_image, "mac.image")
         egress_mode(self.egress_mode)
         object.__setattr__(self, "allow_hosts", host_entries(self.allow_hosts))

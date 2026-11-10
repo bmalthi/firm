@@ -77,7 +77,8 @@ class FakeLinux:
     def _running(self):
         return self.running
 
-    def up(self):
+    def up(self, *, checkpoint=lambda: None):
+        checkpoint()
         self.calls.append("up")
         return {}
 

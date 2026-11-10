@@ -184,6 +184,7 @@ directory and require a sandbox that has not been bound to a different database.
 
 | Tool | Coverage | Arguments |
 | --- | --- | --- |
+| `linux_base.py` | Fresh Linux firms: boot seconds and unique machine IDs, SSH host keys, Samba SIDs and certificates; test firms are deleted afterwards | `--root NEW_PARENT --evidence DIR [--count N] [--parallel N]` |
 | `execution.py` | Two concurrent Linux roles with separate homes and daemons, account/host isolation, independent stop with an empty slice and its handed-over resource usage, filter loss, restart retention and whole-firm replacement | `--root FIRM_DIR --evidence DIR --replace` |
 | `dispatcher.py` | Deterministic programs through the real dispatcher: authenticated guest MCP, in-guest hiring, shared files, and private-home and manager-workspace write denial | `--root FIRM_DIR --evidence DIR [--keep-running]` |
 | `cleanup.py` | Deterministic programs through the real dispatcher: end-of-period handoff cleanup removing the founder's scratch and stopped container while its tagged image stays, expired temporary-role disposal that keeps the role employed and renewable, and fired-role disposal followed by guest and file-server identity retirement | `--root FIRM_DIR --evidence DIR [--keep-running]` |
@@ -195,6 +196,9 @@ directory and require a sandbox that has not been bound to a different database.
 | `network.py` | Closed egress, on a firm after `firm init` that is not started: from a role shell and a container, direct addresses, unproxied HTTP and DNS refused (DNS within 5 s), a baseline host reached through the proxy and `example.com` refused with a 403 the proxy log attributes to the role; the filter's blocked bytes for the direct attempts, host sentinel denial, `firm network allow` and `revoke` live with `network.hosts_changed`, a revoke closing the role's held tunnel to that host within 5 s while a held baseline tunnel survives, a leased station's proxy and `scutil --proxy` (skipped without `[mac]`), `firm network off` blocking the proxy path and retained across restart, `on` restoring it, named-volume retention and host–guest clock drift | `--root FIRM_DIR --evidence DIR [--station N]` |
 | `requests.py` | Owner requests through the real dispatcher, on a fresh firm whose runtime database it creates: a deterministic role's pending `request_access` in `firm analyze` inbox and readiness (`owner_request_pending`), the console's `needs_you` and `firm requests`; `grant` waking the role with Operations mail and the host reachable with no restart, shown in the `network` section and the proxy log; `deny --reason` answering `access_denied` with the note, for a host under the denied wildcard too; `firm network revoke` withdrawing the request | `--root FIRM_DIR --evidence DIR` |
 | `recovery.py` | Runtime loss, run adoption, settlement with an empty slice and retained container output | `--root FIRM_DIR --evidence DIR` |
+
+To force a Linux base rebuild before `linux_base.py`, delete
+`~/Library/Caches/firm/linux-base/`.
 
 The resource history has not yet run live. `docker.py` records the facts its readings
 assume (`uname -r`, `user.slice/cgroup.subtree_control`, `/proc/pressure/memory` and

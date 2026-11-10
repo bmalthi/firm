@@ -19,7 +19,7 @@ from uuid import uuid4
 import pytest
 import yaml
 
-from firm_sandbox import guest_control, linux_vm
+from firm_sandbox import guest_control, linux_base, linux_vm
 from firm_sandbox import lima_paths as paths_module
 from firm_sandbox.compatibility import COMPATIBILITY_GENERATION
 from firm_sandbox.models import VMSettings
@@ -45,7 +45,10 @@ def image(tmp_path):
 
 
 @pytest.fixture
-def vm(tmp_path):
+def vm(tmp_path, monkeypatch):
+    base = tmp_path / "base-key.img"
+    base.write_bytes(b"base disk")
+    monkeypatch.setattr(linux_base, "base_image", lambda *a: base)
     return linux_vm.LinuxVM(settings(tmp_path / "firm", tmp_path), limactl="/usr/local/bin/limactl")
 
 
@@ -117,100 +120,19 @@ def test_incompatible_vm_refuses_before_projecting_lima_files(vm, monkeypatch):
         vm._prepare()
 
 
-def test_shipped_image_installs_what_roles_need(image):
-    script = yaml.safe_load(image.read_text())["provision"][0]["script"]
-    for tool in (
-        "cifs-utils",
-        "acl",
-        "samba",
-        "uidmap",
-        "get.docker.com",
-        "uv",
-        "node",
-        "@anthropic-ai/claude-code",
-        "@openai/codex",
-        "modules-load.d",
-    ):
-        assert tool in script
-    assert "systemctl disable --now docker.service" in script
-    assert "Error-Mode=any update" in script and "install -y $PACKAGES" in script
-    assert script.index("rm -f /run/firm-provisioned") < script.index("apt-get")
-    assert script.index("for command in mount.cifs") < script.index("mv /run/firm-provisioned.new")
-    assert script.index("mv /run/firm-provisioned.new") > script.index("chown -R root:root")
-
-
-def test_shipped_image_resolves_nothing_and_provisions_through_the_proxy(image):
+def test_firm_recipe_configures_identity_and_marks_this_boot_ready(image):
     config = yaml.safe_load(image.read_text())
     assert config["dns"] == ["127.0.0.1"] and config["hostResolver"] == {"enabled": False}
     script = config["provision"][0]["script"]
-    # The proxy credential is exported before tracing starts, so it never reaches the log.
-    assert script.index('HTTPS_PROXY="$PARAM_FIRM_PROXY"') < script.index("set -x")
-    assert script.startswith("#!/bin/bash\nset -euo pipefail\n")
-    assert script.index("nameserver 127.0.0.1") < script.index("Error-Mode=any update")
+    assert "modprobe -a ip_tables iptable_nat nf_tables" in script
+    assert "net getlocalsid" in script
+    assert "make-ssl-cert generate-default-snakeoil" in script
+    assert script.index("rm -f /run/firm-provisioned") < script.index("for command in")
+    assert script.index("for command in") < script.index("mv /run/firm-provisioned.new")
 
 
-def test_every_first_boot_download_survives_a_timed_out_proxy_connection(image):
-    """First boots on 2026-11-09 failed when one connection to the proxy timed out: apt
-    marks the address bad for the rest of its run, so only a new apt-get recovers."""
-    script = yaml.safe_load(image.read_text())["provision"][0]["script"]
-    for step in (
-        # A failed index download must fail the update, or it is never retried.
-        "retry apt-get -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update",
-        "retry apt-get -o Acquire::Retries=3 install -y $PACKAGES",
-        'retry bash -o pipefail -c "$CURL https://get.docker.com | sh"',
-        'retry bash -o pipefail -c "$CURL https://astral.sh/uv/install.sh',
-    ):
-        assert step in script
-    assert script.index("retry() {") < script.index("retry apt-get")
-    downloads = [line.strip() for line in script.splitlines()
-                 if "https://" in line and "curl" in line or "$CURL" in line]
-    assert downloads and all("$CURL" in line or line.startswith("CURL=") for line in downloads)
-    assert 'CURL="curl --retry 10 --retry-all-errors' in script
-    # A piped transfer cannot be retried by curl once it has written part of it onward.
-    assert "| tar" not in script
-    assert "--fetch-retries 10" in script
-
-
-def test_provision_retry_reruns_a_failed_step_and_stops_after_five_tries(image, tmp_path):
-    script = yaml.safe_load(image.read_text())["provision"][0]["script"]
-    helper = script[script.index("retry() {"):script.index('CURL="curl')]
-    count = tmp_path / "count"
-    command = (
-        "set -euo pipefail\nsleep() { :; }\n" + helper
-        + 'step() { echo x >> "$COUNT"; [ "$(wc -l < "$COUNT")" -ge "$NEED" ]; }\n'
-        + 'retry step\necho done\n'
-    )
-
-    def run(need):
-        count.unlink(missing_ok=True)
-        result = subprocess.run(["bash", "-c", command], capture_output=True, text=True,
-                                env={**os.environ, "COUNT": str(count), "NEED": str(need)})
-        return result.returncode, len(count.read_text().splitlines())
-
-    assert run(3) == (0, 3)  # recovers on a later attempt
-    assert run(5) == (0, 5)  # the last attempt still counts
-    assert run(6)[0] != 0 and run(6)[1] == 5  # bounded: then the boot fails visibly
-
-
-def test_agy_pin_is_verified_before_install_and_required_at_readiness(image):
-    script = yaml.safe_load(image.read_text())["provision"][0]["script"]
-    assert "AGY_VERSION=1.5.3" in script
-    assert f"AGY_VERSION={linux_vm.AGY_VERSION}" in script
-    assert "1.5.3-6604829099950080/linux-arm/cli_linux_arm64.tar.gz" in script
-    assert script.index('sha512sum --check --status') < script.index('tar -xzf "$agy_stage')
-    assert script.index('install -o root -g root -m 0755 "$agy_stage/antigravity"') < script.index(
-        'install -o root -g root -m 0644 "$agy_stage/version"')
-    assert "agy" in linux_vm.GUEST_DEPENDENCIES
-    assert (f'test "$(cat /usr/local/lib/agy/version)" = "{linux_vm.AGY_VERSION}"'
-            in linux_vm.GUEST_DEPENDENCY_CHECK)
-    assert "--version" not in script
-    assert "--version" not in linux_vm.GUEST_DEPENDENCY_CHECK
-    assert script.index('test "$(cat /usr/local/lib/agy/version)"') < script.index(
-        'mv /run/firm-provisioned.new')
-
-
-def test_agy_wrapper_disables_updates_even_if_caller_enables_them(image, tmp_path):
-    script = yaml.safe_load(image.read_text())["provision"][0]["script"]
+def test_agy_wrapper_disables_updates_even_if_caller_enables_them(tmp_path):
+    script = yaml.safe_load(linux_base.RECIPE.read_text())["provision"][0]["script"]
     wrapper = script.split("cat > /usr/local/bin/agy <<'AGY'\n", 1)[1].split("\nAGY\n", 1)[0]
     binary = tmp_path / "binary"
     binary.write_text('#!/bin/sh\nprintf "%s\\n" "$AGY_CLI_DISABLE_AUTO_UPDATE" "$@"\n')
@@ -225,11 +147,11 @@ def test_agy_wrapper_disables_updates_even_if_caller_enables_them(image, tmp_pat
 
 
 @pytest.mark.parametrize("valid_checksum", [False, True])
-def test_agy_install_stamp_requires_verified_payload_and_skips_cached_install(
-    image, tmp_path, valid_checksum
+def test_agy_install_requires_verified_payload(
+    tmp_path, valid_checksum
 ):
-    script = yaml.safe_load(image.read_text())["provision"][0]["script"]
-    block = script[script.index('if [ ! -x /usr/local/lib/agy/agy ]'):script.index(
+    script = yaml.safe_load(linux_base.RECIPE.read_text())["provision"][0]["script"]
+    block = script[script.index('agy_stage=$(mktemp -d)'):script.index(
         "# Enforce the vendor's opt-out")]
     # Run the real install/check block as an ordinary user in a disposable prefix.
     block = block.replace('/usr/local/lib/agy', '"$INSTALL_ROOT"')
@@ -249,7 +171,7 @@ def test_agy_install_stamp_requires_verified_payload_and_skips_cached_install(
     env = {
         **os.environ, "INSTALL_ROOT": str(installed), "FIXTURE": str(archive),
         "DOWNLOADS": str(downloads), "PROVIDER_STARTED": str(started),
-        "AGY_VERSION": "1.5.3", "AGY_URL": "https://unused.invalid/pinned.tar.gz",
+        "AGY_URL": "https://unused.invalid/pinned.tar.gz",
         "AGY_SHA512": checksum,
     }
     command = (
@@ -262,24 +184,9 @@ def test_agy_install_stamp_requires_verified_payload_and_skips_cached_install(
 
     assert (run().returncode == 0) is valid_checksum
     assert not started.exists()
-    if not valid_checksum:
-        assert not (installed / "version").exists()
-        assert not (installed / "agy").exists()
-        return
-    assert (installed / "version").read_text() == "1.5.3\n"
-    assert run().returncode == 0
+    assert (installed / "agy").exists() is valid_checksum
     assert downloads.read_text().splitlines() == ["download"]
-    # Stale metadata and a missing executable each require a verified reinstall.
-    (installed / "version").write_text("old\n")
-    assert run().returncode == 0
-    (installed / "agy").unlink()
-    failed_install = command.replace('install -m 0755 "$agy_stage/antigravity"', 'false')
-    assert subprocess.run(["bash", "-c", failed_install], env=env,
-                          capture_output=True).returncode != 0
-    assert not (installed / "version").exists()
-    assert run().returncode == 0
-    assert downloads.read_text().splitlines() == ["download"] * 4
-    assert not started.exists()
+
 
 
 def test_force_down_powers_off_before_cleanup_without_lifecycle_lock(vm, monkeypatch):
@@ -358,7 +265,7 @@ def test_lifecycle_takes_the_firm_lifecycle_lock_exclusively(vm, monkeypatch, op
     class Reached(Exception):
         pass
 
-    def body():
+    def body(**_):
         taken.append("body")
         raise Reached
 
@@ -420,7 +327,7 @@ def test_pid_publication_failure_stops_vm_and_filter_even_when_lima_stop_fails(
     vm, monkeypatch, tmp_path, stop_fails
 ):
     calls = []
-    monkeypatch.setattr(vm, "_prepare", lambda: None)
+    monkeypatch.setattr(vm, "_prepare", lambda **_: None)
     monkeypatch.setattr(vm, "_state", lambda: {})
     monkeypatch.setattr(vm, "_running", lambda: False)
     network = tmp_path / "network"
@@ -431,7 +338,6 @@ def test_pid_publication_failure_stops_vm_and_filter_even_when_lima_stop_fails(
             "scratch": network,
             "config": network / "config.json",
             "pid": network / "usernet.pid",
-            "provisioning": network / "provisioning",
         },
     )
     monkeypatch.setattr(vm.network, "stop", lambda: calls.append("filter-stop"))
@@ -466,7 +372,7 @@ def test_pid_publication_failure_stops_vm_and_filter_even_when_lima_stop_fails(
     assert not vm.network.paths["pid"].exists()
 
 
-def test_first_boot_requires_current_provisioning_marker_and_retries_with_credential(
+def test_first_boot_requires_current_provisioning_marker_before_controller(
     vm, monkeypatch
 ):
     vm.root.mkdir(parents=True)
@@ -474,9 +380,8 @@ def test_first_boot_requires_current_provisioning_marker_and_retries_with_creden
     guest_running = False
     calls = []
     provision_attempts = 0
-    vm.network.paths["provisioning"].touch()
 
-    monkeypatch.setattr(vm, "_prepare", lambda: None)
+    monkeypatch.setattr(vm, "_prepare", lambda **_: None)
     monkeypatch.setattr(vm, "_state", lambda: state)
     monkeypatch.setattr(guest_control, "save", lambda _path, value: state.update(value))
     monkeypatch.setattr(vm, "status", lambda: {"running": True})
@@ -520,17 +425,15 @@ def test_first_boot_requires_current_provisioning_marker_and_retries_with_creden
     with pytest.raises(RuntimeError, match="provisioning did not complete"):
         vm.up()
     assert state["ready"] is False
-    assert vm.network.paths["provisioning"].exists()
     assert "install-controller" not in calls and "initialize" not in calls
     assert not guest_running
 
-    # A later start retries cloud-init with the same temporary proxy credential.
+    # A later start retries the offline configuration stage.
     calls.clear()
     assert vm.up() == {"running": True}
     assert calls.index("verify-provisioning") < calls.index("install-controller")
     assert calls.index("install-controller") < calls.index("initialize")
     assert state["ready"] is True
-    assert not vm.network.paths["provisioning"].exists()
 
 
 def test_ready_compatible_vm_uses_dependency_check_without_new_recipe_marker(vm, monkeypatch):
@@ -552,10 +455,8 @@ def first_boot(vm, monkeypatch, *, ready=False, start_fails=None, verify_fails=N
     """``vm.up()`` with Lima, the filter and the guest faked; returns the calls in order."""
     vm.root.mkdir(parents=True)
     state = {"ready": ready, "controller_digest": "old"}
-    if not ready:
-        vm.network.paths["provisioning"].touch()
     calls, guest = [], {"running": False}
-    monkeypatch.setattr(vm, "_prepare", lambda: None)
+    monkeypatch.setattr(vm, "_prepare", lambda **_: None)
     monkeypatch.setattr(vm, "_state", lambda: state)
     monkeypatch.setattr(guest_control, "save", lambda _path, value: state.update(value))
     for name in ("mark_running", "synchronize", "preserve_logs"):
@@ -653,7 +554,7 @@ def test_a_provisioned_vm_that_fails_to_start_copies_no_first_boot_logs(vm, monk
 def test_up_recovers_unfiltered_vm_only_after_confirmed_shutdown(vm, monkeypatch, stops):
     calls = []
     running = iter([True, not stops, True, True])
-    monkeypatch.setattr(vm, "_prepare", lambda: None)
+    monkeypatch.setattr(vm, "_prepare", lambda **_: None)
     monkeypatch.setattr(
         vm, "_state", lambda: {"ready": True, "controller_digest": "installed"}
     )
@@ -711,13 +612,14 @@ def test_create_applies_resources_and_records_the_generation(vm, monkeypatch, tm
     create = next(call for call in calls if call[0] == "create")
     assert "--name=linux" in create and "--cpus=8" in create and "--memory=24" in create
     assert f"--disk={disk_gib}" in create
-    # Provisioning installs through the proxy, as itself, never as a role.
-    assert vm.network.paths["provisioning"].exists()
     (setting,) = [arg for arg in create if arg.startswith("--set=")]
-    assert setting == f'--set=.param.FIRM_PROXY = "{vm.network.proxy_url("_provision")}"'
-    assert f"@{vm.network.gateway}:{vm.network.proxy_port}" in setting
+    assert json.loads(setting.split(" = ", 1)[1]) == [
+        {"location": str(tmp_path / "base-key.img"), "arch": "aarch64"}
+    ]
     assert create[-1] == str(linux_vm.IMAGE)
     record = json.loads(vm.record.read_text())
+    assert record["base_image"]["key"] == "base-key"
+    assert record["base_image"]["built"].endswith("+00:00")
     assert record["generation"] and record["firm_id"] == "firm" and record["ready"] is False
     assert record["subnet"] == vm.subnet and vm.subnet.startswith("192.168.")
     networks = yaml.safe_load((vm.paths.home / "_config" / "networks.yaml").read_text())
@@ -1245,7 +1147,10 @@ def test_long_paths_share_the_short_lima_and_filter_runtime(projected):
     assert "proxy" not in " ".join(projected.commands.env).lower()
 
 
-def test_create_publishes_disk_then_resume_reconstructs_runtime(projected, monkeypatch):
+def test_create_publishes_disk_then_resume_reconstructs_runtime(projected, monkeypatch, tmp_path):
+    base = tmp_path / "base.img"
+    base.write_bytes(b"base")
+    monkeypatch.setattr(linux_base, "base_image", lambda *a: base)
     calls = []
 
     def lima(*args, **kwargs):

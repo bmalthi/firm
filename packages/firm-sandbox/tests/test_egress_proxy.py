@@ -17,8 +17,6 @@ import pytest
 
 from firm_sandbox.egress_proxy import (
     BASELINE_HOSTS,
-    PROVISION,
-    PROVISION_HOSTS,
     EgressProxy,
     RequestLog,
     Summary,
@@ -289,26 +287,7 @@ def test_agy_hosts_are_exact_and_do_not_include_host_renewal_or_optional_service
         assert not permitted(host, BASELINE_HOSTS)
 
 
-def test_setup_hosts_require_live_provision_identity(start, tmp_path):
-    provisioning = [True]
-    proxy = start(provisioning=lambda: provisioning[0])
-    host = "storage.googleapis.com"
-    assert PROVISION_HOSTS == (host,)
-    assert not permitted(host, BASELINE_HOSTS)
-    assert tunnel(proxy, host, PROVISION).startswith(b"HTTP/1.1 200")
-    assert tunnel(proxy, host, "analyst").startswith(b"HTTP/1.1 403")
-    provisioning[0] = False
-    assert tunnel(proxy, host, PROVISION).startswith(b"HTTP/1.1 407")
-    assert not proxy.listed(host, PROVISION)
-    assert [(r["role"], r["listed"], r["reason"]) for r in records(tmp_path, 3)] == [
-        (PROVISION, True, None), ("analyst", False, "not_allowed"),
-        ("unknown", False, "credentials"),
-    ]
-    for baseline in BASELINE_HOSTS:
-        assert proxy.listed(baseline.replace("*.", "test."), "analyst")
-
-
-def test_setup_host_owner_grants_and_observe_mode_are_unchanged(start):
+def test_host_outside_baseline_obeys_owner_grants_and_observe_mode(start):
     host = "storage.googleapis.com"
     proxy = start()
     proxy.set_granted((host,))
@@ -316,9 +295,8 @@ def test_setup_host_owner_grants_and_observe_mode_are_unchanged(start):
     proxy.set_granted(())
     assert tunnel(proxy, host, "analyst").startswith(b"HTTP/1.1 403")
     observed = start(mode="observe")
-    assert not observed.listed(host, "analyst")
+    assert not observed.listed(host)
     assert tunnel(observed, host, "analyst").startswith(b"HTTP/1.1 200")
-    assert tunnel(observed, host, PROVISION).startswith(b"HTTP/1.1 407")
 
 
 def test_connect_to_an_allowed_name_tunnels_and_is_logged_and_summarized(start, tmp_path):
@@ -379,6 +357,7 @@ def test_a_grant_or_a_configured_suffix_takes_effect_without_a_restart(start):
     credentials("analyst", "0" * 64),
     credentials("analyst", token(KEY, "other")),
     credentials("Analyst"),
+    credentials("_internal"),
     b"Proxy-Authorization: Bearer abc\r\n",
     b"Proxy-Authorization: Basic not-base64!\r\n",
     credentials("analyst") + credentials("analyst"),
@@ -395,20 +374,6 @@ def test_missing_or_wrong_credentials_get_407_and_are_logged_as_unknown(
         "unknown", False, "credentials"
     )
     assert proxy.dialed == []
-
-
-def test_the_provisioning_credential_holds_only_while_the_vm_provisions(start, tmp_path):
-    provisioning = [True]
-    proxy = start(provisioning=lambda: provisioning[0])
-    assert tunnel(proxy, "api.anthropic.com", PROVISION).startswith(b"HTTP/1.1 200")
-    provisioning[0] = False
-    assert tunnel(proxy, "api.anthropic.com", PROVISION).startswith(b"HTTP/1.1 407")
-    assert [(record["role"], record["reason"]) for record in records(tmp_path, 2)] == [
-        (PROVISION, None), ("unknown", "credentials"),
-    ]
-    # A role's credential is unaffected either way, and the default never provisions.
-    assert tunnel(proxy, "api.anthropic.com").startswith(b"HTTP/1.1 200")
-    assert tunnel(start(), "api.anthropic.com", PROVISION).startswith(b"HTTP/1.1 407")
 
 
 # ---- ports, addresses, framing ----------------------------------------------------------

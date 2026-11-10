@@ -6,6 +6,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -312,12 +313,38 @@ def test_check_refuses_durable_symlink_before_opening_external_database(tmp_path
         lambda: {"check": "lima", "status": "good", "message": "test"},
     )
     monkeypatch.setattr("firm_runtime.setup_check._check_vm_resources", lambda *args: [])
+    monkeypatch.setattr(
+        "firm_runtime.setup_check._check_linux_base",
+        lambda directory: {"check": "linux_base", "status": "good", "message": "test"},
+    )
 
     report = check_setup(directory, check_ports=False)
     database_check = next(item for item in report["checks"] if item["check"] == "database")
     assert database_check["status"] == "failure"
     assert "durable parent" in database_check["message"]
     assert (database.read_bytes(), durable.stat().st_mode, durable.stat().st_mtime_ns) == before
+
+
+def test_check_reports_linux_base_age_only_for_a_firm_without_a_vm(tmp_path, monkeypatch):
+    from firm_sandbox import linux_base
+
+    from firm_runtime.setup_check import _check_linux_base
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setattr(linux_base, "cache_directory", lambda: cache)
+    firm = tmp_path / "firm"
+    assert "builds one" in _check_linux_base(firm)["message"]
+    image = cache / f"{linux_base.image_key()}.img"
+    image.touch()
+    assert _check_linux_base(firm)["status"] == "good"
+    old = time.time() - (linux_base.MAX_AGE_DAYS + 1) * 86400
+    os.utime(image, (old, old))
+    report = _check_linux_base(firm)
+    assert report["status"] == "warning" and str(cache) in report["action"]
+    (firm / "durable" / "linux").mkdir(parents=True)
+    (firm / "durable" / "linux" / "vm.json").write_text("{}")
+    assert _check_linux_base(firm)["status"] == "skipped"
 
 
 def test_start_uses_local_sandbox_config_and_reports_startup_failure(tmp_path, monkeypatch, capsys):

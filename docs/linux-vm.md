@@ -18,12 +18,10 @@ why, and what it does not.
 - [Network access and cutoff](#network-access-and-cutoff)
 - [Development limits](#development-limits)
 
-The first boot trusts the configured Ubuntu image and package repositories, Docker's
-installation script, Astral's uv installer, and the pinned Node/provider CLI downloads
-in `assets/linux-vm.yaml`. Docker and uv installers execute as guest root and are not
-pinned by content digest. The egress allowlist limits destinations; it does not verify
-publisher content. Review the recipe before provisioning where that supply-chain
-trust is unacceptable.
+The base image trusts the pinned Ubuntu cloud image, Ubuntu package repositories,
+Docker's installation script, Astral's uv installer, and the pinned Node/provider CLI
+downloads in `assets/linux-base.yaml`. Docker and uv installers execute as guest root
+and are not pinned by content digest.
 
 ## Create and start a firm
 
@@ -42,20 +40,33 @@ egress = "enforce"
 allow_hosts = []
 ```
 
-`[firm]` sizes the Linux VM; there is no image to build for it. Edit `cpus` or
+`[firm]` sizes the Linux VM. Edit `cpus` or
 `memory_gib` later and the stopped VM takes the new size on its next boot, keeping its
 disk; size them from
 [its resource history](runtime.md#sizing-a-firm-from-its-resource-history) after a week
-of real use. `disk_gib` is a positive integer in GiB, default 60, used only when
+of real use. `disk_gib` is an integer in GiB, at least 20 (the base image's size), default 60, used only when
 creating the Linux VM. Editing it leaves an existing firm's disk unchanged.
-Its first boot
-downloads the Ubuntu cloud image and installs Docker, Samba, cifs-utils, uv, Node,
-Claude Code and Codex, which takes several minutes. Every download goes through the
-firm's egress proxy, and each downloading step retries a failed attempt as a new process
-up to five times. If provisioning still does not complete, `firm start` fails and copies
-the end of the guest's `cloud-init-output.log` and `cloud-init.log` to
-`durable/linux/provision.log` before the VM powers off; the error names that file. The
-next `firm start` retries provisioning, and steps that completed are skipped.
+
+New VMs clone a shared software base image cached at
+`~/Library/Caches/firm/linux-base/`. Firm builds it once per Mac on ordinary Apple
+Virtualization networking, outside the firm's network and egress proxy. The base
+contains Docker, Samba, cifs-utils, uv, Node, Claude Code, Codex and AGY. Each firm's
+boot performs only offline configuration behind its sandbox network and creates
+its own machine ID, SSH host keys, Samba SID and certificate.
+
+Firm builds a new base when there is none or its recipe or generalize script
+changed, and then deletes images from earlier recipes. It never rebuilds an image
+just because it is old: once the image is over 30 days old, `firm check` on a firm
+without a VM yet says so, and you choose when to rebuild by deleting
+`~/Library/Caches/firm/linux-base/`. The next new firm then builds a fresh image with
+current updates. Existing VMs keep the tool versions they were created with; discard
+the VM or create a new firm to get newer versions. Build failures keep cloud-init and Lima logs in
+`~/Library/Caches/firm/linux-base/build-logs/`.
+
+If a firm's first boot fails, Firm copies the end of `cloud-init-output.log` and
+`cloud-init.log` to `durable/linux/provision.log` before powering off; the error
+names that file.
+
 The guest has no time source (Lima's plain mode runs no guest agent, and no time
 server is reachable), so each run's launch sets the guest clock to the host's when
 they differ by more than 2 seconds, for example after the host slept.
@@ -318,18 +329,13 @@ A guest reaches the internet only by name, through a proxy the host runs beside 
 VM's packet filter. The filter lets nothing else out: no direct connection to any
 address, no UDP, no DNS. The proxy resolves names itself and admits a request when
 its host is on the firm's allowlist: the built-in baseline (the provider APIs, GitHub,
-the package registries, the image's package mirrors, `astral.sh` and its installer
+the package registries, Ubuntu and Debian package mirrors, `astral.sh` and its installer
 redirect host `releases.astral.sh`, and, for a Mac, Apple's download hosts),
 `[network] allow_hosts` in `sandbox.toml`, and the hosts the owner granted while the
 firm ran. An entry is an exact lower-case name or `*.example.com` for every subdomain.
 Anything else is refused with `403`, which a role reads as a host the firm has not
 allowed yet and asks for with `request_access`; see
 [owner requests](runtime.md#owner-requests).
-
-The separate setup-only list contains `storage.googleapis.com`, for the pinned AGY
-archive. Only the authenticated `_provision` identity can use that list, until the
-guest controller is first ready. Roles need an ordinary owner grant for this host;
-it is omitted from the role baseline shown by status, analysis and the console.
 
 Every role's run carries the proxy in its environment with a credential that names
 the role, so `curl`, `git`, `uv`, `npm`, `apt`, Claude Code and Codex go through it

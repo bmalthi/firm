@@ -16,6 +16,14 @@
 
 ---
 
+## Linux Base Image
+
+The shared Linux base builder runs the trusted installation recipe on ordinary
+Apple Virtualization NAT, outside the firm boundary. It has no roles, firm data,
+credentials or host mounts. This permits software downloads without exposing
+untrusted work to that network. Its generalized disk supplies new firm VMs, which
+boot behind the packet filter and egress proxy before any role runs.
+
 ## Roles on the Linux VM
 
 Each hired role is provisioned on the Linux VM in two phases (recording the identity in the guest ledger before creating the user so interrupted provisioning is idempotent):
