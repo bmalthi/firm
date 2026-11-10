@@ -67,7 +67,8 @@ def test_smb_conf_binds_loopback_and_keeps_clients_from_changing_permissions():
 def test_start_configures_samba_owner_and_forwards_a_stable_port(server):
     access = server.start()
     port = json.loads(server.record.read_text())["port"]
-    assert access["url"] == f"smb://{OWNER}@127.0.0.1:{port}/{SHARE}"
+    # A host name per firm: macOS refuses a second firm's drive under the same name.
+    assert access["url"] == f"smb://{OWNER}@firm-{port}.localhost:{port}/{SHARE}"
     assert access["password"] and access["path"] == "/srv/firm"
     setup = dict(server.log)["setup"]
     assert ["groupadd", "-f", "firmfiles"] in setup

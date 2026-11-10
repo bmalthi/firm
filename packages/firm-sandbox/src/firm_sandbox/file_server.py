@@ -225,8 +225,11 @@ class FileServer:
         ledger = self._load()
         if ledger["port"] is None:
             raise RuntimeError("File server is not started")
+        # macOS keeps one SMB session per server name and user, not per port: a second
+        # firm's drive at 127.0.0.1 would be refused while the first is mounted. Every
+        # *.localhost name is loopback, so a name per firm's port keeps them apart.
         return {
-            "url": f"smb://{OWNER}@127.0.0.1:{ledger['port']}/{SHARE}",
+            "url": f"smb://{OWNER}@firm-{ledger['port']}.localhost:{ledger['port']}/{SHARE}",
             "user": OWNER,
             "password": ledger["owner_password"],
             "path": TREE,

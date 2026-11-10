@@ -50,7 +50,16 @@ of real use. `disk_gib` is a positive integer in GiB, default 60, used only when
 creating the Linux VM. Editing it leaves an existing firm's disk unchanged.
 Its first boot
 downloads the Ubuntu cloud image and installs Docker, Samba, cifs-utils, uv, Node,
-Claude Code and Codex, which takes several minutes. `[network]` names the hosts the
+Claude Code and Codex, which takes several minutes. Every download goes through the
+firm's egress proxy, and each downloading step retries a failed attempt as a new process
+up to five times. If provisioning still does not complete, `firm start` fails and copies
+the end of the guest's `cloud-init-output.log` and `cloud-init.log` to
+`durable/linux/provision.log` before the VM powers off; the error names that file. The
+next `firm start` retries provisioning, and steps that completed are skipped.
+The guest has no time source (Lima's plain mode runs no guest agent, and no time
+server is reachable), so each run's launch sets the guest clock to the host's when
+they differ by more than 2 seconds, for example after the host slept.
+`[network]` names the hosts the
 firm's VMs may reach beyond the built-in baseline, and `egress = "observe"` logs every
 host without refusing any, for finding out what a new workload needs; see
 [network access](#network-access-and-cutoff). An optional `[mac]` table names an enrolled
@@ -272,8 +281,13 @@ channels, so the share never crosses a network interface or the packet filter. T
 owner login `firmowner` is a Samba admin user. Use **Results** in the console to
 browse and download deliverables directly, or inspect the SMB URL and password with
 `firm-sandbox --config PATH data-status` and run
-`mount_smbfs //firmowner@127.0.0.1:<port>/firm <directory>` (or open the URL in Finder)
-when you want a host mount; see [runtime operations](runtime.md#start-and-stop).
+`mount_smbfs //firmowner@firm-<port>.localhost:<port>/firm <directory>` (or open the
+URL in Finder) when you want a host mount; see
+[runtime operations](runtime.md#start-and-stop). The URL names the host as
+`firm-<port>.localhost`, which macOS resolves to loopback, rather than `127.0.0.1`:
+macOS keeps one SMB session per server name and user, so with a shared name a second
+firm's drive is refused with "Authentication error" while another firm's is mounted.
+Mount each firm with its own URL and several can be open at once.
 The port and password are chosen once per firm and survive stop, start and host
 restarts; only discarding the VMs replaces them.
 

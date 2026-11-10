@@ -61,17 +61,37 @@ provision:
       # https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_arm64.json
       AGY_SHA512=c2fac818b3c1bb224079df03a714ccba99728b6a3a41d86d247ab2feb8582a43840c5032f1c2b75e72667623d5503e7ffda2712c4f37b6ee19f99c3fcfb25bae
       export AGY_CLI_DISABLE_AUTO_UPDATE=true
+      # Every download goes to one address, the egress proxy, and under load a
+      # connection to it occasionally times out. apt's http method then marks that
+      # address bad and, without trying, fails every later request of the same
+      # apt-get run, so its own retries cannot recover. A step that downloads is run
+      # again as a new process instead; finished downloads are kept.
+      retry() {
+        local attempt
+        for attempt in 1 2 3 4; do
+          if "$@"; then
+            return 0
+          fi
+          echo "firm-provision: attempt $attempt failed, retrying: $*" >&2
+          sleep 10
+        done
+        "$@"
+      }
+      CURL="curl --retry 10 --retry-all-errors --retry-max-time 600 -fsSL"
       # This script runs on every boot. Each step is skipped once its result is
       # already on the disk, so a restart needs no apt or npm registry: a stall
       # there otherwise outlives the VM's readiness window and the start fails.
       PACKAGES="cifs-utils acl samba samba-vfs-modules uidmap dbus-user-session
         curl xz-utils git gh build-essential"
       if ! dpkg -s $PACKAGES >/dev/null 2>&1; then
-        apt-get -o Acquire::Retries=3 update
-        apt-get -o Acquire::Retries=3 install -y $PACKAGES
+        # By default an index that failed to download is only a warning, and the install
+        # then fails on every attempt for want of it: fail the update so it is retried.
+        retry apt-get -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update
+        retry apt-get -o Acquire::Retries=3 install -y $PACKAGES
       fi
       if ! command -v docker >/dev/null; then
-        curl -fsSL https://get.docker.com | sh
+        # The installer runs apt-get through the proxy too.
+        retry bash -o pipefail -c "$CURL https://get.docker.com | sh"
       fi
       # Every role runs its own rootless daemon under its slice; there is no shared
       # daemon, and the privileged system units stay off.
@@ -82,12 +102,16 @@ provision:
       # The file server; the guest controller writes its configuration on every start.
       systemctl disable --now nmbd || true
       if [ ! -x /usr/local/bin/uv ]; then
-        curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin \
-          UV_NO_MODIFY_PATH=1 sh
+        retry bash -o pipefail -c "$CURL https://astral.sh/uv/install.sh \
+          | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh"
       fi
       if [ ! -x /usr/local/bin/node ]; then
-        curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-arm64.tar.xz" \
-          | tar -xJ -C /usr/local --strip-components=1 --no-same-owner
+        # To a file first: curl cannot retry a transfer it has already piped onward.
+        node_archive=$(mktemp)
+        $CURL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-arm64.tar.xz" \
+          -o "$node_archive"
+        tar -xJf "$node_archive" -C /usr/local --strip-components=1 --no-same-owner
+        rm -f "$node_archive"
       fi
       installed() {
         /usr/local/bin/node -p \
@@ -96,7 +120,7 @@ provision:
       }
       if [ "$(installed @anthropic-ai/claude-code)" != "${CLAUDE_CODE_VERSION}" ] \
         || [ "$(installed @openai/codex)" != "${CODEX_VERSION}" ]; then
-        npm install -g --prefix /usr/local \
+        npm install -g --prefix /usr/local --fetch-retries 10 --fetch-retry-maxtimeout 60000 \
           "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@openai/codex@${CODEX_VERSION}"
       fi
       # Like npm's package metadata above, inspect installation metadata without
@@ -105,7 +129,7 @@ provision:
         || [ "$(cat /usr/local/lib/agy/version 2>/dev/null || true)" != "${AGY_VERSION}" ]; then
         agy_stage=$(mktemp -d)
         trap 'rm -rf "$agy_stage"' EXIT
-        curl -fsSL "$AGY_URL" -o "$agy_stage/agy.tar.gz"
+        $CURL "$AGY_URL" -o "$agy_stage/agy.tar.gz"
         printf '%s  %s\n' "$AGY_SHA512" "$agy_stage/agy.tar.gz" | sha512sum --check --status
         tar -xzf "$agy_stage/agy.tar.gz" -C "$agy_stage" --no-same-owner antigravity
         install -d -o root -g root -m 0755 /usr/local/lib/agy

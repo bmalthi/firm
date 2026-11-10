@@ -54,6 +54,7 @@ FILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}\.[a-z0-9]{1,8}")
 MAX_LOG_BYTES = 64 * 1024 * 1024
 CHILD_LOG_BYTES = 4 * 1024 * 1024
 CHILD_STOP_TIMEOUT = 2.0
+CLOCK_TOLERANCE = 2.0  # Guest and host clocks further apart than this are stepped at launch.
 SETTLE_TIMEOUT = 20.0
 DISPOSE_DAEMON_TIMEOUT = 15.0  # User manager, daemon and socket share this budget.
 DOCKER_PRUNE_BUDGET = 30.0
@@ -1531,6 +1532,25 @@ def supervise(run_id):
 # ---- task children: separate journals, no account lifecycle -----------------------------
 
 
+def step_clock(request):
+    """Set the guest clock to the host's ``host_time`` when the two differ by more than
+    ``CLOCK_TOLERANCE`` seconds; the field is removed from the request, so a retried
+    launch keeps its fingerprint. ``main`` calls it as the request arrives, before the
+    global lock, so the time is only as old as its transport.
+
+    Nothing else keeps this clock right: Lima's plain mode runs no guest agent to sync it,
+    and the guest reaches no time server. While the host sleeps the guest clock stops and
+    then lags, and a launch reads credential lifetimes and deadlines against it.
+    """
+    host_time = request.pop("host_time", None)
+    if host_time is None:
+        return
+    if type(host_time) not in (int, float) or not math.isfinite(host_time) or host_time <= 0:
+        raise ValueError("Invalid host time")
+    if abs(host_time - time.time()) > CLOCK_TOLERANCE:
+        time.clock_settime(time.CLOCK_REALTIME, host_time)
+
+
 def validate_seconds_remaining(value):
     if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
         raise ValueError("Invalid child seconds remaining")
@@ -2446,7 +2466,12 @@ def export(request, stream):
     if not isinstance(request.get("homes"), bool):
         raise ValueError("Export homes must be a boolean")
     with tarfile.open(fileobj=stream, mode="w|", copybufsize=1024 * 1024) as archive:
-        archive.add(root, arcname="drive")
+        try:
+            os.lstat(root)
+        except FileNotFoundError:
+            pass  # provisioning may have failed before the shared drive existed
+        else:
+            archive.add(root, arcname="drive")
         if request["homes"]:
             for role, info in sorted(database()["roles"].items()):
                 if "home" not in info:
@@ -2555,6 +2580,10 @@ def main():
             # Reboot reconciliation in child_status takes the child lock itself.
             result = dispatch(request)
         else:
+            if request["operation"] in {"start", "start-child"}:
+                # Before the global lock: a launch that waits there behind another
+                # role's work would otherwise set the clock to when it was sent.
+                step_clock(request)
             with lock():
                 result = dispatch(request)
         reply = {"ok": True, "result": result}

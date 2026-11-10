@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import shutil
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -909,6 +910,9 @@ def test_lost_start_reply_retries_the_same_run_identity(box, clean_up):
 
     box.linux._rpc = rpc
     run = box.start(RunSpec("analyst", ("true",), clean_up=clean_up))
+    # The same request, but each send carries the host's clock as of that send.
+    times = [payload.pop("host_time") for _, payload in calls]
+    assert times[0] <= times[1] <= time.time()
     assert len(calls) == 2 and calls[0] == calls[1]
     assert calls[0][1]["run_id"] == run.run_id
     assert calls[0][1]["clean_up"] is clean_up
@@ -2016,6 +2020,7 @@ def test_child_rpc_facade_carries_worker_launch_settings(box, monkeypatch):
     assert box.child_logs("task-one", offset=2, limit=4) == b"answer"
     assert box.stop_child("task-one")["confirmed"]
     url = base64.b64encode(box.linux.network.proxy_url("analyst").encode()).decode()
+    assert calls[0][1].pop("host_time") <= time.time()
     assert calls == [
         ("start-child", {"parent_run_id": "parent", "run_id": "task-one",
                          "argv": ["sh", "-c", "printf answer"], "seconds_remaining": 123,

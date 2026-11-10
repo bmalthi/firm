@@ -41,6 +41,11 @@ AGY_VERSION = re.search(r"^\s*AGY_VERSION=(\d+\.\d+\.\d+)$", IMAGE.read_text(), 
 PYTHON = "/usr/bin/python3"
 CONTROLLER = "/usr/local/libexec/firm-controller.py"
 PROVISION_MARKER = "/run/firm-provisioned"
+# The guest's first-boot output: Lima's boot script and the image's provisioning
+# script write to the first, cloud-init itself to the second.
+PROVISION_LOGS = ("/var/log/cloud-init-output.log", "/var/log/cloud-init.log")
+# At most this much of the end of each guest log is kept on the host.
+PROVISION_LOG_LIMIT = "4M"
 GUEST_DEPENDENCIES = (
     "mount.cifs",
     "setfacl",
@@ -146,6 +151,7 @@ class LinuxVM(GuestControl):
         self.ssh_config = self.paths.ssh_config
         self.socket_root = self.paths.runtime
         self.record = self.root / "vm.json"
+        self.provision_log = self.root / "provision.log"
         self.lima = limactl or shutil.which("limactl")
         if not self.lima:
             raise RuntimeError("Lima is not installed")
@@ -401,10 +407,7 @@ sync
                 timeout=30,
             )
             if marker.returncode:
-                raise RuntimeError(
-                    "Linux guest provisioning did not complete; inspect its Lima cloud-init "
-                    "log and retry firm start"
-                )
+                raise RuntimeError("Linux guest provisioning did not complete")
         dependencies = self._shell(
             "/bin/bash",
             "-c",
@@ -414,9 +417,32 @@ sync
         )
         if dependencies.returncode:
             raise RuntimeError(
-                "Linux VM is missing required runtime or file-server dependencies; "
-                "inspect its Lima cloud-init log and retry firm start"
+                "Linux VM is missing required runtime or file-server dependencies"
             )
+
+    def _keep_provision_log(self) -> str:
+        """Copy the guest's first-boot logs to the host, and say where they are.
+
+        They live on the guest disk, which the host cannot read and a discard deletes,
+        so a failed first boot copies them while the guest still runs, before it powers
+        off. Best effort: a guest that cannot answer leaves only Lima's host-side logs.
+        """
+        try:
+            result = self._shell(
+                "/usr/bin/sudo", "-n", "/usr/bin/tail", "-c", PROVISION_LOG_LIMIT,
+                *PROVISION_LOGS, check=False, timeout=30,
+            )
+            if not result.stdout:
+                return "its guest logs could not be copied to the host"
+            temporary = self.provision_log.with_suffix(".new")
+            temporary.unlink(missing_ok=True)
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(result.stdout)
+            temporary.replace(self.provision_log)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            return "its guest logs could not be copied to the host"
+        return f"its guest logs are in {self.provision_log}"
 
     def _check_run(self, run) -> None:
         if run.vm_generation != self._state()["generation"]:
@@ -451,10 +477,12 @@ sync
             self.network.write_configuration()
             self.network.stop()
             self.network.start()
+            started = False
             try:
                 # Lima may signal this marker during stop. Publish the filter's
                 # PID, never the controlling runtime's PID.
                 self.network.publish_lima_pid()
+                started = True  # From here a guest may be running, whatever Lima returns.
                 self._lima("start", "--tty=false", INSTANCE, timeout=1200)
                 if not self._running():
                     raise RuntimeError("Linux VM startup was not confirmed")
@@ -463,12 +491,22 @@ sync
                 if not self.network.ready():
                     raise RuntimeError("Linux VM network filter is not attached")
                 self._verify_guest_ready(require_provision_marker=provisioning_pending)
-            except BaseException:
+            except BaseException as exc:
+                # Whatever failed a first boot, including Lima's own start timing out
+                # while provisioning still ran, its guest logs are taken before power-off.
+                # The power-off follows even when the copy itself is interrupted.
+                kept = None
                 try:
-                    self._lima("stop", "--force", "--tty=false", INSTANCE, check=False)
+                    if started and provisioning_pending and isinstance(exc, Exception):
+                        kept = self._keep_provision_log()
                 finally:
-                    self.paths.preserve_logs()
-                    self.network.stop()
+                    try:
+                        self._lima("stop", "--force", "--tty=false", INSTANCE, check=False)
+                    finally:
+                        self.paths.preserve_logs()
+                        self.network.stop()
+                if kept is not None:
+                    raise RuntimeError(f"{exc}; {kept}; retry firm start") from exc
                 raise
             finally:
                 self.network.paths["pid"].unlink(missing_ok=True)

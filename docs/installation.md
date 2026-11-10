@@ -272,6 +272,8 @@ passing check does not prove remote model access.
 
 Use `firm status DIRECTORY` for a command-line state summary and
 `firm analyze DIRECTORY --section inbox` to inspect pending owner mail and requests.
+`firm status DIRECTORY` (also with `--json`) includes `startup_error` while the execution
+host records a startup failure, until the next successful start clears it.
 Neither a process exit nor a plausible output filename proves that the task is
 complete; open and inspect the artifact, then send follow-up instructions through
 the console when it needs changes.
@@ -421,8 +423,9 @@ change inference billing. `gemini` is not a provider alias.
 Long turns yield after roughly 45–55 minutes and resume the same conversation
 with fresh credentials. AGY reads its token once; replacing it mid-turn cannot
 extend its lifetime. Expiry can leave a conversation reporting persistent ERROR.
-The VM clock must track the host; skew over roughly 300 seconds can defeat the
-pre-expiry yield bound. See [runtime policy](runtime.md#experimental-agy-configuration)
+The yield bound reads the VM's clock. The VM has no time source of its own and its
+clock falls behind while the host sleeps, so the sandbox sets it to the host's time at
+the start of every run when the two differ by more than 2 seconds. See [runtime policy](runtime.md#experimental-agy-configuration)
 for configuration, retry limits and experimental tool isolation.
 
 If a retained conversation keeps failing, route it fresh on its current profile,

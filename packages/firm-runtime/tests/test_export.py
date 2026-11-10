@@ -295,6 +295,45 @@ def test_discard_vms_does_not_discard_when_the_export_fails(firm, monkeypatch, c
     assert not (firm / "export").exists()
 
 
+@pytest.mark.parametrize("present", [False, True])
+def test_discard_vms_verifies_a_missing_or_empty_drive(firm, monkeypatch, capsys, present):
+    def empty_export(self, destination, *, homes=False, boot=False):
+        FakeSandbox.calls.append(("export", homes, boot))
+        if present:
+            (destination / "drive").mkdir()
+        return []
+
+    monkeypatch.setattr(FakeSandbox, "export", empty_export)
+    result = invoke(monkeypatch, capsys, "discard-vms", firm, "--confirm", "demo")
+    assert FakeSandbox.calls == [("export", True, True), ("discard", True)]
+    assert result["status"] == "discarded"
+    export = firm / "export"
+    manifest = exports.verify(export)
+    assert manifest["drive_missing"] is (not present)
+    assert result["export"]["drive_missing"] is (not present)
+    assert not any(path.startswith("drive/") for path in manifest["entries"])
+    # A repeated discard must accept the recorded empty export, too.
+    invoke(monkeypatch, capsys, "discard-vms", firm, "--confirm", "demo")
+    assert FakeSandbox.calls[-1] == ("discard", True)
+    assert FakeSandbox.calls.count(("export", True, True)) == 1
+    # Empty directories have no file entries, so verify their presence separately.
+    if present:
+        (export / "drive").rmdir()
+    else:
+        (export / "drive").mkdir()
+    with pytest.raises(FirmError, match="drive presence does not match"):
+        exports.verify(export)
+
+
+def test_export_manifest_without_drive_field_still_verifies(firm, monkeypatch, capsys):
+    invoke(monkeypatch, capsys, "export", firm)
+    path = firm / "export" / exports.MANIFEST
+    manifest = json.loads(path.read_text())
+    assert manifest.pop("drive_missing") is False
+    path.write_text(json.dumps(manifest))
+    assert exports.verify(firm / "export")["drive_missing"] is False
+
+
 def test_discard_rerun_refuses_an_export_from_another_firm(firm, monkeypatch, capsys):
     invoke(monkeypatch, capsys, "export", firm, "--homes")
     (firm / "discarded").touch()

@@ -756,6 +756,61 @@ def test_status_reports_sandbox_state_when_configured(tmp_path, monkeypatch, cap
     assert "sandbox_error" not in status
 
 
+@pytest.mark.parametrize("flags", [[], ["--json"]])
+def test_status_reports_host_startup_error_until_cleared(tmp_path, monkeypatch, capsys, flags):
+    from starlette.testclient import TestClient
+
+    from firm_runtime import foreground
+    from firm_runtime.console import build_console_app, console_scope
+    from firm_runtime.runtime import Runtime
+    from firm_runtime.store import Store
+
+    directory = _init_firm(tmp_path, monkeypatch, capsys, "demo")
+    monkeypatch.setattr(fleet, "Sandbox", FakeSandbox)
+    _mark_sandbox(directory, state="stopped")
+    runtime = Runtime(Store(directory / "durable" / "firm.sqlite3"))
+    control = foreground.HostControl(lambda **kwargs: None)
+    app = build_console_app(runtime, allowed_host="127.0.0.1:8766", control=control)
+    record = {
+        "pid": os.getpid(),
+        "mcp_port": 8765,
+        "console_port": 8766,
+        "firm_id": "demo",
+        "console_scope": console_scope(runtime.store.path, "demo"),
+    }
+    foreground._write_host_record(directory / "durable" / foreground.HOST_RECORD, record)
+    with TestClient(app, base_url="http://127.0.0.1:8766") as client:
+
+        class Response(io.BytesIO):
+            status = 200
+
+        def console_read(request, timeout):
+            response = client.get(request.full_url, headers=dict(request.header_items()))
+            assert response.status_code == 200
+            return Response(response.content)
+
+        monkeypatch.setattr(foreground.urllib.request, "urlopen", console_read)
+        assert "startup_error" not in _invoke(monkeypatch, capsys, "status", directory, *flags)
+        for message in (
+            "Firm startup failed: provisioning. The host is confirming VM shutdown before "
+            "allowing retry.",
+            "Firm startup failed: provisioning. VM shutdown is confirmed; correct the cause, "
+            "then retry.",
+        ):
+            control.set_startup_error(message)
+            status = _invoke(monkeypatch, capsys, "status", directory, *flags)
+            assert status["startup_error"] == message
+            assert status["state"] == status["sandbox_state"] == "stopped"
+        control.clear_startup_error()
+        assert "startup_error" not in _invoke(monkeypatch, capsys, "status", directory, *flags)
+
+    def offline(request, timeout):
+        raise OSError("host is unavailable")
+
+    monkeypatch.setattr(foreground.urllib.request, "urlopen", offline)
+    assert "startup_error" not in _invoke(monkeypatch, capsys, "status", directory, *flags)
+
+
 def test_status_reports_unknown_sandbox_state_on_broken_config(tmp_path, monkeypatch, capsys):
     directory = _init_firm(tmp_path, monkeypatch, capsys, "demo")
     (directory / "sandbox.toml").write_text("[firm")

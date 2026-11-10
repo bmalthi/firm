@@ -133,8 +133,7 @@ def test_shipped_image_installs_what_roles_need(image):
     ):
         assert tool in script
     assert "systemctl disable --now docker.service" in script
-    assert "apt-get -o Acquire::Retries=3 update" in script
-    assert "apt-get -o Acquire::Retries=3 install" in script
+    assert "Error-Mode=any update" in script and "install -y $PACKAGES" in script
     assert script.index("rm -f /run/firm-provisioned") < script.index("apt-get")
     assert script.index("for command in mount.cifs") < script.index("mv /run/firm-provisioned.new")
     assert script.index("mv /run/firm-provisioned.new") > script.index("chown -R root:root")
@@ -147,7 +146,50 @@ def test_shipped_image_resolves_nothing_and_provisions_through_the_proxy(image):
     # The proxy credential is exported before tracing starts, so it never reaches the log.
     assert script.index('HTTPS_PROXY="$PARAM_FIRM_PROXY"') < script.index("set -x")
     assert script.startswith("#!/bin/bash\nset -euo pipefail\n")
-    assert script.index("nameserver 127.0.0.1") < script.index("Acquire::Retries=3")
+    assert script.index("nameserver 127.0.0.1") < script.index("Error-Mode=any update")
+
+
+def test_every_first_boot_download_survives_a_timed_out_proxy_connection(image):
+    """First boots on 2026-11-09 failed when one connection to the proxy timed out: apt
+    marks the address bad for the rest of its run, so only a new apt-get recovers."""
+    script = yaml.safe_load(image.read_text())["provision"][0]["script"]
+    for step in (
+        # A failed index download must fail the update, or it is never retried.
+        "retry apt-get -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update",
+        "retry apt-get -o Acquire::Retries=3 install -y $PACKAGES",
+        'retry bash -o pipefail -c "$CURL https://get.docker.com | sh"',
+        'retry bash -o pipefail -c "$CURL https://astral.sh/uv/install.sh',
+    ):
+        assert step in script
+    assert script.index("retry() {") < script.index("retry apt-get")
+    downloads = [line.strip() for line in script.splitlines()
+                 if "https://" in line and "curl" in line or "$CURL" in line]
+    assert downloads and all("$CURL" in line or line.startswith("CURL=") for line in downloads)
+    assert 'CURL="curl --retry 10 --retry-all-errors' in script
+    # A piped transfer cannot be retried by curl once it has written part of it onward.
+    assert "| tar" not in script
+    assert "--fetch-retries 10" in script
+
+
+def test_provision_retry_reruns_a_failed_step_and_stops_after_five_tries(image, tmp_path):
+    script = yaml.safe_load(image.read_text())["provision"][0]["script"]
+    helper = script[script.index("retry() {"):script.index('CURL="curl')]
+    count = tmp_path / "count"
+    command = (
+        "set -euo pipefail\nsleep() { :; }\n" + helper
+        + 'step() { echo x >> "$COUNT"; [ "$(wc -l < "$COUNT")" -ge "$NEED" ]; }\n'
+        + 'retry step\necho done\n'
+    )
+
+    def run(need):
+        count.unlink(missing_ok=True)
+        result = subprocess.run(["bash", "-c", command], capture_output=True, text=True,
+                                env={**os.environ, "COUNT": str(count), "NEED": str(need)})
+        return result.returncode, len(count.read_text().splitlines())
+
+    assert run(3) == (0, 3)  # recovers on a later attempt
+    assert run(5) == (0, 5)  # the last attempt still counts
+    assert run(6)[0] != 0 and run(6)[1] == 5  # bounded: then the boot fails visibly
 
 
 def test_agy_pin_is_verified_before_install_and_required_at_readiness(image):
@@ -210,7 +252,10 @@ def test_agy_install_stamp_requires_verified_payload_and_skips_cached_install(
         "AGY_VERSION": "1.5.3", "AGY_URL": "https://unused.invalid/pinned.tar.gz",
         "AGY_SHA512": checksum,
     }
-    command = 'set -eu\ncurl() { echo download >> "$DOWNLOADS"; cp "$FIXTURE" "$4"; }\n' + block
+    command = (
+        'set -eu\nCURL=fetch\n'
+        'fetch() { echo download >> "$DOWNLOADS"; cp "$FIXTURE" "${@: -1}"; }\n' + block
+    )
 
     def run():
         return subprocess.run(["bash", "-c", command], env=env, capture_output=True)
@@ -500,6 +545,108 @@ def test_ready_compatible_vm_uses_dependency_check_without_new_recipe_marker(vm,
     assert linux_vm.PROVISION_MARKER not in calls[0][0]
     for dependency in linux_vm.GUEST_DEPENDENCIES:
         assert f"command -v {dependency}" in calls[0][0][2]
+
+
+def first_boot(vm, monkeypatch, *, ready=False, start_fails=None, verify_fails=None,
+               logs=b"E: Failed to fetch gcc-15\n"):
+    """``vm.up()`` with Lima, the filter and the guest faked; returns the calls in order."""
+    vm.root.mkdir(parents=True)
+    state = {"ready": ready, "controller_digest": "old"}
+    if not ready:
+        vm.network.paths["provisioning"].touch()
+    calls, guest = [], {"running": False}
+    monkeypatch.setattr(vm, "_prepare", lambda: None)
+    monkeypatch.setattr(vm, "_state", lambda: state)
+    monkeypatch.setattr(guest_control, "save", lambda _path, value: state.update(value))
+    for name in ("mark_running", "synchronize", "preserve_logs"):
+        monkeypatch.setattr(vm.paths, name, lambda: None)
+    for name in ("write_configuration", "stop", "start", "publish_lima_pid"):
+        monkeypatch.setattr(vm.network, name, lambda: None)
+    monkeypatch.setattr(vm.network, "ready", lambda **_: True)
+    monkeypatch.setattr(vm, "_running", lambda: guest["running"])
+
+    def lima(*args, **kwargs):
+        calls.append(args[0])
+        if args[0] == "start":
+            if start_fails:
+                raise start_fails
+            guest["running"] = True
+        elif args[0] == "stop":
+            guest["running"] = False
+        return SimpleNamespace(stdout=b"")
+
+    def verify(*, require_provision_marker):
+        calls.append("verify")
+        if verify_fails:
+            raise RuntimeError(verify_fails)
+
+    def shell(*args, **kwargs):
+        calls.append(("shell", args))
+        if isinstance(logs, BaseException):
+            raise logs
+        return SimpleNamespace(returncode=0, stdout=logs)
+
+    monkeypatch.setattr(vm, "_lima", lima)
+    monkeypatch.setattr(vm, "_verify_guest_ready", verify)
+    monkeypatch.setattr(vm, "_shell", shell)
+    return calls
+
+
+@pytest.mark.parametrize("failure", ["unprovisioned", "lima-start-timeout"])
+def test_a_failed_first_boot_copies_guest_logs_before_power_off_and_names_them(
+    vm, monkeypatch, failure
+):
+    if failure == "unprovisioned":
+        calls = first_boot(vm, monkeypatch,
+                           verify_fails="Linux guest provisioning did not complete")
+        cause = "provisioning did not complete"
+    else:
+        # Lima's own wait can end while a stalled download still runs in the guest.
+        calls = first_boot(vm, monkeypatch, start_fails=subprocess.TimeoutExpired(
+            ["limactl", "start"], 1200))
+        cause = "timed out after 1200 seconds"
+    with pytest.raises(RuntimeError) as failed:
+        vm.up()
+    message = str(failed.value)
+    assert cause in message and str(vm.provision_log) in message
+    assert message.endswith("; retry firm start")
+    copy = calls.index(("shell", (
+        "/usr/bin/sudo", "-n", "/usr/bin/tail", "-c", linux_vm.PROVISION_LOG_LIMIT,
+        *linux_vm.PROVISION_LOGS,
+    )))
+    assert copy < calls.index("stop")  # copied while the guest still runs
+    assert vm.provision_log.read_bytes() == b"E: Failed to fetch gcc-15\n"
+    assert vm.provision_log.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("logs", [subprocess.TimeoutExpired(["ssh"], 30), b""])
+def test_unreachable_guest_logs_still_fail_the_first_boot_clearly(vm, monkeypatch, logs):
+    first_boot(vm, monkeypatch, verify_fails="Linux guest provisioning did not complete",
+               logs=logs)
+    with pytest.raises(RuntimeError, match="did not complete; its guest logs could not be "
+                                           "copied to the host; retry firm start"):
+        vm.up()
+    assert not vm.provision_log.exists()
+
+
+def test_an_interrupted_log_copy_still_powers_the_guest_off(vm, monkeypatch):
+    calls = first_boot(vm, monkeypatch, verify_fails="Linux guest provisioning did not complete",
+                       logs=KeyboardInterrupt())
+    stopped = []
+    monkeypatch.setattr(vm.network, "stop", lambda: stopped.append("filter-stop"))
+    with pytest.raises(KeyboardInterrupt):
+        vm.up()
+    # The guest is powered off and the filter stopped (once before the boot, once after).
+    assert calls[-1] == "stop" and stopped == ["filter-stop", "filter-stop"]
+
+
+def test_a_provisioned_vm_that_fails_to_start_copies_no_first_boot_logs(vm, monkeypatch):
+    calls = first_boot(vm, monkeypatch, ready=True,
+                       verify_fails="Linux VM is missing required runtime")
+    with pytest.raises(RuntimeError, match="^Linux VM is missing required runtime$"):
+        vm.up()
+    assert not any(isinstance(call, tuple) for call in calls)
+    assert not vm.provision_log.exists()
 
 
 @pytest.mark.parametrize("stops", [True, False])

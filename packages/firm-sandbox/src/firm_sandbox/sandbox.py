@@ -881,6 +881,7 @@ class Sandbox:
             argv=list(argv), seconds_remaining=seconds_remaining, env=env,
             secrets={key: base64.b64encode(value).decode() for key, value in secrets.items()},
             secret_env=secret_env, stdin=base64.b64encode(stdin).decode(),
+            host_time=time.time(),
         )
 
     @lifecycle()
@@ -1191,13 +1192,15 @@ class Sandbox:
             secrets={key: base64.b64encode(value).decode() for key, value in secrets.items()},
             secret_env=secret_env,
         )
+        # The guest steps its clock to the host's before each launch; the time is read
+        # at each send, so a retry never carries a stale one.
         try:
-            self.linux._rpc("start", **payload)
+            self.linux._rpc("start", **payload, host_time=time.time())
         except (TimeoutError, OSError, ControlConnectionError):
             # A lost reply is not a failed launch. The guest reconciles the same
             # immutable request by run ID, without executing it twice.
             try:
-                self.linux._rpc("start", **payload)
+                self.linux._rpc("start", **payload, host_time=time.time())
             except Exception as exc:
                 raise ControlConnectionError(
                     f"Launch outcome unknown for {run_id}; recover with ps/stop or down"
