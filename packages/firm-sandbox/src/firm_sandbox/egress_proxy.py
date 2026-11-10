@@ -406,7 +406,7 @@ class EgressProxy:
     """
 
     def __init__(
-        self, *, port, log: RequestLog, mode="enforce", allow_hosts=(), key=None, role=None,
+        self, *, port, log: RequestLog, mode="observe", allow_hosts=(), key=None, role=None,
         hosts_path=None, address="127.0.0.1", resolver=resolve,
         acceptable=public_address, opener=asyncio.open_connection, idle=IDLE_TIMEOUT,
     ):

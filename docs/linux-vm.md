@@ -36,7 +36,7 @@ memory_gib = 16
 disk_gib = 60
 
 [network]
-egress = "enforce"
+egress = "observe"
 allow_hosts = []
 ```
 
@@ -70,9 +70,9 @@ names that file.
 The guest has no time source (Lima's plain mode runs no guest agent, and no time
 server is reachable), so each run's launch sets the guest clock to the host's when
 they differ by more than 2 seconds, for example after the host slept.
-`[network]` names the hosts the
-firm's VMs may reach beyond the built-in baseline, and `egress = "observe"` logs every
-host without refusing any, for finding out what a new workload needs; see
+`[network]` defaults to `egress = "observe"`, allowing all public HTTP/HTTPS hosts
+and logging per-role traffic while blocking private/loopback/LAN ranges. The stricter
+opt-in `egress = "enforce"` restricts hosts to the baseline, `allow_hosts` and owner grants; see
 [network access](#network-access-and-cutoff). An optional `[mac]` table names an enrolled
 Mac image; that image records its one to eight station accounts (see
 [the Mac station guide](mac-station.md)); without it the firm has one VM.
@@ -327,7 +327,13 @@ other roles can reach published ports and compete to bind them.
 
 A guest reaches the internet only by name, through a proxy the host runs beside each
 VM's packet filter. The filter lets nothing else out: no direct connection to any
-address, no UDP, no DNS. The proxy resolves names itself and admits a request when
+address, no UDP, no DNS. The proxy resolves names itself and defaults to
+`egress = "observe"`: all public HTTP/HTTPS hosts are allowed, private/loopback/LAN
+ranges stay blocked, and per-role traffic is logged. Observe is the default because
+the baseline already includes GitHub, PyPI, npm and Docker Hub, which can receive
+data, so hostname allowlisting offers little protection while blocking legitimate sites.
+
+The stricter opt-in `egress = "enforce"` admits a request when
 its host is on the firm's allowlist: the built-in baseline (the provider APIs, GitHub,
 the package registries, Ubuntu and Debian package mirrors, `astral.sh` and its installer
 redirect host `releases.astral.sh`, and, for a Mac, Apple's download hosts),
@@ -344,11 +350,11 @@ through it, and its Docker client configuration passes the same settings into ev
 container and build. A tool that resolves names itself fails fast, because the guest's
 resolver points nowhere. Web search needs none of this: Claude Code's WebSearch and
 Codex's web search run on the provider's side, so only the provider API has to be
-reachable. WebFetch and `curl` reach allowed hosts only.
+reachable. WebFetch and `curl` reach public hosts, subject to the allowlist in enforce mode.
 
-`egress = "observe"` in `sandbox.toml` lets every host through and logs it. Run a new
-kind of workload under it once, read the hosts from `firm analyze --section network`,
-and put the ones it needs in `allow_hosts`. The mode is recorded in the filter's policy
+When opting into enforce, read the hosts a workload uses from
+`firm analyze --section network` and put the ones it needs in `allow_hosts`.
+The mode is recorded in the filter's policy
 and changes on the next VM start. In observe mode, host-access requests return granted
 without asking the owner; hostname, port and public-address checks still apply. This
 mode permits outbound actions as well as reads.

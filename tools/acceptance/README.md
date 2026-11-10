@@ -200,6 +200,10 @@ directory and require a sandbox that has not been bound to a different database.
 To force a Linux base rebuild before `linux_base.py`, delete
 `~/Library/Caches/firm/linux-base/`.
 
+For `network.py` and `requests.py`, explicitly set `[network] egress = "enforce"`
+in the fixture's `sandbox.toml` before starting: these suites test hostname refusals
+and owner grants, while the default `"observe"` allows all public HTTP/HTTPS hosts.
+
 The resource history has not yet run live. `docker.py` records the facts its readings
 assume (`uname -r`, `user.slice/cgroup.subtree_control`, `/proc/pressure/memory` and
 whether `systemd-oomd` is active) in `result.json`, and `mac/xcode_build.py` records a
@@ -323,7 +327,7 @@ memory_gib = 8
 disk_gib = 60
 
 [network]
-egress = "enforce"
+egress = "observe"
 allow_hosts = []
 ```
 

@@ -146,7 +146,7 @@ Write three files inside `"$FIRM_DIR"`:
    disk_gib = 60
 
    [network]
-   egress = "enforce"   # "enforce" (default baseline + approved hosts) or "observe" (allow all public web)
+   egress = "observe"   # Default: all public HTTP/HTTPS; "enforce" is the stricter opt-in
    allow_hosts = []     # e.g. ["api.example.com", "*.example.org"]
    ```
 
@@ -216,12 +216,13 @@ Firm stores owner data under `firms/` in the current directory by default. Run t
 Every guest VM's network interfaces are locked down at the host boundary: there is no direct internet route, no UDP/DNS, and no access to your Mac's loopback or private LAN. All outbound HTTP/HTTPS traffic from roles goes through the host's egress proxy (`packages/firm-sandbox/src/firm_sandbox/egress_proxy.py`).
 
 * **Web Search works out of the box:** Provider-native web search (`web_search` in Codex, `WebSearch` in Claude Code, and `search_web` in AGY roles and tasks) is enabled by default and executes on the provider's servers over the pre-allowed provider API hosts. Firm denies AGY's native page fetch (`read_url`); AGY tool-free runs do not enable search.
-* **Default mode (`egress = "enforce"`):** Allows a built-in baseline of essential hosts out of the box:
+* **Default mode (`egress = "observe"`):** Allows all public HTTP/HTTPS hosts while blocking private/loopback/LAN ranges and logging per-role traffic. Observe is the default because the baseline already includes GitHub, PyPI, npm and Docker Hub, which can receive data, so hostname allowlisting offers little protection while blocking legitimate sites.
+* **Stricter opt-in (`egress = "enforce"`):** Allows the built-in baseline, `[network] allow_hosts`, and owner-granted hosts:
   * **Providers & Web Search:** `*.anthropic.com`, `*.claude.com`, `*.openai.com`, `chatgpt.com`, `*.chatgpt.com`
   * **GitHub & Containers:** `github.com`, `*.github.com`, `*.githubusercontent.com`, `ghcr.io`, `*.docker.com`, `*.docker.io`
   * **Package Registries & OS Mirrors:** `pypi.org`, `files.pythonhosted.org`, `astral.sh`, `releases.astral.sh`, `registry.npmjs.org`, `nodejs.org`, `*.ubuntu.com`, `*.debian.org`, `formulae.brew.sh`, `*.apple.com`, `*.cdn-apple.com`
   * Unlisted third-party domains return HTTP `403`. When a role needs an unlisted host for `curl`, `WebFetch`, or an SDK call, it calls `request_access(kind="network_host", resource="...", purpose="...")`, which creates a pending **Owner Request** you can grant in the console or via `firm requests DIRECTORY grant <id>` / `firm network DIRECTORY allow <host>`.
-* **Open public web mode (`egress = "observe"`):** If you prefer agents to reach any public HTTP/HTTPS domain directly without prompting for host approvals (while still blocking private/loopback IP ranges and recording every hostname in the proxy log), configure `sandbox.toml` (changes to `egress` take effect on the next VM start):
+* Set the mode in `sandbox.toml` (an absent setting means `"observe"`; an explicit `"enforce"` stays enforced). Changes to `egress` take effect on the next VM start:
   ```toml
   [network]
   egress = "observe"

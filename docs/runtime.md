@@ -64,9 +64,16 @@ cpus = 8
 memory_gib = 16
 
 [network]
-egress = "enforce"
+egress = "observe"
 allow_hosts = []
 ```
+
+Network egress defaults to `"observe"`: all public HTTP/HTTPS hosts are allowed,
+private/loopback/LAN ranges stay blocked, and per-role traffic is logged. The stricter
+opt-in `"enforce"` limits hosts to the baseline, `allow_hosts` and owner grants.
+Observe is the default because the baseline already includes GitHub, PyPI, npm and
+Docker Hub, which can receive data, so hostname allowlisting offers little protection
+while blocking legitimate sites. See [network access](linux-vm.md#network-access-and-cutoff).
 
 Each profile names its provider, model, effort and allowed accounts. Optional
 `alternates = ["another_profile"]` join selection for fresh conversations, which go to the

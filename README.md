@@ -137,7 +137,7 @@ Install and set up Firm from https://github.com/bmalthi/firm on my Mac following
 What the standard setup gives you by default:
 * **Dedicated Linux VM:** 4 vCPUs, 8 GiB RAM, and a thin-provisioned 60 GiB disk (configurable in `sandbox.toml`), with per-employee OS accounts, cgroup slices, rootless Docker, and an internal `/srv/firm` SMB share.
 * **Automatic model tiering (`[staffing]`):** Up to 4 concurrent active roles (`max_active = 4`), isolated browser OAuth sign-in (`~/.config/firm-runtime/credentials/`), and blind `low` / `medium` / `high` model assignment per hire.
-* **Safe outbound firewall (`egress = "enforce"`):** Provider web search (`web_search` / `WebSearch`), GitHub, Docker Hub, PyPI, npm, and OS package mirrors work out of the box; unlisted domains trigger one-click owner approval requests (or set `egress = "observe"` to allow all public web).
+* **Outbound firewall and proxy (`egress = "observe"`):** All public HTTP/HTTPS hosts are allowed, private/loopback/LAN ranges stay blocked, and per-role traffic is logged; `"enforce"` is the stricter opt-in for baseline, `allow_hosts` and owner-granted hosts. Observe is the default because the baseline already includes GitHub, PyPI, npm and Docker Hub, which can receive data, so hostname allowlisting offers little protection while blocking legitimate sites.
 * **Local Owner Console (`http://127.0.0.1:8766/`):** Live org tree, inbox, deliverable file reader, network approvals, and VM health controls.
 
 <details>

@@ -140,7 +140,7 @@ class Config:
     mac_image: str | None = None
     mac_cpus: int = 8
     mac_memory_gib: int = 24
-    egress_mode: str = "enforce"
+    egress_mode: str = "observe"
     allow_hosts: tuple[str, ...] = ()
 
     def __post_init__(self):
@@ -190,7 +190,7 @@ class Config:
             mac_image=mac.get("image"),
             mac_cpus=mac.get("cpus", 8),
             mac_memory_gib=mac.get("memory_gib", 24),
-            egress_mode=network.get("egress", "enforce"),
+            egress_mode=network.get("egress", "observe"),
             allow_hosts=network.get("allow_hosts", ()),
         )
 
@@ -233,7 +233,7 @@ class VMSettings:
     cpus: int
     memory_gib: int
     disk_gib: int = 60
-    egress_mode: str = "enforce"
+    egress_mode: str = "observe"
     allow_hosts: tuple[str, ...] = ()
 
     def __post_init__(self):

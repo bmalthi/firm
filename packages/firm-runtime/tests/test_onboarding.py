@@ -35,6 +35,8 @@ def test_generated_files_validate_and_are_owner_only_without_overwrite(tmp_path,
     config = validate_config(__import__("tomllib").loads((firm / "firm.toml").read_text()))
     assert config["founder_profile"] == provider
     assert config["profiles"][provider]["model"]
+    sandbox = __import__("tomllib").loads((firm / "sandbox.toml").read_text())
+    assert sandbox["network"] == {"egress": "observe", "allow_hosts": []}
     before = (firm / "mandate.md").read_bytes()
     with pytest.raises(FirmError, match="refusing to replace"):
         onboarding.create_firm_files(firm, provider, "Replace it")

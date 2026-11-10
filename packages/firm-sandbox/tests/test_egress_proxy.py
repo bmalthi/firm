@@ -25,6 +25,7 @@ from firm_sandbox.egress_proxy import (
     public_address,
     token,
 )
+from firm_sandbox.models import Config
 
 KEY = bytes(range(32))
 PUBLIC = "93.184.216.34"
@@ -133,6 +134,7 @@ def start(tmp_path, servers):
             "port": 0, "log": RequestLog(tmp_path / "egress.jsonl"), "key": KEY,
             "resolver": resolver, "opener": opener,
             "acceptable": lambda address: public_address(address, local_addresses=set),
+            "mode": "enforce",
             **options,
         })
         proxy.start()
@@ -754,6 +756,23 @@ def test_an_origin_that_stops_reading_the_upload_is_closed_after_the_idle_time(
 
 
 # ---- observe mode, the Mac, lifecycle -----------------------------------------------------
+
+
+@pytest.mark.parametrize(("setting", "mode", "status"), [
+    ("", "observe", b"HTTP/1.1 200"),
+    ("[network]\n", "observe", b"HTTP/1.1 200"),
+    ('[network]\negress = "enforce"\n', "enforce", b"HTTP/1.1 403"),
+])
+def test_absent_egress_observes_and_explicit_enforce_still_enforces(
+    start, tmp_path, setting, mode, status,
+):
+    path = tmp_path / "sandbox.toml"
+    path.write_text(setting)
+    config = Config.load(path)
+    assert config.egress_mode == mode
+    proxy = start(mode=config.egress_mode)
+    assert tunnel(proxy, "unlisted.example").startswith(status)
+    assert tunnel(proxy, "private.example").startswith(b"HTTP/1.1 403")
 
 
 def test_observe_mode_allows_every_name_and_says_which_enforce_would_refuse(start, tmp_path):

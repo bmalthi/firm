@@ -318,7 +318,7 @@ def test_config_reads_the_egress_mode_and_allowed_hosts(tmp_path):
     assert box.linux.settings.allow_hosts == config.allow_hosts
     assert box.linux.settings.egress_mode == "observe"
     path.write_text("")
-    assert (Config.load(path).egress_mode, Config.load(path).allow_hosts) == ("enforce", ())
+    assert (Config.load(path).egress_mode, Config.load(path).allow_hosts) == ("observe", ())
 
 
 @pytest.mark.parametrize(("setting", "message"), [
@@ -791,7 +791,7 @@ def test_network_status_reports_the_firm_and_each_vm(box):
                                   "overflow": 1}
     status = box.network_status()
     assert set(status) == {"enabled", "mode", "allowed_hosts", "egress", "vms"}
-    assert (status["enabled"], status["mode"]) == (True, "enforce")
+    assert (status["enabled"], status["mode"]) == (True, "observe")
     assert status["egress"] == {
         "live": True, "overflow": 4,
         "entries": [{**entry, "vm": "linux"}, {**entry, "role": "mac", "vm": "mac"}],
