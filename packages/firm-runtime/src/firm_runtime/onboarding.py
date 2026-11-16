@@ -132,9 +132,11 @@ def generated_files(directory: Path, provider: str, mandate: str) -> dict[Path, 
     else:
         model, effort = "sonnet", "medium"
     firm_toml = (
-        "# One provider and one role for the first firm.\n"
+        "# One provider for the first firm; the staffing chooser sizes each hire and picks\n"
+        "# its guidance. Set staffing = false to give every role the founder's profile.\n"
+        "# Staffing uses low/medium/high model tiers, not just the founder's model, and\n"
+        "# guidance assessments consume subscription quota at startup, hire and revision.\n"
         "max_active = 1\n"
-        "staffing = false\n"
         f'founder_profile = "{provider}"\n\n'
         f"[profiles.{provider}]\n"
         f'provider = "{provider}"\n'

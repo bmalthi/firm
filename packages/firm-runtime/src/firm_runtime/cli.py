@@ -556,6 +556,17 @@ def main(argv=None):
             command.add_argument("--fresh", action="store_true", required=True)
         if name == "retry":
             command.add_argument("--episode", required=True)
+    guidance_command = commands.add_parser(
+        "guidance", help="Set or automatically choose role guidance"
+    )
+    guidance_command.add_argument("directory", type=Path)
+    guidance_command.add_argument("employee_id")
+    guidance_command.add_argument("--request-id", required=True)
+    guidance_mode = guidance_command.add_mutually_exclusive_group(required=True)
+    guidance_mode.add_argument("--set", action="store_true")
+    guidance_mode.add_argument("--automatic", action="store_true")
+    guidance_command.add_argument("--scope")
+    guidance_command.add_argument("--function", action="append", default=[])
     github_command = commands.add_parser("github", help="Manage the firm's GitHub access")
     github_actions = github_command.add_subparsers(dest="action", required=True)
     for name, description in (
@@ -668,10 +679,10 @@ def main(argv=None):
                 database = args.directory / exports.DATABASE
             if not database.is_file():
                 raise FirmError("firm database does not exist")
-            if args.command != "analyze":
-                from .compatibility import validate_firm
+            from .compatibility import validate_firm
 
-                validate_firm(args.directory)
+            # Read-only analysis also requires this release's schema, including exports.
+            validate_firm(args.directory)
             if args.command == "analyze":
 
                 def timestamp(value):
@@ -786,6 +797,17 @@ def main(argv=None):
                 result = runtime.owner.resume_role(OWNER, args.employee_id, args.request_id)
             elif args.command == "route":
                 result = runtime.owner.route(OWNER, args.employee_id, args.profile, args.request_id)
+            elif args.command == "guidance":
+                if args.automatic:
+                    if args.scope or args.function:
+                        raise FirmError("--scope and --function require --set")
+                    result = runtime.owner.automatic_guidance(
+                        OWNER, args.employee_id, args.request_id
+                    )
+                else:
+                    result = runtime.owner.set_guidance(
+                        OWNER, args.employee_id, args.scope, args.function, args.request_id
+                    )
             elif args.command == "retry":
                 result = runtime.retry(OWNER, args.employee_id, args.episode, args.request_id)
             elif args.command == "export":

@@ -2,7 +2,7 @@
 
 import json
 
-from . import analysis_history, github
+from . import analysis_history, github, guidance
 from .errors import FirmError
 from .lifecycle import _require_address, validate_config
 from .store import OWNER, encoded
@@ -175,6 +175,64 @@ class OwnerControls:
                 {"employee_id": employee_id, "profile": profile},
                 change,
             )
+
+    def set_guidance(self, actor, employee_id, scope, functions, request_id):
+        """Set exactly the owner's selection, including an intentionally empty one."""
+        self._require_owner(actor)
+        try:
+            selection = guidance.parse_selection(
+                {"scope_guidance": scope, "functional_guidance": functions}, guidance.catalog()
+            )
+        except ValueError as exc:
+            raise FirmError(str(exc)) from exc
+        with self.store.transaction() as db:
+            role = self.store.role(db, employee_id)
+
+            def change():
+                if role["employment"] == "retired":
+                    raise FirmError("retired roles cannot be given guidance")
+                db.execute(
+                    "UPDATE roles SET guidance_state='owner',scope_guidance=?,"
+                    "functional_guidance=?,guidance_retry_at=NULL,guidance_reason=NULL "
+                    "WHERE employee_id=?",
+                    (selection["scope"], encoded(selection["functions"]), employee_id),
+                )
+                analysis_history.record(db, self.store.clock(), "guidance.owner_set",
+                                        employee_id, **selection)
+                return selection
+
+            return self.store.request(db, actor, request_id, "set_guidance",
+                                      {"employee_id": employee_id, **selection}, change)
+
+    def automatic_guidance(self, actor, employee_id, request_id):
+        self._require_owner(actor)
+        with self.store.transaction() as db:
+            role = self.store.role(db, employee_id)
+
+            def change():
+                if role["employment"] == "retired":
+                    raise FirmError("retired roles cannot be given guidance")
+                config = self.runtime.accounts.config(db)
+                revision = db.execute("SELECT MAX(revision) FROM mandates WHERE employee_id=?",
+                                      (employee_id,)).fetchone()[0]
+                db.execute(
+                    "UPDATE roles SET scope_guidance=NULL,functional_guidance='[]' "
+                    "WHERE employee_id=?", (employee_id,),
+                )
+                if config.get("staffing") is False:
+                    db.execute(
+                        "UPDATE roles SET guidance_state=NULL,guidance_revision=NULL,"
+                        "guidance_attempts=0,guidance_retry_at=NULL,guidance_reason=NULL "
+                        "WHERE employee_id=?", (employee_id,),
+                    )
+                else:
+                    guidance.register(db, employee_id, revision)
+                analysis_history.record(db, self.store.clock(), "guidance.automatic",
+                                        employee_id, revision=revision)
+                return guidance.effective(db, self.store.role(db, employee_id), config)
+
+            return self.store.request(db, actor, request_id, "automatic_guidance",
+                                      {"employee_id": employee_id}, change)
 
     def resume_role(self, actor, employee_id, request_id):
         self._require_owner(actor)

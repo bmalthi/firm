@@ -641,3 +641,58 @@ def test_employee_sequence_keeps_committed_floor_and_rejects_corrupt_reservation
     with pytest.raises(FirmError, match="could not reserve"):
         lifecycle.hire("founder", "third", "Third", request_id="third")
     assert scalar(store, "SELECT COUNT(*) FROM roles") == 3
+
+
+@pytest.mark.parametrize("staffing", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("temporary", [False, True])
+def test_guidance_registration_and_replayed_requests_are_atomic(
+    tmp_path, staffing, explicit, temporary
+):
+    store = Store.scratch(tmp_path / "firm.sqlite3", clock=lambda: 100.0)
+    messaging = RecordingMessaging(store)
+    lifecycle = Lifecycle(store, messaging)
+    config = {
+        **CONFIG,
+        "profiles": {
+            "heavy": {"provider": "codex", "model": "test"},
+            "light": {"provider": "codex", "model": "test-small"},
+        },
+    }
+    if staffing:
+        config.pop("staffing")
+    lifecycle.initialize("test", "Build", config)
+    kwargs = {
+        "execution_profile": "light" if explicit else None,
+        "temporary_periods": 2 if temporary else None,
+        "request_id": "hire",
+    }
+    employee = lifecycle.hire("founder", "worker", "Work", **kwargs)["employee_id"]
+    with store.read() as db:
+        for eid in ("founder", employee):
+            role = store.role(db, eid)
+            assert role["guidance_state"] == ("pending" if staffing else None)
+            assert role["guidance_revision"] == (0 if staffing else None)
+    if staffing:
+        with store.transaction() as db:
+            db.execute(
+                "UPDATE roles SET guidance_attempts=2,guidance_retry_at=200 WHERE employee_id=?",
+                (employee,),
+            )
+    lifecycle.hire("founder", "worker", "Work", **kwargs)
+    with store.read() as db:
+        assert store.role(db, employee)["guidance_attempts"] == (2 if staffing else 0)
+    lifecycle.revise_mandate("founder", employee, 0, "New work", request_id="rev")
+    with store.read() as db:
+        role = store.role(db, employee)
+        assert role["guidance_revision"] == (1 if staffing else None)
+        assert role["guidance_attempts"] == 0 and role["guidance_retry_at"] is None
+    if staffing:
+        with store.transaction() as db:
+            db.execute(
+                "UPDATE roles SET guidance_attempts=1,guidance_retry_at=300 WHERE employee_id=?",
+                (employee,),
+            )
+    lifecycle.revise_mandate("founder", employee, 0, "New work", request_id="rev")
+    with store.read() as db:
+        assert store.role(db, employee)["guidance_attempts"] == (1 if staffing else 0)

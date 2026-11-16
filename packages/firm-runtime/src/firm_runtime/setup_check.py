@@ -19,6 +19,7 @@ from firm_sandbox.compatibility import validate_firm_directories
 from firm_sandbox.host_paths import read_text_file
 
 from .credential_store import setup_token_warning
+from .errors import FirmError
 from .lifecycle import validate_config
 from .provider_contract import ProviderSetupError
 from .providers import provider_adapter
@@ -540,6 +541,13 @@ def check_setup(
     """Return a safe local setup report without constructing Store, Runtime, or Sandbox."""
     directory = directory.absolute()
     checks = [_check_directory(directory)]
+    from .guidance import catalog
+
+    try:
+        catalog()
+        checks.append(_result("guidance_catalog", "good", "Role guidance catalog is valid."))
+    except FirmError as exc:
+        checks.append(_result("guidance_catalog", "failure", str(exc)))
 
     database_path = directory / "durable" / "firm.sqlite3"
     database_state = database_initialization_state(database_path)

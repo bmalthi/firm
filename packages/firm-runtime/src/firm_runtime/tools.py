@@ -78,7 +78,7 @@ class RoleTools:
 
     def send(
         self, recipients: list[str], body: str, request_id: str,
-        subject: str | None = None,
+        subject: Annotated[str, Field(min_length=1, max_length=80)] | None = None,
         attachments: Annotated[list[str], Field(max_length=10)] | None = None,
     ) -> dict:
         return self._call(

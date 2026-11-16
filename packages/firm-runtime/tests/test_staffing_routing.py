@@ -81,7 +81,8 @@ def test_fresh_hires_use_both_providers_up_to_firm_capacity(system):
     runtime, _ = system
     for index in range(4):
         runtime.lifecycle.hire("founder", f"analyst{index}", "Work.", request_id=f"hire{index}")
-    runtime.levels.chooser = lambda _: {"model_class": "medium", "effort": "high", "reason": "Work"}
+    runtime.levels.chooser = lambda _: {"model_class": "medium", "effort": "high", "reason": "Work",
+                                       "scope_guidance": None, "functional_guidance": []}
     runtime.levels.tick(background=False)
     with ThreadPoolExecutor(5) as pool:
         admitted = [r for r in pool.map(lambda _: runtime.admit(), range(5)) if r]
@@ -97,7 +98,8 @@ def test_staffing_reserves_with_every_account_slot_taken(system):
     runtime, _ = system
     for index in range(4):
         runtime.lifecycle.hire("founder", f"analyst{index}", "Work.", request_id=f"hire{index}")
-    runtime.levels.chooser = lambda _: {"model_class": "medium", "effort": "high", "reason": "Work"}
+    runtime.levels.chooser = lambda _: {"model_class": "medium", "effort": "high", "reason": "Work",
+                                       "scope_guidance": None, "functional_guidance": []}
     runtime.levels.tick(background=False)
     with ThreadPoolExecutor(5) as pool:
         assert len([r for r in pool.map(lambda _: runtime.admit(), range(5)) if r]) == 4

@@ -12,7 +12,11 @@ Standing instructions, in order:
 - `workplace.json`: identity, manager, and complete owner mandate.
 - `workplace.json`: workspace paths and access rules.
 - `workplace.json`: configured service and Mac capabilities, or their explicit absence.
-- `standing.md`: common employee instructions.
+- `standing-physics.md`: common workplace physics (how the workplace operates).
+- `standing-good-worker.md`: common good-worker guidance (how to do useful work
+  with others).
+- `guidance-introduction.md` and selected scope/function bodies, when any apply.
+- `standing-limits.md`, last for every role.
 
 Activation prompt, in order:
 
@@ -27,7 +31,10 @@ Standing instructions, in order:
 - `workplace.json`: current identity, manager, and complete owner mandate.
 - `workplace.json`: workspace paths and access rules.
 - `workplace.json`: configured service and Mac capabilities, or their explicit absence.
-- `standing.md`.
+- `standing-physics.md`.
+- `standing-good-worker.md`.
+- `guidance-introduction.md` and selected scope/function bodies, when any apply.
+- `standing-limits.md`, last for every role.
 
 Activation prompt, in order:
 
@@ -37,6 +44,7 @@ Activation prompt, in order:
   3. Fresh-context introduction without notes.
   4. Ordinary work update explaining the wake reason.
 - Mandate-change notice when applicable to a resumed provider session.
+- Guidance-change notice when a retained native session receives a different selection.
 - Organization orientation, where available.
 - Inbox snapshot, or “No pending mail.”
 
@@ -48,7 +56,10 @@ Standing instructions, in order:
 - `workplace.json`: workspace paths, access rules, and instructions for looking
   up the founder's mandate.
 - `workplace.json`: configured service and Mac capabilities, or their explicit absence.
-- `standing.md`.
+- `standing-physics.md`.
+- `standing-good-worker.md`.
+- `guidance-introduction.md` and selected scope/function bodies, when any apply.
+- `standing-limits.md`, last for every role.
 
 Activation prompt, in order:
 
@@ -65,20 +76,31 @@ Standing instructions, in order:
 - `workplace.json`: workspace paths, access rules, and founder-mandate lookup
   instructions.
 - `workplace.json`: configured service and Mac capabilities, or their explicit absence.
-- `standing.md`.
+- `standing-physics.md`.
+- `standing-good-worker.md`.
+- `guidance-introduction.md` and selected scope/function bodies, when any apply.
+- `standing-limits.md`, last for every role.
 
 Activation prompt, in order:
 
 - One `wake.json` opening using the same recovery → handoff → fresh → ordinary
   precedence as the founder.
 - Mandate-change notice when applicable to a resumed provider session.
+- Guidance-change notice when a retained native session receives a different selection.
 - Organization orientation, where available.
 - Remaining work-period allowance, if temporarily employed.
 - Inbox snapshot, or “No pending mail.”
 
 ## Shared behavior
 
-- Standing instructions are assembled for every activation.
+- Standing instructions are assembled for every activation. Codex, Claude and
+  AGY receive the same assembled text.
+- Common resources appear once, after the role's identity, mandate,
+  workplace and capability facts: physics first, then good-worker guidance, the optional
+  guidance introduction, scope and
+  function bodies in catalog order, and limits last for every role.
+  The role's mandate takes precedence over good-worker and role guidance; neither can
+  change limits, workplace rules or tool permissions.
 - While `birth_delivered` is false, a role reporting to `owner` receives
   `founder_birth.md`; other roles receive `birth.md`.
   The runtime marks birth delivered when execution starts; a later fresh session does not repeat birth.
@@ -97,4 +119,16 @@ These are used by isolated runtime calls, not injected into employee activations
 
 - `runtime_summary.md`: correspondence summarization. Employees receive the
   derived summary, not these instructions.
-- `runtime_level-choice.md`: staffing assessment after a hire request.
+- `runtime_level-choice.md`: one isolated staffing assessment for pending level and/or guidance decisions.
+
+## Role guidance and limits
+
+- `guidance/catalog.json` and `guidance/*.md`: validated catalog and the scope and function bodies.
+  Org-chart scopes are recomputed at admission; the chooser sees descriptions only for the other scopes
+  and functions. Staffing off makes no chooser call. Owner overrides specify the exact selection.
+- `guidance-introduction.md`: rendered only with a nonempty selection, outside the catalog directory.
+- `standing-limits.md`: rules for every role, last even when no guidance is selected.
+- `wake.json:guidance_changed`: a short notice when retained native context receives a changed selection.
+
+Prompt resource edits load on host restart only. `firm guidance` changes stored selection without resetting
+sessions; `--automatic` restores org-chart and staffing rules.

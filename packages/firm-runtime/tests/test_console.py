@@ -1987,3 +1987,28 @@ def test_console_counts_waiting_messages_independently_of_wakes_and_execution(tm
             ).fetchone()[0]
             == 1
         )
+
+
+def test_console_exposes_effective_guidance_in_all_owner_enrichment_paths(tmp_path):
+    runtime, founder, analyst, app = _system(tmp_path)
+    runtime.owner.set_guidance(OWNER, analyst, "specialist-adviser", ["sales", "legal"], "set")
+    expected = {
+        "state": "owner",
+        "scope": "specialist-adviser",
+        "functions": ["legal", "sales"],
+        "source": "owner",
+        "reason": None,
+    }
+    with _login(app) as client:
+        roles = {r["employee_id"]: r for r in client.get("/api/snapshot").json()["roles"]}
+        assert roles[analyst]["guidance"] == expected
+        assert roles[founder]["guidance"]["source"] == "org_chart"
+        tree = client.get("/api/roles/tree").json()
+        assert next(r for r in tree["nodes"] if r["employee_id"] == analyst)["guidance"] == expected
+        search = client.get("/api/roles/search?query=founder").json()
+        assert (
+            next(r for r in search["roles"] if r["employee_id"] == analyst)["guidance"] == expected
+        )
+        detail = client.get(f"/api/roles/{analyst}?section=profile").json()
+        assert detail["owner_facts"]["guidance"] == expected
+    assert "guidance" not in runtime.lifecycle.get_role(analyst, analyst)

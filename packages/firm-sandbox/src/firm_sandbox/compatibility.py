@@ -8,7 +8,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from uuid import uuid4
 
-COMPATIBILITY_GENERATION = 1
+COMPATIBILITY_GENERATION = 2
 FIRM_RECORD = "firm-release.json"
 _RELEASE = re.compile(r"[0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.-]+)?\Z")
 

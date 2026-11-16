@@ -900,3 +900,173 @@ def test_handoff_default_cleanup_is_saved_and_cannot_be_replaced(system):
             "SELECT payload_json FROM requests WHERE operation='handoff'"
         ).fetchone()
         assert json.loads(request[0])["clean_up"] is False
+
+
+def guidance_role(runtime, employee="founder"):
+    with runtime.store.read() as db:
+        return runtime.store.role(db, employee)
+
+
+def request_guidance_wake(runtime, employee="founder"):
+    with runtime.store.transaction() as db:
+        runtime.store.request_execution(db, employee, "owner_fresh_route")
+
+
+def test_guidance_failed_prelaunch_and_admitted_selection_delivery(system):
+    runtime, founder, _ = system
+    runtime.start()
+    first = run(runtime)
+    runtime.finish(first.activation_id)
+    old = guidance_role(runtime)["session_guidance"]
+    runtime.owner.set_guidance(OWNER, founder, None, ["legal"], "guides")
+    request_guidance_wake(runtime)
+    failed = runtime.admit()
+    assert failed.context["guidance_changed"] is True
+    runtime.finish(failed.activation_id, "interrupted")
+    assert guidance_role(runtime)["session_guidance"] == old
+    request_guidance_wake(runtime)
+    admitted = runtime.admit()
+    assert admitted.context["guidance_changed"] is True
+    runtime.owner.set_guidance(OWNER, founder, None, ["sales"], "different")
+    runtime.mark_started(admitted.activation_id)
+    assert guidance_role(runtime)["session_guidance"] == admitted.context["guidance"]
+    assert json.loads(admitted.context["guidance"])["functions"] == ["legal"]
+    runtime.finish(admitted.activation_id)
+    request_guidance_wake(runtime)
+    assert runtime.admit().context["guidance_changed"] is True
+
+
+def test_org_chart_changes_notify_retained_manager_without_reselection(system):
+    runtime, founder, _ = system
+    runtime.start()
+    first = run(runtime)
+    lead = runtime.lifecycle.hire(founder, "lead", "Lead work", request_id="lead")["employee_id"]
+    runtime.finish(first.activation_id)
+    initial = run(runtime)
+    assert initial.employee_id == lead
+    assert json.loads(initial.context["guidance"])["scope"] is None
+    session = initial.session_id
+    child = runtime.lifecycle.hire(lead, "child", "Work", request_id="child")["employee_id"]
+    runtime.owner.stop_role(OWNER, child, "pause")
+    runtime.finish(initial.activation_id)
+    request_guidance_wake(runtime, lead)
+    manager = run(runtime)
+    assert manager.session_id == session
+    assert manager.context["guidance_changed"] is True
+    assert json.loads(manager.context["guidance"])["scope"] == "team-leader"
+    runtime.finish(manager.activation_id)
+    runtime.lifecycle.fire(lead, child, reason="Done", request_id="fire")
+    request_guidance_wake(runtime, lead)
+    contributor = run(runtime)
+    assert contributor.session_id == session
+    assert contributor.context["guidance_changed"] is True
+    assert json.loads(contributor.context["guidance"])["scope"] is None
+
+
+@pytest.mark.parametrize("selector", [False, True])
+@pytest.mark.parametrize("born", [False, True])
+@pytest.mark.parametrize("staffing", [False, True])
+def test_guidance_initial_wait_is_only_for_unborn_roles_with_staffing_and_selector(
+    system, selector, born, staffing
+):
+    from firm_runtime import guidance
+
+    runtime, founder, _ = system
+    if staffing:
+        with runtime.store.transaction() as db:
+            config = runtime.accounts.config(db)
+            config["staffing"] = {"classes": {"medium": "default"}}
+            db.execute("UPDATE firm SET config_json=?", (json.dumps(config),))
+            guidance.register(db, founder)
+            db.execute("UPDATE roles SET birth_delivered=?", (born,))
+    runtime.levels.chooser = (lambda _: {}) if selector else None
+    runtime.start()
+    admitted = runtime.admit()
+    waits = staffing and selector and not born
+    assert (admitted is None) == waits
+    if waits:
+        with runtime.store.transaction() as db:
+            db.execute("UPDATE roles SET guidance_state='defaulted'")
+        assert runtime.admit() is not None
+
+
+@pytest.mark.parametrize(
+    "event", ["mail", "handoff", "recovery", "renewal", "promotion", "route", "stop-resume"]
+)
+def test_ordinary_events_reuse_guidance_without_an_assessment(tmp_path, event):
+    runtime = Runtime(Store.scratch(tmp_path / "firm.sqlite3"))
+    runtime.lifecycle.initialize("test", "Build", {
+        "max_active": 4, "profiles": {"main": {"provider": "codex", "model": "test"}},
+    })
+    calls = []
+    runtime.levels.chooser = lambda p: calls.append(p) or {
+        "model_class": "low", "effort": "low", "scope_guidance": None,
+        "functional_guidance": ["legal"],
+    }
+    runtime.start()
+    runtime.levels.tick(background=False)
+    founder = run(runtime)
+    employee = runtime.lifecycle.hire("founder", "worker", "Work", request_id="hire",
+                                      temporary_periods=2)["employee_id"]
+    runtime.levels.tick(background=False)
+    current = run(runtime)
+    assert current.employee_id == employee
+    before = guidance_role(runtime, employee)
+    if event == "mail":
+        runtime.messaging.send(OWNER, [employee], "Work", request_id="mail")
+        runtime.finish(current.activation_id)
+    elif event == "handoff":
+        runtime.handoff(current.token, "Progress", "continue", "handoff")
+        runtime.finish(current.activation_id)
+    elif event == "recovery":
+        runtime.finish(current.activation_id, "interrupted")
+    elif event == "renewal":
+        runtime.appointments.renew("founder", employee, 2, "renew")
+    elif event == "promotion":
+        runtime.appointments.promote("founder", employee, "promote")
+    elif event == "route":
+        runtime.finish(current.activation_id)
+        runtime.owner.route(OWNER, employee, before["execution_profile"], "route")
+    else:
+        runtime.owner.stop_role(OWNER, employee, "stop")
+        runtime.finish(current.activation_id, "interrupted")
+        runtime.owner.resume_role(OWNER, employee, "resume")
+    assert runtime.levels.tick(background=False) == []
+    assert len(calls) == 2
+    after = guidance_role(runtime, employee)
+    assert {k: v for k, v in before.items() if k.startswith("guidance_") or k in (
+        "scope_guidance", "functional_guidance"
+    )} == {k: v for k, v in after.items() if k.startswith("guidance_") or k in (
+        "scope_guidance", "functional_guidance"
+    )}
+    assert founder.employee_id == "founder"
+
+
+def test_mandate_revision_with_unchanged_guidance_has_no_guidance_notice(system):
+    runtime, founder, _ = system
+    runtime.start()
+    first = run(runtime)
+    runtime.finish(first.activation_id)
+    runtime.lifecycle.revise_mandate(OWNER, founder, 0, "New work", request_id="rev")
+    next_run = runtime.admit()
+    assert next_run.context["mandate_changed"] is True
+    assert next_run.context["guidance_changed"] is False
+
+
+def test_hire_birth_waits_for_guidance_after_its_level_succeeds(tmp_path):
+    runtime = Runtime(Store.scratch(tmp_path / "firm.sqlite3"))
+    runtime.lifecycle.initialize("test", "Build", {
+        "max_active": 4, "profiles": {"main": {"provider": "codex", "model": "test"}},
+    })
+    runtime.owner.set_guidance(OWNER, "founder", "firm-leader", [], "founder")
+    employee = runtime.lifecycle.hire("founder", "worker", "Work", request_id="hire")["employee_id"]
+    runtime.levels.chooser = lambda _: {"model_class": "low", "effort": "low"}
+    runtime.start()
+    runtime.levels.tick(background=False)
+    first = run(runtime)
+    assert first.employee_id == "founder"
+    assert runtime.admit() is None
+    with runtime.store.transaction() as db:
+        assert runtime.levels.record(db, employee)["state"] == "chosen"
+        db.execute("UPDATE roles SET guidance_state='defaulted' WHERE employee_id=?", (employee,))
+    assert runtime.admit().employee_id == employee

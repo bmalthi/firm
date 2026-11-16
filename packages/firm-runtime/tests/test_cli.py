@@ -208,6 +208,35 @@ def test_init_never_stamps_or_opens_an_unmarked_legacy_database(tmp_path, monkey
     assert not (directory / "firm-release.json").exists()
 
 
+@pytest.mark.parametrize("exported", [False, True])
+@pytest.mark.parametrize("section", ["overview", "readiness"])
+def test_analyze_refuses_old_generation_without_touching_state(
+    tmp_path, monkeypatch, capsys, exported, section
+):
+    from firm_runtime.compatibility import FIRM_RECORD, initialize_firm
+
+    record = initialize_firm(tmp_path)
+    record["compatibility_generation"] = 1
+    (tmp_path / FIRM_RECORD).write_text(json.dumps(record))
+    if exported:
+        (tmp_path / "manifest.json").write_text("{}")
+        database = tmp_path / "firm.sqlite3"
+    else:
+        database = tmp_path / "durable" / "firm.sqlite3"
+        database.parent.mkdir()
+    with sqlite3.connect(database) as db:
+        db.execute("CREATE TABLE roles (employee_id TEXT PRIMARY KEY)")
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+
+    monkeypatch.setattr(sys, "argv", ["firm", "analyze", str(tmp_path), "--section", section])
+    with pytest.raises(SystemExit) as error:
+        main()
+
+    assert error.value.code == 2
+    assert "requires generation" in capsys.readouterr().err
+    assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
+
+
 @pytest.mark.parametrize("filename", ["mandate.md", "firm.toml"])
 @pytest.mark.parametrize("invalid", ["fifo", "oversized"])
 def test_init_rejects_invalid_control_files_without_blocking_or_creating_state(
@@ -1104,3 +1133,72 @@ def test_task_config_applied_by_init_and_configure(tmp_path, monkeypatch, capsys
     assert error.value.code == 2
     assert "positive integer" in capsys.readouterr().err
     assert stored() == before
+
+
+@pytest.mark.parametrize(
+    "flags,expected",
+    [
+        (["--set"], {"scope": None, "functions": []}),
+        (["--set", "--scope", "firm-leader"], {"scope": "firm-leader", "functions": []}),
+        (
+            [
+                "--set",
+                "--scope",
+                "specialist-adviser",
+                "--function",
+                "sales",
+                "--function",
+                "legal",
+            ],
+            {"scope": "specialist-adviser", "functions": ["legal", "sales"]},
+        ),
+    ],
+)
+def test_guidance_cli_sets_exact_selection_and_replays(
+    tmp_path, monkeypatch, capsys, flags, expected
+):
+    directory = _init_firm(tmp_path, monkeypatch, capsys, "guidance")
+    args = ("guidance", directory, "founder", *flags, "--request-id", "set")
+    assert _invoke(monkeypatch, capsys, *args) == expected
+    assert _invoke(monkeypatch, capsys, *args) == expected
+
+
+@pytest.mark.parametrize("staffing", [False, True])
+def test_guidance_cli_automatic_uses_current_revision_in_both_staffing_modes(
+    tmp_path, monkeypatch, capsys, staffing
+):
+    from firm_runtime.runtime import Runtime
+    from firm_runtime.store import OWNER, Store
+
+    directory = _init_firm(tmp_path, monkeypatch, capsys, "guidance")
+    runtime = Runtime(Store(directory / "durable/firm.sqlite3"))
+    if staffing:
+        with runtime.store.read() as db:
+            config = runtime.accounts.config(db)
+        config["profiles"]["controlled"] = {"provider": "codex", "model": "test", "effort": "low"}
+        config["staffing"] = {"profile": "controlled", "classes": {
+            "low": "controlled", "medium": "controlled", "high": "controlled"
+        }}
+        runtime.owner.configure(OWNER, config)
+    _invoke(monkeypatch, capsys, "guidance", directory, "founder", "--set", "--request-id", "set")
+    runtime.lifecycle.revise_mandate(OWNER, "founder", 0, "New mandate", request_id="rev")
+    assert _invoke(monkeypatch, capsys, "guidance", directory, "founder", "--automatic",
+                   "--request-id", "auto") == {"scope": "firm-leader", "functions": []}
+    with runtime.store.read() as db:
+        role = runtime.store.role(db, "founder")
+        assert role["guidance_state"] == ("pending" if staffing else None)
+        assert role["guidance_revision"] == (1 if staffing else None)
+
+
+@pytest.mark.parametrize("flags", [
+    ["--set", "--scope", "legal"], ["--set", "--function", "team-leader"],
+    ["--set", "--function", "unknown"], ["--automatic", "--function", "legal"],
+])
+def test_guidance_cli_refuses_invalid_selection(tmp_path, monkeypatch, capsys, flags):
+    directory = _init_firm(tmp_path, monkeypatch, capsys, "guidance")
+    monkeypatch.setattr(sys, "argv", ["firm", "guidance", str(directory), "founder", *flags,
+                                    "--request-id", "set"])
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 2
+    assert capsys.readouterr().err

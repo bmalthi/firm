@@ -20,5 +20,6 @@
   "renew_temporary": "Your manager renewed your allocated work periods.",
   "promote": "Your manager made your appointment permanent.",
   "authorized_retry": "Your manager or owner authorized another attempt.",
-  "dependency_recovery": "Operations is retrying work after a shared service interruption."
+  "dependency_recovery": "Operations is retrying work after a shared service interruption.",
+  "guidance_changed": "The role guidance in your standing instructions has changed and replaces any you had before."
 }

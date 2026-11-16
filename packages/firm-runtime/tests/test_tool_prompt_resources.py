@@ -11,6 +11,13 @@ from firm_runtime.runtime import Runtime
 from firm_runtime.store import Store
 
 
+def common_standing() -> str:
+    """Common standing resources, for wording that must hold across all of them."""
+    return "\n\n".join(prompt(n) for n in (
+        "standing-physics.md", "standing-good-worker.md", "standing-limits.md"
+    ))
+
+
 def test_tool_descriptions_are_resource_backed_and_keep_registered_operations():
     resources = json.loads(prompt("tools.json"))
     expected_names = {
@@ -74,7 +81,7 @@ def test_mail_tool_descriptions_explain_deliverable_attachments():
 
 
 def test_standing_and_starter_mandate_explain_deliverable_attachments():
-    standing = " ".join(prompt("standing.md").split())
+    standing = " ".join(prompt("standing-physics.md").split())
     assert "Attach deliverables they should open with send or reply" in standing
     assert "using their absolute paths under your drive" in standing
     starter = " ".join(
@@ -85,16 +92,20 @@ def test_standing_and_starter_mandate_explain_deliverable_attachments():
 
 
 def test_role_text_describes_pending_answers_and_never_sends_a_role_to_the_owner():
-    standing = " ".join(prompt("standing.md").split())
-    assert "tell your manager so the owner" not in standing.lower()
-    assert "ask the owner" not in standing.lower()
+    common = " ".join(common_standing().split()).lower()
+    assert "tell your manager so the owner" not in common
+    assert "ask the owner" not in common
+    assert "saves the image" not in common
+    standing = " ".join(prompt("standing-physics.md").split())
     assert "answer `pending` with a request_id and a cause" in standing
-    assert "`access_denied` is the owner's answer" in standing
+    assert "Do not ask for it again" in render(
+        "notices", "access_denied", resource="host", reason="declined"
+    )
+    assert "`access_denied`" not in common
     assert "finish normally to pause while retaining working memory" in standing
     assert "Set a reminder when it serves a real future check" in standing
     assert "public services that need no account" in standing
-    assert "owner-specified limits" in standing
-    assert "saves the image" not in standing
+    assert "owner-specified limits" in prompt("standing-limits.md")
     for name in ("mac_acquire", "request_access", "configuration_error"):
         assert "ask the owner" not in json.loads(prompt("tools.json"))[name].lower()
     assert "pending" in TOOL_DESCRIPTIONS["mac_acquire"]
@@ -156,7 +167,7 @@ def test_template_values_are_substituted_once_and_user_text_stays_literal():
 
 
 def test_mac_guidance_describes_the_account_and_shared_machine_boundaries():
-    standing = prompt("standing.md")
+    standing = common_standing()
     acquire = TOOL_DESCRIPTIONS["mac_acquire"]
     lowered = " ".join(acquire.lower().split())
     assert "your own account" in lowered
@@ -253,3 +264,15 @@ def test_disk_owner_mails_are_resource_backed():
     resources = json.loads(prompt("notices.json"))
     assert resources["linux_disk_low_subject"] == "Linux disk low"
     assert resources["linux_disk_recovered_subject"] == "Linux disk recovered"
+
+
+def test_physics_and_limits_do_not_duplicate_authority_rules():
+    physics = " ".join(prompt("standing-physics.md").split())
+    limits = " ".join(prompt("standing-limits.md").split())
+    for phrase in ("tool failure grants no authority", "Do not make purchases",
+                   "Never print, copy or save a secret", "Never create an account",
+                   "owner-specified limits", "Material published in the firm's name",
+                   "signed, accepted or agreed"):
+        assert phrase in limits
+        assert phrase not in physics
+    assert "access_denied" not in common_standing()

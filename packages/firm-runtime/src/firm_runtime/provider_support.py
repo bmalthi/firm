@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
+from . import guidance
 from .prompt_resources import prompt, render
 from .provider_contract import ProviderSetupError
 from .runtime import Invocation
@@ -109,7 +111,19 @@ def standing(context: dict) -> str:
         workplace.append("## Configured optional capabilities\n\n" + "\n\n".join(enabled))
     else:
         workplace.append(render("workplace", "capabilities_none"))
-    sections += ["\n".join(workplace), prompt("standing.md")]
+    sections += [
+        "\n".join(workplace), prompt("standing-physics.md"), prompt("standing-good-worker.md")
+    ]
+    selection = (json.loads(context["guidance"]) if context.get("guidance")
+                 else {"scope": None, "functions": []})
+    ids = ([selection["scope"]] if selection["scope"] else []) + [
+        e["id"] for e in guidance.catalog() if e["dimension"] == "function"
+        and e["id"] in selection["functions"]
+    ]
+    if ids:
+        sections.append(prompt("guidance-introduction.md"))
+        sections.extend(guidance.body(i) for i in ids)
+    sections.append(prompt("standing-limits.md"))
     return "\n\n".join(sections) + "\n"
 
 
@@ -191,6 +205,8 @@ def render_invocation(invocation: Invocation, provider_session_id: str | None) -
         )
     if context.get("mandate_changed") and provider_session_id is not None:
         sections.append(render("wake", "mandate_changed"))
+    if context.get("guidance_changed") and provider_session_id is not None:
+        sections.append(render("wake", "guidance_changed"))
     if orientation := _orientation(context):
         sections.append(orientation)
     if terms := context.get("temporary_appointment"):

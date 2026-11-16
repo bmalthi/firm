@@ -1,11 +1,14 @@
 """Prompt boundaries and memory transitions, independent of provider execution."""
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
 import pytest
 from firm_sandbox import Layout
+from test_agy_credentials import account
 
+from firm_runtime.agy_provider import AgyProvider
 from firm_runtime.claude_provider import ClaudeProvider
 from firm_runtime.codex_provider import CodexProvider
 from firm_runtime.prompt_resources import prompt, render
@@ -42,7 +45,11 @@ def context(**changes):
 
 
 @pytest.mark.parametrize("state", ["birth", "resume", "handoff", "recovery", "fresh"])
-def test_provider_parity_and_literal_source_across_memory_states(tmp_path, state):
+@pytest.mark.parametrize("selection", [
+    {"scope": None, "functions": []},
+    {"scope": "team-leader", "functions": ["legal", "software-engineering"]},
+])
+def test_provider_parity_and_literal_source_across_memory_states(tmp_path, state, selection):
     changes = {
         "birth": {"birth": True, "fresh_session": True},
         "resume": {"mandate_changed": True},
@@ -50,7 +57,7 @@ def test_provider_parity_and_literal_source_across_memory_states(tmp_path, state
         "recovery": {"recovery": {"cause": "owner_stop", "context_retained": True}},
         "fresh": {"fresh_session": True},
     }[state]
-    data = context(**changes)
+    data = context(guidance=json.dumps(selection), **changes)
     invocation = Invocation(str(uuid4()), "e2", "test-token", str(uuid4()), data)
     native = None if data["fresh_session"] else str(uuid4())
     codex_auth = tmp_path / "codex.json"
@@ -62,6 +69,10 @@ def test_provider_parity_and_literal_source_across_memory_states(tmp_path, state
     adapters = (
         CodexProvider(model="test", effort="high", auth_file=codex_auth),
         ClaudeProvider(model="test", effort="high", auth_file=claude_auth),
+        AgyProvider(
+            model="gemini-3.8-flash", effort="medium",
+            auth_file=account(tmp_path, expiry=4102444800),
+        ),
     )
     specs = [
         adapter.build_spec(
@@ -75,9 +86,24 @@ def test_provider_parity_and_literal_source_across_memory_states(tmp_path, state
         for adapter in adapters
     ]
     assert specs[0].stdin == specs[1].stdin == render_invocation(invocation, native).encode()
-    assert specs[0].secrets["role-instructions"] == specs[1].secrets["role-instructions"]
+    assert (
+        specs[0].secrets["role-instructions"]
+        == specs[1].secrets["role-instructions"]
+        == specs[2].secrets["agy-instructions"]
+    )
     instructions = specs[0].secrets["role-instructions"].decode()
     assert instructions == standing(data)
+    physics = prompt("standing-physics.md")
+    good_worker = prompt("standing-good-worker.md")
+    assert instructions.count(physics) == instructions.count(good_worker) == 1
+    assert instructions.index(physics) < instructions.index(good_worker)
+    limits = prompt("standing-limits.md")
+    assert instructions.count(limits) == 1
+    assert instructions.endswith(limits + "\n")
+    from firm_runtime import guidance
+
+    for guide_id in ([selection["scope"]] if selection["scope"] else []) + selection["functions"]:
+        assert instructions.count(guidance.body(guide_id)) == 1
     assert instructions.count(SOURCE) == 1
     assert "profile.md" in instructions and "track-record.md" in instructions
     assert "/work/profile.md" not in instructions and "/work/track-record.md" not in instructions
@@ -121,7 +147,10 @@ def test_workspace_path_is_supplied_while_prompt_records_stay_relative(birth):
 @pytest.mark.parametrize(
     "name",
     [
-        "standing.md",
+        "standing-physics.md",
+        "standing-good-worker.md",
+        "standing-limits.md",
+        "guidance-introduction.md",
         "birth.md",
         "founder_birth.md",
         "mac-acquired.md",
@@ -132,6 +161,11 @@ def test_workspace_path_is_supplied_while_prompt_records_stay_relative(birth):
 )
 def test_standalone_prompt_resources_are_packaged_and_nonempty(name):
     assert prompt(name).strip()
+
+
+def test_old_standing_resource_is_not_packaged():
+    with pytest.raises(FileNotFoundError):
+        prompt("standing.md")
 
 
 def test_templates_fail_on_missing_values_and_do_not_reinterpret_inserted_text():
@@ -145,10 +179,10 @@ def test_birth_and_wake_resources_leave_routine_judgment_to_the_role():
     birth = " ".join(prompt("birth.md").split())
     founder_birth = " ".join(prompt("founder_birth.md").split())
     wake = render("wake", "inbox", inbox="No pending mail.")
-    assert "missing information would materially change the work" in birth
-    assert "routine implementation decisions need not block progress" in birth
+    assert "missing information would materially change the work" not in birth
+    assert "routine implementation decisions need not block progress" not in birth
     assert "current mandate supplied in your responsibility above" in founder_birth
-    assert "Do the work yourself when that is sufficient" in founder_birth
+    assert "Do work yourself only when it is small or no role would fit" in founder_birth
     assert "responsibilities, authority and coordination clear in its mandate" in founder_birth
     assert "Already pending mail will not cause another automatic wake." in wake
 
@@ -302,3 +336,10 @@ def test_saved_handoff_finishes_without_repeating_save_guidance(tmp_path, drain)
     next_work = runtime.admit()
     assert next_work.context["handoff_notes"] == SOURCE
     assert next_work.context["fresh_session"]
+
+
+def test_all_guidance_resources_are_packaged_and_nonempty():
+    from firm_runtime import guidance
+
+    for entry in guidance.catalog():
+        assert prompt("guidance/" + entry["id"] + ".md").strip()
