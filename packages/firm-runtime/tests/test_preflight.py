@@ -7,8 +7,8 @@ import pytest
 from firm_runtime import providers as providers_module
 from firm_runtime.claude_provider import ClaudeProvider
 from firm_runtime.codex_provider import CodexProvider
+from firm_runtime.credential_files import read_private_credential
 from firm_runtime.provider_contract import ProviderSetupError
-from firm_runtime.provider_support import read_private_credential
 from firm_runtime.providers import Providers
 from firm_runtime.runtime import Runtime
 from firm_runtime.sandbox_dispatcher import SandboxDispatcher

@@ -336,6 +336,53 @@ def test_stale_subscription_threshold_does_not_create_a_hold(system):
     assert runtime.accounts.status()["incidents"] == []
 
 
+@pytest.mark.parametrize("age,held", [(299.999, True), (300, False), (300.001, False)])
+def test_subscription_admission_freshness_boundary_and_codex_account_hold(system, age, held):
+    runtime, now = system
+    config = configuration()
+    config["accounts"]["a"]["stop_admitting_at"] = 0.8
+    runtime.owner.configure(OWNER, config)
+    # A model-specific bucket keeps the existing account-wide admission policy.
+    window = {
+        "window": "codex_other_primary",
+        "limit_id": "codex_other",
+        "used_percent": 80,
+        "resets_at": 2000,
+    }
+    with runtime.store.transaction() as db:
+        db.execute(
+            "INSERT INTO subscription_readings VALUES(?,?,?)",
+            ("a", json.dumps([window]), now[0] - age),
+        )
+        account = runtime.accounts.config(db)["accounts"]["a"]
+        incident = runtime.accounts._refresh_quota_threshold(db, "a", account)
+        assert bool(incident) is held
+        if held:
+            incident = runtime.accounts._incident(db, "account", "a")
+            assert incident["kind"] == "quota" and incident["until_at"] == 2000
+
+
+def test_empty_subscription_clears_reading_and_preserves_existing_timed_hold(system):
+    runtime, now = system
+    config = configuration()
+    config["accounts"]["a"]["stop_admitting_at"] = 0.8
+    runtime.owner.configure(OWNER, config)
+    runtime.accounts.record_subscription(
+        "a", [{"window": "codex_other_primary", "used_percent": 99, "resets_at": 1200}]
+    )
+    now[0] += 1
+    runtime.accounts.record_subscription("a", [])
+    with runtime.store.transaction() as db:
+        assert runtime.accounts.subscription_reading(db, "a") == {
+            "observed_at": now[0],
+            "windows": [],
+        }
+        incident = runtime.accounts._incident(db, "account", "a")
+        assert incident["kind"] == "quota" and incident["until_at"] == 1200
+    now[0] = 1200
+    assert runtime.accounts.status()["incidents"] == []
+
+
 def test_new_crossed_window_extends_a_timed_quota_hold(system):
     runtime, now = system
     config = configuration()

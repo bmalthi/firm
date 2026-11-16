@@ -6,7 +6,10 @@ describes, then run the checks on a disposable firm cloned from it. The station 
 comes from the image recipe and `Sandbox.mac.stations`; there is no station count in
 `sandbox.toml`. Ordinary application checks on different stations can run side by
 side; a role has one run. The Device Hub tap check is timing-sensitive, so keep its
-result and timing evidence with the run that produced it.
+result and timing evidence with the run that produced it. Known live-validation gaps
+include mixed Device Hub downstream timing, virtual display resizing, Apple Events
+entitlement, consent prompt order and macOS session/reboot timing. Run checks on each
+enrolled account before claiming parity; scripts alone do not establish that these pass.
 
 Run from the repository root with `uv run tools/acceptance/mac/SCRIPT.py`.
 Every executable check accepts `--root FIRM_DIR`, `--evidence DIR` (a new private
@@ -46,20 +49,20 @@ shared text of the programs a role and a station run.
 
 | Tool | Coverage | Arguments |
 | --- | --- | --- |
-| `project_handoff.py` | An ordinary Linux role holds a lease from its run, builds an AppKit/Metal app and the [Metal compute probe](../fixtures/metal_probe.m) on the Mac through the lease's SSH endpoint into its workspace on the drive and runs the probe on the Mac VM's GPU, the helper launches the app from the Mac's mount of the same drive, clicks, captures, and the role reads the saved result and the probe's output from its own mount. Checks that the Mac cannot reach the role's private home and a clean release. | `--root FIRM_DIR --evidence DIR --station N` |
-| `helper_smoke.py` | Through a lease: Chromium launch through the default LaunchServices path, the staged browser fixture and form entry, window capture, tracked-app release, then an Apple platform app (TextEdit by default, which the helper also launches through LaunchServices) launch, new window, capture and tracked-app release, then a clean lease release. | `--root FIRM_DIR --evidence DIR --browser GUEST_APP --station N [--page URL] [--apple-app GUEST_APP]` |
-| `dispatcher_lease.py` | The real dispatcher: an ordinary role acquires, reaches the Mac over the lease tunnel, writes to the drive through the Mac and reads it back, starts a background process the release must stop, drives the helper and releases clean; a second role sees busy while held and granted after; lease tables record both; runtime drain stops the VMs. With `--browser`, the live console shows the lease held and free. | `--root FIRM_DIR --evidence DIR --station N [--browser HOST_CHROMIUM]` |
-| `lease_cleanup.py` | Ten acquire/SSH/release cycles with verified station baselines and command logs; background-process cleanup, LaunchAgent and crontab removal, ControlMaster revocation, and dirty-station refusal and owner recovery. | `--root FIRM_DIR --evidence DIR --station N` |
-| `release_faults.py` | Lost guest replies during key removal, session termination, sweep, unmount, reclaim, final verification and command-log collection; dirty-station refusal, owner recovery and retry when a request was never sent. An unreadable LaunchAgents directory must keep the station dirty while independent process cleanup continues. Command-log loss remains diagnostic evidence. The helper relay and closing disk sample are outside this check. | `--root FIRM_DIR --evidence DIR --station N` |
-| `release_during_tests.py` | The release that has the most to clean up: the leased Mac builds the [LeaseProbeApp](../fixtures/LeaseProbeApp/) fixture for testing and starts `xcodebuild test-without-building` with parallel testing in the background, which clones the device into the `testing` device set under `~/Library/Developer/XCTestDevices`; once a clone is booted with a test runner attached, and the host has seen from outside the lease that `xcodebuild` and the runner are still alive, it releases the lease under them. The release must be clean with every simulator step completed, and afterwards the station account runs no `xcodebuild`, test runner or simulated device, both device sets are empty and the checkout and build tree are gone. CoreSimulator's own on-demand service, which the release's `simctl` calls start themselves, is recorded and not counted. | `--root FIRM_DIR --evidence DIR --station N` |
-| `station_self_service.py` | An ordinary Linux role holds a lease and, over its SSH endpoint as the station account, checks it is not an administrator, reports `brew --version`, runs `brew install hello` and runs `hello`, which must resolve to `/opt/homebrew/bin` (macOS ships no `hello`; it does ship `/usr/bin/jq`, which would shadow a brewed `jq`), lists simulator runtimes (reduced on the Mac to platform, version, identifier and availability), re-runs `sudo -n /usr/local/libexec/firm-station-add-platform` for an installed platform (must succeed), and sees sudo refuse `bogus`, two platforms, `true` and a shell. It leaves a `homebrew.mxcl.*` LaunchAgent that release must remove; after a clean release the formula and runtime persist. | `--root FIRM_DIR --evidence DIR --station N` |
-| `xcode_build.py` | A Linux role publishes the [LeaseProbeApp](../fixtures/LeaseProbeApp/) iOS fixture as a Git repo on the drive; the leased Mac clones it, builds with `xcodebuild`, boots a simulator and installs/launches the app, then copies the product to the drive for the role to verify. The simulator is the newest iOS runtime, or with `--ios` the one of that version (`26.0`, met by itself or a patch of it), which is how an image that carries two iOS versions is checked on both. Builds in the lease's `scratch`; release must delete the simulator device and leave neither the checkout nor the build tree. | `--root FIRM_DIR --evidence DIR --station N [--ios VERSION]` |
-| `ui_test_play.py` | The test-driven play path, with no helper and no window: the same [LeaseProbeApp](../fixtures/LeaseProbeApp/) fixture, now with a UI test target and a local Swift package, is published by a Linux role, cloned by the leased Mac and run with `xcodebuild test` on a simulator. A pinch, a long press and a swipe with velocity reach the app's gesture recognisers through the real touch pipeline — asserted from the readout the app itself writes, never by calling app code — once against an idle screen and once against a continuously rendering SpriteKit scene, with every gesture call timed against `--gesture-seconds`. Keeps `XCUIScreen` attachments, a `simctl io screenshot` and a short `recordVideo` in the role's workspace on the drive, reports their sizes and whether the mp4 has an audio track, compares the tests that ran against the test methods that exist, and runs a second scheme naming a local package's tests to report whether that count check catches the silent skip. Builds in the lease's `scratch`; release must delete the simulator device and leave neither the checkout nor the build tree. | `--root FIRM_DIR --evidence DIR --station N [--gesture-seconds S] [--video-seconds S]` |
-| `pointer_tools.py` | The pointer tools on a real desktop, against TextEdit through the lease-bound relay: a held click takes at least its hold, a paced drag selects lines that typing then replaces, a tap sequence keeps its cadence within 150 ms, and a scroll with a held modifier is accepted. Whether a shift-held click extends the selection is recorded in `result.json`, not asserted. | `--root FIRM_DIR --evidence DIR --station N` |
-| `device_hub_taps.py` | Whether a posted tap cadence survives the trip into the simulated device. A Linux role publishes the [LeaseProbeApp](../fixtures/LeaseProbeApp/) fixture as `xcode_build.py` does and the leased Mac builds it, boots a simulator and relaunches it with `FIRM_TAP_TIMING`; the fixture records wall-clock `epoch_ms` and monotonic `uptime_ms` for each touch-down. Through the relay the host opens Device Hub out of this Xcode with explicit direct launch for its trampoline handoff, selects the device's entry, captures its window, and posts a `tap_sequence` at the centre of the content area beyond the sidebar; the station reads the app's timing document back with `xcrun simctl get_app_container`. It passes only when every posted tap arrived and, for a multi-tap run, monotonic app spacing held the requested cadence within 150 ms. A clean run may receive all eight taps while failing cadence when delivery bunches after the helper posts near the requested gaps; this remains downstream timing evidence, not a proof of which component caused it. The bounded AX inspection records partial-result counts and truncation reasons and may follow the sidebar outline with a focused inspection; `result.json` keeps those fields, the chosen and post-selection windows, captures and both timing streams. | `--root FIRM_DIR --evidence DIR --station N [--cadence-ms MS] [--taps N]` |
-| `all_stations.py` | Every recorded account leased concurrently through the dispatcher; each lease port authenticates the account and sees the same guest sshd public key; live tunnel records all target that sshd; exactly one live `files-mac` forward and one Mac VM; each helper ready; an extra role sees busy with every holder named; all release clean. | `--root FIRM_DIR --evidence DIR --station N` |
-| `station_isolation.py` | Selected station versus every other account, in both directions: existing home/drive files and root-owned command log unreadable, process signalling denied, helper connection refused or closed without an answer. Every account creates a unique file in `/opt/homebrew/bin`; all others append to it, proving the inherited writable prefix is shared. Removes that file and releases all leases. | `--root FIRM_DIR --evidence DIR --station N` |
-| `station_sessions.py` | Actual `mac-session-reset` while another lease repeatedly writes scratch, computes and queries its helper; restart/cold boot restores every session; acquire/release/reset/up overlap; machine operations refuse leases; disabled per-account helper is reported by `up` and skipped by acquire; real guest lock contention retries within one deadline. | `--root FIRM_DIR --evidence DIR --station N` |
+| `project_handoff.py` | Shared-drive app handoff, Metal execution and clean release | `--root FIRM_DIR --evidence DIR --station N` |
+| `helper_smoke.py` | Browser input and capture through the station helper | `--root FIRM_DIR --evidence DIR --browser GUEST_APP --station N [--page URL] [--apple-app GUEST_APP]` |
+| `dispatcher_lease.py` | Mac leases through the real dispatcher | `--root FIRM_DIR --evidence DIR --station N [--browser HOST_CHROMIUM]` |
+| `lease_cleanup.py` | Dirty cleanup refusal and recovery | `--root FIRM_DIR --evidence DIR --station N` |
+| `release_faults.py` | Lease cleanup under injected faults | `--root FIRM_DIR --evidence DIR --station N` |
+| `release_during_tests.py` | Lease release during active simulator tests | `--root FIRM_DIR --evidence DIR --station N` |
+| `station_self_service.py` | Station package and simulator self-service | `--root FIRM_DIR --evidence DIR --station N` |
+| `xcode_build.py` | Xcode builds and simulator execution from a leased station | `--root FIRM_DIR --evidence DIR --station N [--ios VERSION]` |
+| `ui_test_play.py` | Gesture delivery, UI test counts and captured artifacts | `--root FIRM_DIR --evidence DIR --station N [--gesture-seconds S] [--video-seconds S]` |
+| `pointer_tools.py` | Held clicks, drags, scrolls and tap cadence | `--root FIRM_DIR --evidence DIR --station N` |
+| `device_hub_taps.py` | Tap arrival and cadence measured inside the simulated app | `--root FIRM_DIR --evidence DIR --station N [--cadence-ms MS] [--taps N]` |
+| `all_stations.py` | Concurrent leases across all enrolled accounts | `--root FIRM_DIR --evidence DIR --station N` |
+| `station_isolation.py` | Cross-account file, process and helper isolation | `--root FIRM_DIR --evidence DIR --station N` |
+| `station_sessions.py` | Session restoration, reset contention and recovery | `--root FIRM_DIR --evidence DIR --station N` |
 
 ```sh
 uv run tools/acceptance/mac/project_handoff.py \
@@ -233,16 +236,6 @@ and resets that account again. Its guest lock holders exit on their own bounded
 deadlines. Ordinary failures retain restoration evidence in `result.json`; killing
 the host process can interrupt cleanup, so use disposable clones.
 
-For the overlap round, lock refusals are valid race outcomes; any successful reset
-or station restated by `up` must report ready, any acquired lease must still work, and
-release must be clean. On a running firm with its controller installed, `up` restates
-only the stations it can lock and reports the others in `mac.stations_skipped` as
-`{"station": n, "skipped": "leased"}`. A boot or controller install still takes every
-station lock and refuses under any lease, as do `down`, `mac-restart` and `mac-replace`. The
-contention check holds a real guest account lock once past its ten-second busy
-response and once past a fourteen-second host budget; the latter must time out
-without acquiring a fresh budget on retry.
-
 Isolation covers the stated account boundaries. CPU, memory, loopback ports and
 Homebrew remain shared. This check deliberately proves writable shared Homebrew;
 it does not claim resource or package isolation.
@@ -252,7 +245,6 @@ Mac's machine-wide network policy through the control channel; its evidence uses
 `mac`, as do resource samples. `../browser.py` uses Linux and merely reports whether
 the shared Mac is configured.
 
-Known live-validation gaps include the mixed Device Hub downstream timing result, virtual
-display resizing, Apple Events entitlement, consent prompt order and macOS session/reboot timing.
-Run these checks on each enrolled account before claiming parity; the scripts are not
-evidence that those behaviors have passed.
+These scripts must be run on the target image and accounts to establish live
+acceptance. They do not establish virtual display resizing, Apple Events
+entitlement, or all consent and reboot ordering behavior.

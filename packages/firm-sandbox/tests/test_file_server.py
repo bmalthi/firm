@@ -2,6 +2,8 @@
 
 import json
 import os
+import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -273,6 +275,165 @@ def test_start_replays_directories_and_accounts_lost_before_the_guest(server):
     assert (server.tree / "org/one/work").is_dir()
     account = dict(server.log)["account"]
     assert ["smbpasswd", "-s", "-a", server.credentials("r-one").user] in account
+
+
+def test_ready_workspace_requires_successful_guest_replay_and_live_instance(server, monkeypatch):
+    identity = "a" * 64
+    grant = Organization("one")
+    server.start()
+    server.bind_identity(identity)
+    server.provision("r-one", grant)
+
+    def ready(files=server):
+        return files.ready_workspace("r-one", grant, database_identity=identity)
+
+    assert ready() == "org/one/work"
+    fresh = FileServer(server.config, server.run)
+    assert ready(fresh) is None
+    original = server.run
+
+    def failed(request):
+        raise RuntimeError("guest unavailable")
+
+    monkeypatch.setattr(server, "run", failed)
+    with pytest.raises(RuntimeError, match="guest unavailable"):
+        server.provision("r-one", grant)
+    assert ready() is None
+    monkeypatch.setattr(server, "run", original)
+    server.provision("r-one", grant)
+    assert ready() == "org/one/work"
+    monkeypatch.setattr(server, "run", failed)
+    with pytest.raises(RuntimeError, match="guest unavailable"):
+        server.start()
+    assert ready() is None
+    monkeypatch.setattr(server, "run", original)
+    server.start()
+    assert ready() == "org/one/work"
+    server.stop()
+    assert ready() is None
+    server.start()
+    assert ready() == "org/one/work"
+    server.discard()
+    assert ready() is None
+
+
+@pytest.mark.parametrize("invalid", [
+    "identity", "address_owner", "address", "archived", "retired", "account",
+    "password", "uid", "port", "pending_archive",
+])
+def test_ready_workspace_revalidates_current_ledger(server, invalid):
+    server.start()
+    server.bind_identity("a" * 64)
+    server.provision("r-one", Organization("one"))
+    ledger = server._load()
+    if invalid == "identity":
+        ledger["database_identity"] = "b" * 64
+    elif invalid == "address_owner":
+        ledger["addresses"]["one"] = "r-other"
+    elif invalid in {"address", "archived"}:
+        ledger["roles"]["r-one"][invalid] = "other" if invalid == "address" else True
+    elif invalid in {"retired", "account", "password", "uid"}:
+        ledger["accounts"]["r-one"][invalid] = True if invalid == "retired" else None
+    elif invalid == "port":
+        ledger["port"] = None
+    else:
+        ledger["pending_archive"] = {"role": "r-old", "replacement": "r-new"}
+    server._save(ledger)
+    assert server.ready_workspace("r-one", Organization("one"), database_identity="a" * 64) is None
+
+
+@pytest.mark.parametrize("operation", ["provision", "retire", "replace"])
+def test_failed_guest_grants_require_replay_for_all_roles(server, monkeypatch, operation):
+    server.start()
+    server.bind_identity("a" * 64)
+    server.provision("r-one", Organization("one"))
+    server.provision("r-child", Organization("one/child"))
+    server.provision("r-other", Organization("other"))
+
+    def failed(request):
+        raise RuntimeError("partial guest grants")
+
+    monkeypatch.setattr(server, "run", failed)
+    with pytest.raises(RuntimeError, match="partial guest grants"):
+        if operation == "retire":
+            server.retire_role("r-one")
+        elif operation == "replace":
+            server.provision("r-new", Organization("one"), replace_role_id="r-one")
+        else:
+            server.provision("r-one", Organization("one"))
+    for role, address in [("r-one", "one"), ("r-child", "one/child"), ("r-other", "other")]:
+        assert server.ready_workspace(
+            role, Organization(address), database_identity="a" * 64
+        ) is None
+
+
+def test_content_read_failure_preserves_workspace_readiness(server, monkeypatch):
+    server.start()
+    server.bind_identity("a" * 64)
+    server.provision("r-one", Organization("one"))
+
+    def failed(request):
+        raise RuntimeError("read unavailable")
+
+    monkeypatch.setattr(server, "run", failed)
+    with pytest.raises(RuntimeError, match="read unavailable"):
+        server.browse_list("org/one/work")
+    assert server.ready_workspace(
+        "r-one", Organization("one"), database_identity="a" * 64
+    ) == "org/one/work"
+
+
+def test_queued_repair_invalidates_success_from_preceding_provision(server, monkeypatch):
+    server.start()
+    server.bind_identity("a" * 64)
+    server.provision("r-one", Organization("one"))
+    entered, queued, release = (threading.Event() for _ in range(3))
+    original_lock, original_run = server._lock, server.run
+    calls = 0
+    observed = []
+    errors = []
+
+    @contextmanager
+    def lock():
+        if entered.is_set():
+            queued.set()
+        with original_lock():
+            yield
+
+    def delayed(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            assert release.wait(3)
+        else:
+            observed.append(server.ready_workspace(
+                "r-one", Organization("one"), database_identity="a" * 64
+            ))
+        return original_run(request)
+
+    def repair():
+        try:
+            server.provision("r-one", Organization("one"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(server, "_lock", lock)
+    monkeypatch.setattr(server, "run", delayed)
+    first, second = (threading.Thread(target=repair) for _ in range(2))
+    first.start()
+    try:
+        assert entered.wait(2)
+        second.start()
+        assert queued.wait(2)
+    finally:
+        release.set()
+        first.join(timeout=2)
+        if second.ident is not None:
+            second.join(timeout=2)
+        assert not first.is_alive() and not second.is_alive()
+    assert not errors
+    assert observed == [None]
 
 
 def test_owner_access_needs_a_started_server(server):

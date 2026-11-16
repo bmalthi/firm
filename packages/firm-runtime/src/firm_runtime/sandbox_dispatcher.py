@@ -18,12 +18,20 @@ from . import google_cloud
 from .errors import FirmError
 from .execution_activity import DEFAULT_IDLE_TIMEOUT, record_activity
 from .prompt_records import record_inputs, role_tool_catalog
+from .provider_contract import ExecutionProvider, RoleLaunchRequest
+from .provider_definitions import incompatible_service
 from .provider_support import activation_url
 from .public_profiles import ingest_public_profiles
 from .runtime import Runtime
 from .summaries import summary_role_id
 from .task_runner import reconcile_tasks
-from .workspaces import grants_for, provision_runtime_role, sandbox_role_id, sandbox_run_id
+from .workspaces import (
+    ensure_runtime_role,
+    grants_for,
+    provision_runtime_role,
+    sandbox_role_id,
+    sandbox_run_id,
+)
 
 LOGGER = logging.getLogger(__name__)
 RUN_JOURNAL_RETENTION = 7 * 24 * 60 * 60  # A week for postmortems; host history is permanent.
@@ -250,9 +258,46 @@ class SandboxDispatcher:
                     f"the owner's granted hosts could not be applied to the sandbox: {exc}; "
                     "the firm VMs were powered off"
                 ) from exc
-            self._infrastructure_state("running")
             self.reconcile()
+            # File-server boot replays its ledger, but employees hired while this
+            # host was closed may not be recorded there yet. Finish their workspaces
+            # before any guest can wait at its activation gate behind provisioning.
+            with self.runtime.store.read() as db:
+                employees = [row[0] for row in db.execute(
+                    "SELECT employee_id FROM roles WHERE employment='active' "
+                    "ORDER BY length(address),address"
+                )]
+            for employee_id in employees:
+                with self.runtime.store.read() as db:
+                    infrastructure = db.execute(
+                        "SELECT infrastructure_state FROM execution_host WHERE singleton=1"
+                    ).fetchone()[0]
+                    if (infrastructure != "starting"
+                            or self.runtime.store.firm(db)["state"] in {"draining", "stopping"}):
+                        raise FirmError(
+                            "firm startup was interrupted; finish stopping before starting"
+                        )
+                try:
+                    ensure_runtime_role(
+                        self.runtime.store,
+                        self.sandbox.config.root,
+                        employee_id,
+                        files=self.sandbox.file_server,
+                    )
+                except BaseException:
+                    # A reopened firm's durable state can already be running.
+                    # Failed preparation must close admission there as well.
+                    self.runtime.stop(force=True)
+                    raise
             self._open_task_runner()
+            with self.runtime.store.transaction() as db:
+                infrastructure = db.execute(
+                    "SELECT infrastructure_state FROM execution_host WHERE singleton=1"
+                ).fetchone()[0]
+                if (infrastructure != "starting"
+                        or self.runtime.store.firm(db)["state"] in {"draining", "stopping"}):
+                    raise FirmError("firm startup was interrupted; finish stopping before starting")
+                db.execute("UPDATE execution_host SET infrastructure_state='running'")
             self.runtime.start()
         except BaseException:
             self._infrastructure_state("unknown")
@@ -459,7 +504,7 @@ class SandboxDispatcher:
                 (json.dumps(recovery) if recovery else None, role["employee_id"]),
             )
 
-    def _provider(self, row):
+    def _provider(self, row) -> ExecutionProvider:
         if hasattr(self.providers, "for_session"):
             return self.providers.for_session(row["session_id"])
         provider = self.providers.get(row["provider"])
@@ -483,33 +528,31 @@ class SandboxDispatcher:
 
     def _observe_usage(self, row, logs, *, historical=False, strict=False):
         provider = self._provider(row)
-        parser = getattr(provider, "parse_usage", None)
-        if parser is not None:
-            try:
-                self.runtime.record_usage(row["activation_id"], parser(logs), historical=historical)
-            except (TypeError, ValueError, OverflowError):
-                if strict:
-                    raise
-                # Usage is advisory telemetry. A malformed or changed provider event
-                # must not fail otherwise valid role execution.
-                pass
+        try:
+            self.runtime.record_usage(
+                row["activation_id"], provider.parse_usage(logs), historical=historical
+            )
+        except (TypeError, ValueError, OverflowError):
+            if strict:
+                raise
+            # Advisory telemetry must not fail otherwise valid role execution.
+            pass
         if historical:
             return  # Old journal windows must never become fresh subscription readings.
-        subscription = getattr(provider, "parse_subscription", None)
-        reading = subscription(logs) if subscription is not None else None
+        reading = provider.parse_subscription(logs)
         aid = row["activation_id"]
-        if reading is None or self._subscription_events.get(aid) == reading["event_id"]:
+        if reading is None or self._subscription_events.get(aid) == reading.event_id:
             return
         with self.runtime.store.read() as db:
             binding = self.runtime.accounts.binding(db, row["session_id"])
         if binding:
             self.runtime.accounts.record_subscription(
                 binding["account_id"],
-                reading["windows"],
-                status=reading.get("status"),
-                warning=reading.get("warning"),
+                list(reading.windows),
+                status=reading.status,
+                warning=reading.warning,
             )
-        self._subscription_events[aid] = reading["event_id"]
+        self._subscription_events[aid] = reading.event_id
 
     def _read_logs(self, row, run, info):
         """The run's full output so far, fetched only past what was already read.
@@ -560,11 +603,9 @@ class SandboxDispatcher:
 
     def _record_tool_calls(self, row, logs, *, strict=False):
         """Tally what the period called, from the log this collection already holds."""
-        extract = getattr(self._provider(row), "parse_tool_calls", None)
-        if extract is None:
-            return
+        provider = self._provider(row)
         try:
-            self.runtime.record_tool_calls(row["activation_id"], extract(logs))
+            self.runtime.record_tool_calls(row["activation_id"], provider.parse_tool_calls(logs))
         except (TypeError, ValueError, OverflowError, sqlite3.Error) as exc:
             if strict:
                 raise
@@ -1001,7 +1042,7 @@ class SandboxDispatcher:
         launched = []
         while invocation := self.runtime.admit():
             try:
-                provision_runtime_role(
+                ensure_runtime_role(
                     self.runtime.store,
                     self.sandbox.config.root,
                     invocation.employee_id,
@@ -1034,18 +1075,24 @@ class SandboxDispatcher:
                 if session and session["provider"] != profile:
                     raise FirmError("retained conversation cannot silently change providers")
                 adapter = self._provider({"provider": profile, "session_id": invocation.session_id})
-                if getattr(adapter, "name", None) == "agy" and image_access:
-                    raise FirmError("AGY subscription inference cannot coexist with [google_cloud]")
+                provider_name = adapter.name
+                service = incompatible_service(provider_name, config)
+                if service is not None:
+                    raise FirmError(
+                        f"{provider_name.upper()} subscription inference cannot coexist "
+                        f"with [{service}]"
+                    )
                 spec = adapter.build_spec(
-                    invocation,
-                    role_id,
-                    run_id,
-                    self.mcp_url,
-                    session["native_session_id"] if session else None,
+                    RoleLaunchRequest(
+                        invocation=invocation,
+                        role_id=role_id,
+                        run_id=run_id,
+                        mcp_url=self.mcp_url,
+                        provider_session_id=session["native_session_id"] if session else None,
+                        offered_tools=tuple(tool["name"] for tool in self._tool_catalog),
+                        task_timeout_seconds=config["task"]["timeout_seconds"],
+                    ),
                     layout=layout,
-                    **({"mcp_tools": [tool["name"] for tool in self._tool_catalog],
-                        "mcp_timeout": config["task"]["timeout_seconds"]}
-                       if getattr(adapter, "name", None) == "agy" else {}),
                 )
                 spec = replace(
                     spec,

@@ -577,7 +577,12 @@ class SummaryService:
         )
 
     def _reserve_run(
-        self, input_bytes: int, reserve, kind: str, caller_session_id: str | None
+        self,
+        input_bytes: int,
+        reserve,
+        kind: str,
+        caller_session_id: str | None,
+        timeout: float = SUMMARY_TIMEOUT_SECONDS,
     ) -> tuple[str, dict[str, Any]] | None:
         run_id = "run-" + uuid4().hex
         start_token = secrets.token_urlsafe(32)
@@ -605,7 +610,7 @@ class SummaryService:
                     reservation.get("account_id"),
                     reservation.get("profile"),
                     reservation.get("provider"),
-                    now + SUMMARY_TIMEOUT_SECONDS,
+                    now + timeout,
                     hashlib.sha256(start_token.encode()).hexdigest(),
                     kind,
                 ),
@@ -740,7 +745,7 @@ class SummaryService:
         """Run a strict runner and return output plus a terminal failure reason."""
         run_id = request.run_id
         handle = None
-        deadline = time.monotonic() + SUMMARY_TIMEOUT_SECONDS
+        deadline = time.monotonic() + request.timeout
 
         def confirmed_stop() -> bool:
             if handle is None:
@@ -799,6 +804,7 @@ class SummaryService:
         max_input_bytes: int = MAX_SUMMARY_PROMPT_BYTES,
         caller_session_id: str | None = None,
         input_bytes: int | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         """Run one bounded, no-authority provider turn and return its text.
 
@@ -807,6 +813,7 @@ class SummaryService:
         The result carries ``status`` ``completed`` with ``text``, or
         ``unavailable`` with a ``reason``; usage is included when reported.
         """
+        run_timeout = SUMMARY_TIMEOUT_SECONDS if timeout is None else timeout
         try:
             prompt_bytes = check_prompt_size(prompt, max_input_bytes)
         except SummaryInputTooLarge:
@@ -820,7 +827,9 @@ class SummaryService:
         try:
             with self._launch_lock:
                 reserved = (
-                    self._reserve_run(input_bytes, reserve, kind, caller_session_id)
+                    self._reserve_run(
+                        input_bytes, reserve, kind, caller_session_id, run_timeout
+                    )
                     if self._accepting
                     else None
                 )
@@ -835,7 +844,7 @@ class SummaryService:
         request = SummaryLaunch(
             run_id=run_id,
             prompt=prompt,
-            timeout=SUMMARY_TIMEOUT_SECONDS,
+            timeout=run_timeout,
             account_id=reservation.get("account_id"),
             profile=reservation.get("profile"),
             provider=reservation.get("provider"),

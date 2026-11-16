@@ -10,11 +10,11 @@ from . import analysis_history
 from .errors import FirmError
 from .prompt_resources import prompt, render
 from .provider_contract import ProviderUsage
+from .provider_definitions import PROVIDER_DEFINITIONS
 from .store import OWNER, encoded
 
 DEFAULT_ADVISORY_FRACTION = 0.60
 DEFAULT_HANDOFF_RESERVE = 10_000
-DEFAULT_CONTEXT_WINDOWS = {"claude": 500_000, "codex": 256_000}
 CONTEXT_POLICY_KEYS = frozenset({"context_window", "context_advisory_fraction", "handoff_reserve"})
 
 SCHEMA = """
@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS activation_tool_calls (
 
 
 def validate_context_policy(profile: dict, name: str) -> None:
-    window = profile.get("context_window", DEFAULT_CONTEXT_WINDOWS.get(profile.get("provider")))
+    definition = PROVIDER_DEFINITIONS.get(profile.get("provider"))
+    window = profile.get("context_window", definition.soft_context_window if definition else None)
     fraction = profile.get("context_advisory_fraction", DEFAULT_ADVISORY_FRACTION)
     reserve = profile.get("handoff_reserve", DEFAULT_HANDOFF_RESERVE)
     if window is not None and (type(window) is not int or window <= 0):
@@ -86,8 +87,9 @@ def validate_context_policy(profile: dict, name: str) -> None:
 
 
 def context_policy(profile: dict) -> tuple[int | None, float, int]:
+    definition = PROVIDER_DEFINITIONS.get(profile.get("provider"))
     return (
-        profile.get("context_window", DEFAULT_CONTEXT_WINDOWS.get(profile.get("provider"))),
+        profile.get("context_window", definition.soft_context_window if definition else None),
         float(profile.get("context_advisory_fraction", DEFAULT_ADVISORY_FRACTION)),
         profile.get("handoff_reserve", DEFAULT_HANDOFF_RESERVE),
     )

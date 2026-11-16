@@ -180,8 +180,34 @@ def refused_with_note(answer):
 
 
 class ProbeProvider:
-    def build_spec(self, invocation, role_id, run_id, mcp_url, provider_session_id=None, *,
-                   layout=None):
+    name = "probe"
+    model = "probe"
+
+    def validate_credentials(self):
+        return None
+
+    def build_summary_spec(self, request, layout):
+        raise NotImplementedError("probe only executes roles")
+
+    def build_task_spec(self, request, layout):
+        raise NotImplementedError("probe only executes roles")
+
+    def parse_summary(self, logs, exit_code):
+        raise NotImplementedError("probe only executes roles")
+
+    def parse_usage(self, logs):
+        return None
+
+    def parse_tool_calls(self, logs):
+        return {}
+
+    def parse_subscription(self, logs):
+        return None
+
+    def build_spec(self, request, *, layout):
+        self.request = request
+        invocation = request.invocation
+        role_id, run_id, mcp_url = request.role_id, request.run_id, request.mcp_url
         from firm_sandbox import RunSpec
 
         return RunSpec(
@@ -447,10 +473,11 @@ def main():
     if database.exists():
         parser.error(f"{database} exists; this check creates the runtime database itself and "
                      "needs a fresh disposable firm")
+    from firm_sandbox import Config, Sandbox
+
     from firm_runtime.compatibility import validate_firm
     from firm_runtime.runtime import Runtime
     from firm_runtime.store import Store
-    from firm_sandbox import Config, Sandbox
 
     validate_firm(args.root)
     box = Sandbox(Config.load(args.root / "sandbox.toml"))

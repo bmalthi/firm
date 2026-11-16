@@ -10,6 +10,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from firm_runtime.mcp_server import TOOL_DESCRIPTIONS
+from firm_runtime.provider_contract import RoleLaunchRequest
+
 ACCEPTANCE = Path(__file__).resolve().parents[1] / "acceptance"
 
 
@@ -272,8 +275,16 @@ def test_probe_provider_runs_the_program_with_the_activation_token_as_a_secret()
     layout = SimpleNamespace(python="/usr/bin/python3", private="/home/probe",
                              credential=lambda name: f"/run/credentials/{name}")
     spec = requests.ProbeProvider().build_spec(
-        SimpleNamespace(token="activation-secret"), "founder", "run-1",
-        "http://127.0.0.1:9000/mcp", layout=layout,
+        RoleLaunchRequest(
+            invocation=SimpleNamespace(token='activation-secret'),
+            role_id='founder',
+            run_id='run-1',
+            mcp_url='http://127.0.0.1:9000/mcp',
+            provider_session_id=None,
+            offered_tools=tuple(TOOL_DESCRIPTIONS),
+            task_timeout_seconds=600,
+        ),
+        layout=layout,
     )
     assert spec.argv == ("/usr/bin/python3", "/run/credentials/probe-program")
     assert spec.env == {"PROBE_MCP": "http://127.0.0.1:9000", "PROBE_HOME": "/home/probe"}

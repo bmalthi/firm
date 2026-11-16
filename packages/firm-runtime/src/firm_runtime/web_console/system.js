@@ -1,5 +1,5 @@
 // System owns these observations; analysis.js keeps its persistent diagnostic panel.
-import {age, bytes, machineName, incidentStatus, incidentTitle, decisionStatus, vmState, runtimeState} from "./format.js";
+import {age, bytes, machineName, incidentStatus, incidentTitle, decisionStatus, vmState, runtimeState, subscriptionQuotaDetail} from "./format.js";
 
 export function createSystem({$, api, element, number, time, sourceText, technicalDetails, syncChildren}) {
   let snapshot = null;
@@ -72,7 +72,9 @@ export function createSystem({$, api, element, number, time, sourceText, technic
   function renderAccounts() {
     const status = snapshot.accounts;
     $("#capacity-summary").textContent = `${snapshot.active.length} working · ${snapshot.waiting_roles} queued · ${snapshot.held.length} with a recorded hold or retry`;
-    const signature = JSON.stringify(status);
+    const allowanceAges = status.accounts.filter((account) => account.subscription_quota?.unavailable_stream)
+      .map((account) => age(account.subscription_quota.observed_at));
+    const signature = JSON.stringify([status, allowanceAges]);
     if (signatures.get("accounts") === signature) return;
     signatures.set("accounts", signature);
     const cards = status.accounts.map((account) => {
@@ -87,13 +89,9 @@ export function createSystem({$, api, element, number, time, sourceText, technic
           windows.append(element("li", "", `${window.label}: ${window.used_percent}% used · ${window.expired ? "reset passed" : "resets"} ${time(window.resets_at)}${quota.state === "stale" || window.expired ? " · stale · last recorded reading" : ""}`));
         }
         card.append(windows);
-        let detail = "";
-        if (quota.state === "unsupported") detail = "Subscription quota and context unavailable for experimental AGY.";
-        else if (quota.state === "awaiting_stream") detail = "Subscription allowance appears after a Claude role runs.";
-        else if (!quota.observed_at) detail = quota.state === "loading" ? "Checking subscription allowance…" : "Subscription allowance unavailable; will retry.";
-        else if (quota.state === "stale" || quota.error) detail = `Stale quota reading · observed ${time(quota.observed_at)}${quota.checked_at ? ` · checked ${time(quota.checked_at)}` : ""}${quota.error ? " · latest refresh unavailable" : ""}`;
+        const detail = subscriptionQuotaDetail(quota, time);
         if (detail) card.append(element("p", "quota-detail", detail));
-        if (quota.state !== "unsupported") card.append(technicalDetails(`Quota observed ${time(quota.observed_at)}${quota.polled ? ` · checked ${time(quota.checked_at)} · refreshes every 5 minutes` : " · updates while Claude roles run"}`));
+        if (quota.state !== "unsupported" && quota.observed_at != null) card.append(technicalDetails(`${quota.source || "Subscription allowance"} · observed ${time(quota.observed_at)}${quota.polled ? ` · checked ${time(quota.checked_at)} · refreshes every 5 minutes` : " · updates while roles run"}`));
       } else card.append(element("p", "quota-detail", account.headroom === "known"
         ? `${Math.round(account.remaining_fraction * 100)}% allowance remaining (last supplied reading)`
         : "Remaining allowance unavailable · no fresh quota reading. Work remains eligible unless blocked."));
@@ -255,6 +253,7 @@ export function createSystem({$, api, element, number, time, sourceText, technic
       }
       $("#system-age").textContent = sourceText("/api/snapshot");
       $("#network-age").textContent = sourceText("/api/analysis/network");
+      if (snapshot) renderAccounts();
       renderHealth();
     },
   };

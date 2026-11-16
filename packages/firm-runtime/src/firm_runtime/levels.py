@@ -18,22 +18,18 @@ from typing import Any
 from . import analysis_history, guidance
 from .errors import FirmError
 from .prompt_resources import render
-from .provider_contract import SUPPORTED_EFFORTS
+from .provider_definitions import PROVIDER_DEFINITIONS
 from .store import OWNER, encoded
 from .summaries import SummaryInputTooLarge, check_prompt_size
 
 CLASSES = ("low", "medium", "high")
-DEFAULT_MODELS = {
-    "agy": ("gemini-3.8-flash", "gemini-3.8-flash", "gemini-4-argon"),
-    "codex": ("gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra"),
-    "claude": ("sonnet", "opus", "claude-fable-5-1"),
-}
 EFFORTS = ("low", "medium", "high", "xhigh")
 FOUNDER_LEVEL = ("high", "high")
 FALLBACK_LEVEL = ("medium", "high")
 MAX_ATTEMPTS = 3
 MAX_CHOICE_REASON_CHARS = 1000
 RETRY_DELAY_SECONDS = 60.0
+CHOOSER_TIMEOUT_SECONDS = 120.0
 MAX_STAFFING_PROMPT_BYTES = 256 * 1024
 # The hire's mandate is authoritative input and is passed through unchanged.
 # Only surrounding mandates are excerpts, so a verbose manager cannot crowd out
@@ -75,7 +71,7 @@ def with_staffing_defaults(config: dict) -> dict:
     if (
         not isinstance(source, dict)
         or not isinstance(source.get("provider"), str)
-        or source["provider"] not in DEFAULT_MODELS
+        or source["provider"] not in PROVIDER_DEFINITIONS
     ):
         raise FirmError(
             "staffing defaults need a founder_profile with provider codex, claude or agy "
@@ -94,14 +90,14 @@ def with_staffing_defaults(config: dict) -> dict:
     if any(
         not isinstance(route, dict)
         or not isinstance(route.get("provider"), str)
-        or route["provider"] not in DEFAULT_MODELS
+        or route["provider"] not in PROVIDER_DEFINITIONS
         for route in routes
     ):
         raise FirmError(
             "staffing default routes must name configured codex, claude or agy profiles"
         )
     classes = {}
-    for level_index, level in enumerate((*CLASSES, "chooser")):
+    for level in (*CLASSES, "chooser"):
         names = [f"staffing-{level}" + (f"-{i}" if i else "") for i in range(len(routes))]
         for name, route in zip(names, routes, strict=True):
             if name in profiles:
@@ -109,16 +105,9 @@ def with_staffing_defaults(config: dict) -> dict:
                     f"profile {name} is reserved for staffing defaults; configure [staffing]"
                 )
             profile = {k: copy.deepcopy(v) for k, v in route.items() if k != "alternates"}
-            profile.update(
-                model=DEFAULT_MODELS[route["provider"]][0 if level == "chooser" else level_index],
-                effort=(
-                    "medium"
-                    if level == "chooser"
-                    or (level == "low" and route["provider"] == "agy")
-                    or (level == "high" and route["provider"] in {"codex", "agy"})
-                    else "high"
-                ),
-            )
+            definition = PROVIDER_DEFINITIONS[route["provider"]]
+            settings = getattr(definition, f"staffing_{level}")
+            profile.update(settings.as_dict())
             profiles[name] = profile
         if len(names) > 1:
             profiles[names[0]]["alternates"] = names[1:]
@@ -148,13 +137,16 @@ def validate_staffing(config: dict) -> None:
     if (
         not isinstance(chooser, dict)
         or not isinstance(chooser.get("provider"), str)
-        or chooser["provider"] not in SUPPORTED_EFFORTS
+        or chooser["provider"] not in PROVIDER_DEFINITIONS
     ):
         raise FirmError("staffing profile provider must be codex, claude or agy")
     if not isinstance(chooser.get("model"), str) or not chooser["model"].strip():
         raise FirmError("staffing profile model must be non-empty")
     effort = chooser.get("effort")
-    if not isinstance(effort, str) or effort not in SUPPORTED_EFFORTS[chooser["provider"]]:
+    if (
+        not isinstance(effort, str)
+        or effort not in PROVIDER_DEFINITIONS[chooser["provider"]].supported_efforts
+    ):
         raise FirmError("unsupported staffing profile effort")
     classes = staffing.get("classes")
     if not isinstance(classes, dict) or set(classes) != set(CLASSES):
@@ -510,6 +502,7 @@ class Levels:
                 instructions=level_instructions(),
                 reserve=self.runtime.accounts.reserve_staffing,
                 max_input_bytes=MAX_STAFFING_PROMPT_BYTES,
+                timeout=CHOOSER_TIMEOUT_SECONDS,
             )
             if outcome.get("reason") == "input_limit":
                 raise SummaryInputTooLarge(

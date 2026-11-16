@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from firm_runtime.levels import CLASSES, DEFAULT_MODELS
+from firm_runtime.levels import CLASSES
 from firm_runtime.runtime import Runtime
 from firm_runtime.store import OWNER, Store
 
@@ -63,7 +63,7 @@ def test_defaults_keep_provider_class_and_context_on_each_route(system):
         model_index = 0 if level == "chooser" else index
         assert (first["provider"], first["model"], first["accounts"], first["context_window"]) == (
             "codex",
-            DEFAULT_MODELS["codex"][model_index],
+            ("gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra")[model_index],
             ["c1", "c2"],
             256000,
         )
@@ -72,7 +72,7 @@ def test_defaults_keep_provider_class_and_context_on_each_route(system):
             second["model"],
             second["accounts"],
             second["context_window"],
-        ) == ("claude", DEFAULT_MODELS["claude"][model_index], ["a1", "a2"], 500000)
+        ) == ("claude", ("sonnet", "opus", "claude-fable-5-1")[model_index], ["a1", "a2"], 500000)
         assert first["effort"] == ("medium" if level in {"high", "chooser"} else "high")
         assert second["effort"] == ("medium" if level == "chooser" else "high")
 
@@ -133,7 +133,7 @@ def test_staffing_uses_same_fresh_route_rules_as_roles(system, block):
         expected["account_id"],
     )
     assert reservation["provider"] == "claude"
-    assert reservation["model"] == DEFAULT_MODELS["claude"][0]
+    assert reservation["model"] == "sonnet"
     assert reservation["effort"] == "medium"
     with runtime.store.read() as db:
         run = db.execute("SELECT * FROM summary_runs WHERE run_id=?", (run_id,)).fetchone()

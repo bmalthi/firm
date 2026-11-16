@@ -1,30 +1,26 @@
-# AGY replay fixtures
+# AGY protocol fixtures
 
-The stream envelope follows the [official headless protocol](https://antigravity.google/docs/cli/headless/).
-Each JSON fixture declares `fixture_kind`, `events`, `exit_code`, and a partial
-`expected` analysis checked by both pytest and `agy_probe.py replay`.
+Synthetic and sanitized captured streams exercise completion, malformed output,
+tool failures, session identity, cumulative usage, search, timeout/resume and
+credential-expiry errors. Both runtime provider tests and tools protocol tests
+consume these fixtures.
 
-- `captured_search_role.json` and `captured_search_task.json` capture AGY 1.5.3
-  subscription search on 2026-11-08 with the launcher's exact role/task settings
-  and `search_web` added to the declared tools. Both finish SUCCESS with successful
-  `search_web` steps, no `read_url_content` step, and no permission allow entry.
-  `read_url(*)` and `execute_url(*)` remained denied. Response prose, arguments,
-  and native identifiers are omitted; the gate separately checked the answer date.
+Each fixture declares its kind, events, exit code and expected analysis. Optional
+parser options describe multi-turn streams or an expected conversation ID.
+Captures omit response prose, tool arguments, real native identifiers and credentials.
+Synthetic fixtures do not establish live provider acceptance. Captured streams retain
+the original model IDs and CLI version/date; they are historical protocol evidence,
+not evidence that the current Hydrogen default has passed live acceptance.
 
-- `success.json`, `process_failure.json`, and `missing_result.json` are synthetic
-  protocol tests, not successful AGY executions or authentication evidence.
-- `startup_error.json` preserves the structure and zero counters observed from
-  CLI **1.5.3** on 2026-11-07 with an isolated HOME and no injected credentials.
-  Startup returned exit 1 and one ERROR result with an empty conversation ID,
-  without an init event. Error and finished-reason prose were replaced. No
-  credential, account identifier, private path, or actual conversation ID remains.
-- `captured_mcp_float_ignored.json` and `captured_mcp_integer_authenticated.json`
-  capture the launcher's silent MCP configuration failure and its one-field fix:
-  `timeoutSeconds` must serialize as an integer, not `2.0`. Both streams report
-  SUCCESS and the same 60 native tools in init; only the corrected configuration
-  has an authenticated server receipt and `mcp_firm_org_tree` event. The real Firm
-  catalog names were served by harmless echoes, not a production Firm server.
+`captured_search_role.json` and `captured_search_task.json` record AGY 1.5.3
+subscription search on 2026-11-08, with `search_web` added to the declared tools.
+Both completed with successful search steps, no page-fetch step and no permission
+allow entry; URL-reading tools remained denied. Native identifiers and response prose
+were sanitized. `startup_error.json` preserves the zero-counter error shape from
+AGY 1.5.3 on 2026-11-07 without injected credentials, with error prose replaced.
+The MCP timeout captures used harmless echoes of the Firm catalog, not a production
+Firm server; only the integer-timeout capture had an authenticated server receipt.
 
-The parser does not infer authorization categories from provider prose. Unknown
-activation accounting, context occupancy, quota, and inner MCP tool identities
-remain unproven. No fixture means the provider is ready for Firm registration.
+The MCP timeout fixtures preserve the regression where integer and floating-point
+timeout settings produced different tool availability despite terminal SUCCESS.
+Expiry and yield fixtures distinguish a successful process exit from completed work.

@@ -38,6 +38,15 @@ stored mail, and context summarizes a conversation. Mail is attributed to its se
 not automatically instructions from Operations. New mail, reminders and Operations
 notices can wake you; already pending mail does not repeatedly wake you.
 
+A successfully delivered reply claims your pending copy of the message you answer
+and earlier pending messages in the same conversation whose full bodies were returned
+by messages in your current session. Nothing after the reply target is claimed, even
+if you read it. Inbox listings and summaries do not count as full-message reads.
+Claiming acknowledges receipt, not completion: retain unfinished commitments in your
+working memory and handoff notes. Replies remain available during a required handoff;
+they do not pull new message bodies into context. Exact lookups record full reads but
+leave inbox dispositions unchanged. Prefer claim when reading newly waiting mail.
+
 Before a long run or sending a finding, check your inbox for relevant changes and
 read updates that could change the work, so you do not act on work a colleague has
 since changed. Reuse a recent check when it is still current. A `New mail` line on a
@@ -84,6 +93,15 @@ Compose; use containers for system packages and services. Install other tools in
 your home, which is private to you and persists. Check out and build in your Linux
 `scratch` directory, named above: it is private local disk and keeps its contents
 between work periods. Keep deliverables and anything colleagues need on the firm drive.
+Chromium's system libraries and fonts are installed. For browser inspection,
+screenshots or PDFs of your local HTML, you can use Playwright directly without
+Docker or sudo. In your project, run `uv add playwright==1.63.0`, then
+`uv run playwright install chromium`. Reuse an existing suitable installation
+rather than reinstalling for each task; the project environment and browser download
+persist in your private storage between work periods. For trusted local HTML, use
+Playwright's default Chromium launch settings (`chromium_sandbox=False`); do not
+change system security settings. Browser downloads require network access. Save
+outputs colleagues need on the firm drive.
 Everything you start ends with your work period: background jobs, servers and
 watchers are stopped when it finishes, and nothing reports back or wakes you afterwards.
 Wait for a result you need before you finish; do not end a work period promising to

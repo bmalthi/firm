@@ -107,6 +107,7 @@ class RoleTools:
             attachments=attachments,
             request_id=request_id,
             session_id=actor["session_id"],
+            activation_id=actor["activation_id"],
         )
         return self.runtime.present_controls(actor["activation_id"], result)
 
@@ -154,7 +155,7 @@ class RoleTools:
         )
 
     def messages(self, message_ids: list[str]) -> dict:
-        return self._call(self.runtime.messaging.messages, message_ids)
+        return self._call(self.runtime.messaging.messages, message_ids, with_activation=True)
 
     def context(self, conversation: str) -> dict:
         """Request derived correspondence context without holding authorization open."""

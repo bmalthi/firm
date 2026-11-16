@@ -5,11 +5,11 @@ import re
 
 from agy_protocol import analyze
 
+from firm_runtime.agy_auth import profile_home
+from firm_runtime.provider_contract import ProviderSetupError
+
 PROVIDERS = ("codex", "claude", "agy")
-AGY_AUTH_FILE = (
-    "/tmp/firm-agy-dedicated-profile/home/.gemini/antigravity-cli/antigravity-oauth-token"
-)
-AGY_MODELS = {f"{model}-{effort}" for model in ("gemini-3.8-flash", "gemini-4-argon")
+AGY_MODELS = {f"{model}-{effort}" for model in ("gemini-4-hydrogen", "gemini-4-argon")
               for effort in ("low", "medium", "high")}
 
 
@@ -24,9 +24,13 @@ def selected_profile(source, name, provider=None):
     if profile["provider"] == "agy":
         if source.get("google_cloud"):
             raise ValueError("AGY subscription acceptance cannot use [google_cloud]")
-        if any(a.get("provider") != "agy" or a.get("auth_file") != AGY_AUTH_FILE
-               for a in accounts.values()):
-            raise ValueError("AGY acceptance requires the dedicated profile auth_file reference")
+        for account in accounts.values():
+            if account.get("provider") != "agy":
+                raise ValueError("AGY acceptance requires AGY accounts")
+            try:
+                profile_home(account.get("auth_file", ""))
+            except (ProviderSetupError, TypeError, ValueError):
+                raise ValueError("AGY acceptance requires a dedicated profile auth_file") from None
     return profile, accounts
 
 
@@ -128,7 +132,7 @@ def agy_output_evidence(logs, *, expected_model=None, expected_id=None, exit_cod
         except (ValueError, UnicodeError):
             first = None
         # The launcher emits this before native output. Check its exact identity
-        # before passing the native stream to the A0 protocol parser.
+        # before passing the native stream to the acceptance protocol parser.
         if first == {"type": "firm.agy_expected_session", "conversation_id": expected_id}:
             stream = b"".join(lines[1:])
     evidence = analyze(stream, exit_code, expected_conversation_id=expected_id)

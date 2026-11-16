@@ -278,8 +278,8 @@ def main():
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--role", default="docker-probe")
     args = parser.parse_args()
+    args.evidence.mkdir(mode=0o700, parents=True, exist_ok=False)
     box = Sandbox(Config.load(args.root / "sandbox.toml"))
-    args.evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
     record = {"role": args.role, "passed": False}
     sampler = None
     try:

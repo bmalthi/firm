@@ -16,13 +16,14 @@ import tomllib
 import uuid
 from pathlib import Path
 
+from firm_sandbox import Config, Sandbox
+
 from firm_runtime.hosting import LocalServer
 from firm_runtime.mcp_http import build_http_app
 from firm_runtime.providers import Providers
 from firm_runtime.runtime import Runtime
 from firm_runtime.sandbox_dispatcher import SandboxDispatcher
 from firm_runtime.store import OWNER, Store
-from firm_sandbox import Config, Sandbox
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from provider_checks.acceptance_common import (  # noqa: E402

@@ -11,14 +11,17 @@ from uuid import NAMESPACE_URL, uuid5
 
 from firm_sandbox import Layout, RunSpec
 
-from . import codex_launch, credential_mirror
+from . import codex_auth, codex_launch, credential_mirror
+from .credential_store import access_credentials
 from .provider_contract import (
-    SUPPORTED_EFFORTS,
     ErrorKind,
     ProviderError,
     ProviderResult,
     ProviderSetupError,
     ProviderUsage,
+    RoleLaunchRequest,
+    SubscriptionObservation,
+    SubscriptionWindow,
     category_for_code,
     reset_at,
     retry_after_seconds,
@@ -27,40 +30,20 @@ from .provider_contract import (
     token_count,
     tool_name,
 )
+from .provider_definitions import PROVIDER_DEFINITIONS
 from .provider_support import (
-    access_credentials,
     activation_url,
     canonical_uuid,
-    read_private_credential,
     render_invocation,
+    role_mcp_settings,
     standing,
     summary_instructions,
     text_setting,
 )
-from .runtime import Invocation
 from .summaries import SummaryLaunch, SummaryOutput, summary_role_id
 
 # Completed items that are work the role asked for, rather than its own prose or reasoning.
 TOOL_ITEMS = frozenset({"command_execution", "file_change", "mcp_tool_call", "web_search"})
-
-
-def _read_auth(path: Path) -> bytes:
-    data = read_private_credential(path, "Codex")
-    try:
-        parsed = json.loads(data)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        raise ProviderSetupError(
-            category="auth",
-            code="credential_invalid",
-            message="configured Codex authentication is not valid JSON",
-        ) from None
-    if not isinstance(parsed, dict):
-        raise ProviderSetupError(
-            category="auth",
-            code="credential_invalid",
-            message="configured Codex authentication must contain a JSON object",
-        )
-    return data
 
 
 class CodexProvider:
@@ -82,11 +65,14 @@ class CodexProvider:
             raise ProviderSetupError(
                 category="config", code="invalid_model", message=str(exc)
             ) from None
-        if effort not in SUPPORTED_EFFORTS["codex"]:
+        if effort not in PROVIDER_DEFINITIONS["codex"].supported_efforts:
             raise ProviderSetupError(
                 category="config",
                 code="invalid_effort",
-                message=("effort must be one of " + ", ".join(sorted(SUPPORTED_EFFORTS["codex"]))),
+                message=(
+                    "effort must be one of "
+                    + ", ".join(sorted(PROVIDER_DEFINITIONS["codex"].supported_efforts))
+                ),
             )
         self.effort = effort
         if not isinstance(auth_file, Path):
@@ -112,32 +98,14 @@ class CodexProvider:
         return self.executable or f"{layout.tools}/codex"
 
     def validate_credentials(self):
-        parsed = json.loads(_read_auth(self.auth_file))
-        tokens = parsed.get("tokens")
-        if not (
-            isinstance(parsed.get("OPENAI_API_KEY"), str) and parsed["OPENAI_API_KEY"].strip()
-        ) and not (
-            isinstance(tokens, dict)
-            and isinstance(tokens.get("access_token"), str)
-            and tokens["access_token"].strip()
-        ):
-            raise ProviderSetupError(
-                category="auth",
-                code="credential_missing_token",
-                message="configured Codex authentication has no account token or API key",
-            )
+        codex_auth.validate_credentials(self.auth_file)
 
-    def build_spec(
-        self,
-        invocation: Invocation,
-        role_id: str,
-        run_id: str,
-        mcp_url: str,
-        provider_session_id: str | None = None,
-        *,
-        layout: Layout,
-    ) -> RunSpec:
+    def build_spec(self, request: RoleLaunchRequest, *, layout: Layout) -> RunSpec:
+        invocation = request.invocation
+        role_id, run_id = request.role_id, request.run_id
+        mcp_url, provider_session_id = request.mcp_url, request.provider_session_id
         try:
+            offered_tools, mcp_timeout = role_mcp_settings(request)
             runtime_session_id = canonical_uuid(invocation.session_id, "runtime session ID")
             if provider_session_id is not None:
                 provider_session_id = canonical_uuid(
@@ -183,6 +151,10 @@ class CodexProvider:
             "-c",
             "mcp_servers.firm.required=true",
             "-c",
+            f"mcp_servers.firm.enabled_tools={json.dumps(offered_tools)}",
+            "-c",
+            f"mcp_servers.firm.tool_timeout_sec={mcp_timeout}",
+            "-c",
             f"model_instructions_file={json.dumps(layout.credential('role-instructions'))}",
         ]
         common = [
@@ -220,7 +192,7 @@ class CodexProvider:
             secrets={
                 "credential-mirror": Path(credential_mirror.__file__).read_bytes(),
                 "activation-token": invocation.token.encode(),
-                "codex-auth": access_credentials("codex", _read_auth(self.auth_file)),
+                "codex-auth": access_credentials("codex", codex_auth.read_auth(self.auth_file)),
                 "codex-launcher": launcher,
                 "role-instructions": instructions.encode(),
             },
@@ -240,7 +212,7 @@ class CodexProvider:
         return parse_usage(logs)
 
     @staticmethod
-    def parse_subscription(logs: bytes | str) -> dict | None:
+    def parse_subscription(logs: bytes | str) -> SubscriptionObservation | None:
         return parse_subscription(logs)
 
     @staticmethod
@@ -264,7 +236,7 @@ class CodexProvider:
             )
         model = request.model or self.model
         effort = request.effort or self.effort
-        if effort not in SUPPORTED_EFFORTS["codex"]:
+        if effort not in PROVIDER_DEFINITIONS["codex"].supported_efforts:
             raise ProviderSetupError(
                 category="config", code="invalid_effort", message="invalid summary effort"
             )
@@ -348,7 +320,7 @@ class CodexProvider:
             },
             secrets={
                 "credential-mirror": Path(credential_mirror.__file__).read_bytes(),
-                "codex-auth": access_credentials("codex", _read_auth(self.auth_file)),
+                "codex-auth": access_credentials("codex", codex_auth.read_auth(self.auth_file)),
                 "codex-launcher": Path(codex_launch.__file__).read_bytes(),
                 "summary-token": request.start_token.encode(),
                 "summary-instructions": (request.instructions or summary_instructions()).encode(),
@@ -556,7 +528,7 @@ def parse_usage(logs: bytes | str) -> ProviderUsage | None:
     )
 
 
-def parse_subscription(logs: bytes | str) -> dict | None:
+def parse_subscription(logs: bytes | str) -> SubscriptionObservation | None:
     """Read Codex's optional rollout rate_limits attached to token_count events."""
     raw = logs.decode(errors="replace") if isinstance(logs, bytes) else logs
     if not isinstance(raw, str):
@@ -574,7 +546,7 @@ def parse_subscription(logs: bytes | str) -> dict | None:
         limits = event.get("rate_limits")
         if not isinstance(limits, dict):
             if isinstance(event.get("usage"), dict):
-                latest = {"event_id": f"line:{index}", "windows": []}
+                latest = SubscriptionObservation(event_id=f"line:{index}", windows=())
             continue
         limit_id = limits.get("limit_id")
         if isinstance(limit_id, str) and limit_id:
@@ -586,7 +558,7 @@ def parse_subscription(logs: bytes | str) -> dict | None:
                 bucket = "unknown"
         else:
             bucket = "unknown"
-        windows = []
+        windows: list[SubscriptionWindow] = []
         for slot in ("primary", "secondary"):
             value = limits.get(slot)
             if not isinstance(value, dict):
@@ -608,7 +580,7 @@ def parse_subscription(logs: bytes | str) -> dict | None:
                     "resets_at": reset,
                 }
             )
-        latest = {"event_id": f"line:{index}", "windows": windows}
+        latest = SubscriptionObservation(event_id=f"line:{index}", windows=tuple(windows))
     return latest
 
 

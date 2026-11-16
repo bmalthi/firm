@@ -13,8 +13,13 @@ from firm_runtime.codex_provider import (
     parse_tool_calls,
     parse_usage,
 )
+from firm_runtime.mcp_server import TOOL_DESCRIPTIONS
 from firm_runtime.prompt_resources import prompt as resource_prompt
-from firm_runtime.provider_contract import ProviderSetupError
+from firm_runtime.provider_contract import (
+    ProviderSetupError,
+    RoleLaunchRequest,
+    SubscriptionObservation,
+)
 from firm_runtime.provider_support import standing
 from firm_runtime.runtime import Invocation
 from firm_runtime.summaries import SummaryLaunch
@@ -78,10 +83,15 @@ def test_builds_fresh_sandbox_spec_without_exposing_credentials(tmp_path, model)
     adapter = CodexProvider(model=model, effort="high", auth_file=adapter.auth_file)
     call = invocation()
     spec = adapter.build_spec(
-        call,
-        "r-example",
-        "run-example",
-        "http://firm.local:8421/mcp",
+        RoleLaunchRequest(
+            invocation=call,
+            role_id='r-example',
+            run_id='run-example',
+            mcp_url='http://firm.local:8421/mcp',
+            provider_session_id=None,
+            offered_tools=tuple(TOOL_DESCRIPTIONS),
+            task_timeout_seconds=600,
+        ),
         layout=Layout(),
     )
 
@@ -103,6 +113,8 @@ def test_builds_fresh_sandbox_spec_without_exposing_credentials(tmp_path, model)
     assert 'mcp_servers.firm.url="http://firm.local:8421/mcp"' in rendered
     assert 'mcp_servers.firm.bearer_token_env_var="FIRM_ACTIVATION_TOKEN"' in rendered
     assert "mcp_servers.firm.required=true" in rendered
+    assert f"mcp_servers.firm.enabled_tools={json.dumps(tuple(TOOL_DESCRIPTIONS))}" in command
+    assert "mcp_servers.firm.tool_timeout_sec=665" in command
     assert 'model_reasoning_effort="high"' in rendered
     assert "activation-secret" not in rendered
     assert "host-secret" not in rendered
@@ -191,11 +203,15 @@ def test_builds_exact_resume_and_validates_native_session_id(tmp_path):
         }
     )
     spec = adapter.build_spec(
-        call,
-        "r-example",
-        "run-example",
-        "https://bridge.example/mcp/",
-        native_id,
+        RoleLaunchRequest(
+            invocation=call,
+            role_id='r-example',
+            run_id='run-example',
+            mcp_url='https://bridge.example/mcp/',
+            provider_session_id=native_id,
+            offered_tools=tuple(TOOL_DESCRIPTIONS),
+            task_timeout_seconds=600,
+        ),
         layout=Layout(),
     )
     command = json.loads(spec.env["FIRM_CODEX_ARGV"])
@@ -206,11 +222,15 @@ def test_builds_exact_resume_and_validates_native_session_id(tmp_path):
 
     with pytest.raises(ValueError, match="must be a UUID"):
         adapter.build_spec(
-            call,
-            "r-example",
-            "run-example",
-            "https://bridge.example/mcp",
-            "../../auth.json",
+            RoleLaunchRequest(
+                invocation=call,
+                role_id='r-example',
+                run_id='run-example',
+                mcp_url='https://bridge.example/mcp',
+                provider_session_id='../../auth.json',
+                offered_tools=tuple(TOOL_DESCRIPTIONS),
+                task_timeout_seconds=600,
+            ),
             layout=Layout(),
         )
 
@@ -220,10 +240,15 @@ def test_auth_file_is_selected_explicitly_and_read_only_at_build(tmp_path):
     adapter = CodexProvider(model="gpt-6-astra", effort="medium", auth_file=auth_file)
     with pytest.raises(ValueError, match="not readable"):
         adapter.build_spec(
-            invocation(),
-            "r-example",
-            "run-example",
-            "http://firm.local/mcp",
+            RoleLaunchRequest(
+                invocation=invocation(),
+                role_id='r-example',
+                run_id='run-example',
+                mcp_url='http://firm.local/mcp',
+                provider_session_id=None,
+                offered_tools=tuple(TOOL_DESCRIPTIONS),
+                task_timeout_seconds=600,
+            ),
             layout=Layout(),
         )
 
@@ -231,10 +256,15 @@ def test_auth_file_is_selected_explicitly_and_read_only_at_build(tmp_path):
     auth_file.chmod(0o600)
     with pytest.raises(ValueError, match="JSON object"):
         adapter.build_spec(
-            invocation(),
-            "r-example",
-            "run-example",
-            "http://firm.local/mcp",
+            RoleLaunchRequest(
+                invocation=invocation(),
+                role_id='r-example',
+                run_id='run-example',
+                mcp_url='http://firm.local/mcp',
+                provider_session_id=None,
+                offered_tools=tuple(TOOL_DESCRIPTIONS),
+                task_timeout_seconds=600,
+            ),
             layout=Layout(),
         )
 
@@ -244,10 +274,15 @@ def test_auth_file_is_selected_explicitly_and_read_only_at_build(tmp_path):
     auth_file.symlink_to(target)
     with pytest.raises(ValueError, match="not readable"):
         adapter.build_spec(
-            invocation(),
-            "r-example",
-            "run-example",
-            "http://firm.local/mcp",
+            RoleLaunchRequest(
+                invocation=invocation(),
+                role_id='r-example',
+                run_id='run-example',
+                mcp_url='http://firm.local/mcp',
+                provider_session_id=None,
+                offered_tools=tuple(TOOL_DESCRIPTIONS),
+                task_timeout_seconds=600,
+            ),
             layout=Layout(),
         )
 
@@ -256,10 +291,15 @@ def test_auth_file_is_selected_explicitly_and_read_only_at_build(tmp_path):
     adapter.auth_file = fifo
     with pytest.raises(ValueError, match="regular file"):
         adapter.build_spec(
-            invocation(),
-            "r-example",
-            "run-example",
-            "http://firm.local/mcp",
+            RoleLaunchRequest(
+                invocation=invocation(),
+                role_id='r-example',
+                run_id='run-example',
+                mcp_url='http://firm.local/mcp',
+                provider_session_id=None,
+                offered_tools=tuple(TOOL_DESCRIPTIONS),
+                task_timeout_seconds=600,
+            ),
             layout=Layout(),
         )
 
@@ -276,7 +316,16 @@ def test_auth_file_is_selected_explicitly_and_read_only_at_build(tmp_path):
 def test_rejects_non_direct_mcp_urls(tmp_path, url):
     with pytest.raises(ValueError, match="mcp_url"):
         provider(tmp_path).build_spec(
-            invocation(), "r-example", "run-example", url, layout=Layout()
+            RoleLaunchRequest(
+                invocation=invocation(),
+                role_id='r-example',
+                run_id='run-example',
+                mcp_url=url,
+                provider_session_id=None,
+                offered_tools=tuple(TOOL_DESCRIPTIONS),
+                task_timeout_seconds=600,
+            ),
+            layout=Layout(),
         )
 
 
@@ -325,7 +374,16 @@ def test_employee_birth_and_fresh_transition_inputs_are_attributed(tmp_path):
         }
     )
     spec = provider(tmp_path).build_spec(
-        call, "r-example", "run-example", "http://firm.local/mcp", layout=Layout()
+        RoleLaunchRequest(
+            invocation=call,
+            role_id='r-example',
+            run_id='run-example',
+            mcp_url='http://firm.local/mcp',
+            provider_session_id=None,
+            offered_tools=tuple(TOOL_DESCRIPTIONS),
+            task_timeout_seconds=600,
+        ),
+        layout=Layout(),
     )
     prompt = spec.stdin.decode()
     assert resource_prompt("birth.md") in prompt
@@ -677,9 +735,9 @@ def test_codex_rollout_subscription_windows_are_projected_and_parsed():
             "secondary": {"used_percent": 0.0, "resets_at": 3000},
         },
     }
-    assert parse_subscription(json.dumps(projected)) == {
-        "event_id": "line:0",
-        "windows": [
+    assert parse_subscription(json.dumps(projected)) == SubscriptionObservation(
+        event_id="line:0",
+        windows=(
             {
                 "window": "codex_primary",
                 "limit_id": "codex",
@@ -692,8 +750,8 @@ def test_codex_rollout_subscription_windows_are_projected_and_parsed():
                 "used_percent": 0.0,
                 "resets_at": 3000,
             },
-        ],
-    }
+        ),
+    )
 
 
 def test_codex_rate_limit_only_token_count_survives_null_usage_info():
@@ -714,7 +772,7 @@ def test_codex_rate_limit_only_token_count_survives_null_usage_info():
         "limit_id": "codex_other",
         "primary": {"used_percent": 99.0, "resets_at": 2000.0},
     }
-    assert parse_subscription(json.dumps(projected))["windows"][0]["window"] == (
+    assert parse_subscription(json.dumps(projected)).windows[0]["window"] == (
         "codex_other_primary"
     )
 
@@ -723,7 +781,7 @@ def test_codex_subscription_parser_ignores_missing_rate_limit_snapshots():
     reading = parse_subscription(
         json.dumps({"type": "firm.telemetry", "provider": "codex", "usage": {}})
     )
-    assert reading is not None and reading["windows"] == []
+    assert reading is not None and reading.windows == ()
 
 
 @pytest.mark.parametrize(
@@ -740,7 +798,7 @@ def test_newer_codex_missing_or_invalid_snapshot_supersedes_older_one(limits):
         },
     }
     latest = {"type": "firm.telemetry", "provider": "codex", "usage": {}, "rate_limits": limits}
-    assert parse_subscription("\n".join([json.dumps(first), json.dumps(latest)]))["windows"] == []
+    assert parse_subscription("\n".join([json.dumps(first), json.dumps(latest)])).windows == ()
 
 
 def test_turn_usage_does_not_claim_rollout_compaction_support():

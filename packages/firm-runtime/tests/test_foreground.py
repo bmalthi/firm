@@ -1,12 +1,15 @@
+import errno
 import os
 import signal
 import socket
 import time as wall_time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
-from firm_sandbox import Layout
+from firm_sandbox import Config, Layout
+from firm_sandbox.file_server import FileServer, local_runner
 
 import firm_runtime.sandbox_dispatcher as sandbox_dispatcher
 from firm_runtime import foreground
@@ -95,9 +98,13 @@ class Box:
         self.config = config
         self.live = False
         self.ups = self.downs = 0
-        self.file_server = object()
         config.root.mkdir(parents=True, exist_ok=True)
         config.root.chmod(0o700)
+        config.durable.mkdir(mode=0o700, exist_ok=True)
+        config.durable.chmod(0o700)
+        tree = config.root / "tree"
+        tree.mkdir(exist_ok=True)
+        self.file_server = FileServer(Config(root=config.root), local_runner(tree))
         Box.latest = self
 
     def identity(self):
@@ -131,6 +138,7 @@ class Box:
         raise AssertionError("the Mac lease is not part of these host tests")
 
     def up(self):
+        self.file_server.start()
         self.live = True
         self.ups += 1
 
@@ -577,6 +585,43 @@ def test_a_taken_port_names_the_port_and_the_likely_cause():
     assert f"cannot listen on 127.0.0.1:{port}" in str(error.value)
     assert "another firm's host is probably running" in str(error.value)
     assert "--mcp-port" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        OSError(errno.EADDRINUSE, "Address already in use"),
+        OSError(errno.EACCES, "Permission denied"),
+        OSError(errno.EPERM, "Operation not permitted"),
+        OSError(errno.EADDRNOTAVAIL, "Cannot assign requested address"),
+        OSError("socket bind failed"),
+    ],
+)
+def test_local_server_bind_failure_reports_the_cause_and_closes_socket(monkeypatch, failure):
+    listener = Mock()
+    listener.bind.side_effect = failure
+    monkeypatch.setattr("firm_runtime.hosting.socket.socket", Mock(return_value=listener))
+    app_factory = Mock()
+
+    with pytest.raises(FirmError) as error:
+        with LocalServer(app_factory, port=8765):
+            pytest.fail("server started despite a failed bind")
+
+    message = str(error.value)
+    assert "cannot listen on 127.0.0.1:8765" in message
+    assert str(failure) in message
+    if failure.errno == errno.EADDRINUSE:
+        assert "another firm's host is probably running" in message
+        assert "--mcp-port" in message
+        assert "--console-port" in message
+    else:
+        assert "another firm" not in message
+        assert "--mcp-port" not in message
+        assert "--console-port" not in message
+    if failure.errno in {errno.EACCES, errno.EPERM}:
+        assert "permissions or sandbox restrictions" in message
+    app_factory.assert_not_called()
+    listener.close.assert_called_once_with()
 
 
 def test_detached_launcher_returns_reconnects_and_keeps_child_output_alive(tmp_path, monkeypatch):

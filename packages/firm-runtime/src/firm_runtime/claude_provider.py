@@ -12,14 +12,18 @@ from uuid import NAMESPACE_URL, uuid5
 
 from firm_sandbox import Layout, RunSpec
 
-from . import claude_launch, credential_mirror
+from . import claude_auth, claude_launch, credential_mirror
+from .credential_store import access_credentials
 from .provider_contract import (
-    SUPPORTED_EFFORTS,
     ErrorKind,
     ProviderError,
     ProviderResult,
     ProviderSetupError,
     ProviderUsage,
+    RoleLaunchRequest,
+    SubscriptionObservation,
+    SubscriptionWarning,
+    SubscriptionWindow,
     category_for_code,
     reset_at,
     retry_after_seconds,
@@ -28,69 +32,17 @@ from .provider_contract import (
     token_count,
     tool_name,
 )
+from .provider_definitions import PROVIDER_DEFINITIONS
 from .provider_support import (
-    access_credentials,
     activation_url,
     canonical_uuid,
-    read_private_credential,
     render_invocation,
+    role_mcp_settings,
     standing,
     summary_instructions,
     text_setting,
 )
-from .runtime import Invocation
 from .summaries import SummaryLaunch, SummaryOutput, summary_role_id
-
-MAX_TOKEN_BYTES = 4096
-
-
-def _auth_error(code: str, message: str) -> ProviderSetupError:
-    return ProviderSetupError(category="auth", code=code, message=message)
-
-
-def _read_auth(path: Path) -> tuple[str, bytes]:
-    raw = read_private_credential(path, "Claude")
-    if b"\0" in raw:
-        raise _auth_error(
-            "credential_invalid", "configured Claude authentication contains a NUL byte"
-        )
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        raise _auth_error(
-            "credential_invalid", "configured Claude authentication is not valid UTF-8"
-        ) from None
-    if text.lstrip().startswith(("{", "[")):
-        try:
-            credentials = json.loads(text)
-        except json.JSONDecodeError:
-            raise _auth_error(
-                "credential_invalid", "configured Claude authentication is not valid JSON"
-            ) from None
-        if not isinstance(credentials, dict) or not credentials:
-            raise _auth_error(
-                "credential_invalid",
-                "configured Claude authentication must contain a JSON object",
-            )
-        return "credentials-json", raw
-    if len(raw) > MAX_TOKEN_BYTES:
-        raise _auth_error(
-            "credential_too_large", "configured Claude OAuth token exceeds 4096 bytes"
-        )
-    if text.endswith("\r\n"):
-        body = text[:-2]
-    elif text.endswith(("\n", "\r")):
-        body = text[:-1]
-    else:
-        body = text
-    if "\n" in body or "\r" in body:
-        raise _auth_error(
-            "credential_invalid", "configured Claude authentication must contain one line"
-        )
-    token = body.strip()
-    if not token:
-        raise _auth_error("credential_invalid", "configured Claude authentication is empty")
-    return "oauth-token", token.encode()
 
 
 class ClaudeProvider:
@@ -112,11 +64,14 @@ class ClaudeProvider:
             raise ProviderSetupError(
                 category="config", code="invalid_model", message=str(exc)
             ) from None
-        if effort not in SUPPORTED_EFFORTS["claude"]:
+        if effort not in PROVIDER_DEFINITIONS["claude"].supported_efforts:
             raise ProviderSetupError(
                 category="config",
                 code="invalid_effort",
-                message=("effort must be one of " + ", ".join(sorted(SUPPORTED_EFFORTS["claude"]))),
+                message=(
+                    "effort must be one of "
+                    + ", ".join(sorted(PROVIDER_DEFINITIONS["claude"].supported_efforts))
+                ),
             )
         self.effort = effort
         if not isinstance(auth_file, Path):
@@ -142,30 +97,14 @@ class ClaudeProvider:
         return self.executable or f"{layout.tools}/claude"
 
     def validate_credentials(self):
-        kind, raw = _read_auth(self.auth_file)
-        if kind == "credentials-json":
-            account = json.loads(raw).get("claudeAiOauth")
-            if not (
-                isinstance(account, dict)
-                and isinstance(account.get("accessToken"), str)
-                and account["accessToken"].strip()
-            ):
-                raise _auth_error(
-                    "credential_missing_token",
-                    "configured Claude authentication has no OAuth token",
-                )
+        claude_auth.validate_credentials(self.auth_file)
 
-    def build_spec(
-        self,
-        invocation: Invocation,
-        role_id: str,
-        run_id: str,
-        mcp_url: str,
-        provider_session_id: str | None = None,
-        *,
-        layout: Layout,
-    ) -> RunSpec:
+    def build_spec(self, request: RoleLaunchRequest, *, layout: Layout) -> RunSpec:
+        invocation = request.invocation
+        role_id, run_id = request.role_id, request.run_id
+        mcp_url, provider_session_id = request.mcp_url, request.provider_session_id
         try:
+            offered_tools, mcp_timeout = role_mcp_settings(request)
             runtime_session_id = canonical_uuid(invocation.session_id, "runtime session ID")
             if provider_session_id is not None:
                 provider_session_id = canonical_uuid(
@@ -187,6 +126,8 @@ class ClaudeProvider:
                     "type": "http",
                     "url": mcp_url,
                     "headers": {"Authorization": "Bearer ${FIRM_ACTIVATION_TOKEN}"},
+                    # Per-server milliseconds also raise Claude's HTTP idle timeout.
+                    "timeout": mcp_timeout * 1000,
                 }
             }
         }
@@ -198,6 +139,11 @@ class ClaudeProvider:
             "attribution": {"commit": "", "pr": ""},
             "claudeMdExcludes": ["**"],
         }
+        from .mcp_server import TOOL_DESCRIPTIONS
+
+        denied_mcp = [
+            f"mcp__firm__{name}" for name in TOOL_DESCRIPTIONS if name not in offered_tools
+        ]
         command = [
             self._executable(layout),
             "-p",
@@ -222,6 +168,7 @@ class ClaudeProvider:
             "ListAgents",
             "Task",
             "Agent",
+            *denied_mcp,
             "--mcp-config",
             json.dumps(mcp_config, separators=(",", ":"), sort_keys=True),
             "--strict-mcp-config",
@@ -236,7 +183,7 @@ class ClaudeProvider:
         else:
             command += ["--resume", provider_session_id]
 
-        auth_kind, auth = _read_auth(self.auth_file)
+        auth_kind, auth = claude_auth.read_auth(self.auth_file)
         secret_env = {"FIRM_ACTIVATION_TOKEN": "activation-token"}
         if auth_kind == "oauth-token":
             secret_env["CLAUDE_CODE_OAUTH_TOKEN"] = "claude-auth"
@@ -254,6 +201,8 @@ class ClaudeProvider:
                 "FIRM_PRIVATE_HOME": layout.private,
                 # Telemetry and update checks stay off the firm's allowlist.
                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                # Firm task() must return its bounded result in the calling turn.
+                "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "0",
             },
             secrets={
                 "credential-mirror": Path(credential_mirror.__file__).read_bytes(),
@@ -282,7 +231,7 @@ class ClaudeProvider:
         return parse_tool_calls(logs)
 
     @staticmethod
-    def parse_subscription(logs: bytes | str) -> dict | None:
+    def parse_subscription(logs: bytes | str) -> SubscriptionObservation | None:
         return parse_subscription(logs)
 
     def build_summary_spec(self, request: SummaryLaunch, layout: Layout) -> RunSpec:
@@ -302,7 +251,7 @@ class ClaudeProvider:
             )
         model = request.model or self.model
         effort = request.effort or self.effort
-        if effort not in SUPPORTED_EFFORTS["claude"]:
+        if effort not in PROVIDER_DEFINITIONS["claude"].supported_efforts:
             raise ProviderSetupError(
                 category="config", code="invalid_effort", message="invalid summary effort"
             )
@@ -356,7 +305,7 @@ class ClaudeProvider:
             "--strict-mcp-config",
             *(["--mcp-config", '{"mcpServers":{}}'] if task else []),
         ]
-        auth_kind, auth = _read_auth(self.auth_file)
+        auth_kind, auth = claude_auth.read_auth(self.auth_file)
         secret_env = {}
         if auth_kind == "oauth-token":
             secret_env["CLAUDE_CODE_OAUTH_TOKEN"] = "claude-auth"
@@ -670,7 +619,7 @@ def parse_usage(logs: bytes | str) -> ProviderUsage | None:
     )
 
 
-def parse_subscription(logs: bytes | str) -> dict | None:
+def parse_subscription(logs: bytes | str) -> SubscriptionObservation | None:
     """Return the latest structured subscription allowance event, if any."""
     raw = logs.decode(errors="replace") if isinstance(logs, bytes) else logs
     if not isinstance(raw, str):
@@ -686,15 +635,13 @@ def parse_subscription(logs: bytes | str) -> dict | None:
         info = event.get("rate_limit_info")
         if not isinstance(info, dict):
             event_id = event.get("uuid")
-            latest = {
-                "event_id": event_id if isinstance(event_id, str) else f"line:{index}",
-                "windows": [],
-                "status": None,
-                "warning": None,
-            }
+            latest = SubscriptionObservation(
+                event_id=event_id if isinstance(event_id, str) else f"line:{index}",
+                windows=(),
+            )
             continue
         unified = info.get("unifiedWindows")
-        windows = []
+        windows: list[SubscriptionWindow] = []
         for key, value in unified.items() if isinstance(unified, dict) else ():
             if not re.fullmatch(r"[a-z0-9_]{1,40}", key) or not isinstance(value, dict):
                 continue
@@ -708,12 +655,12 @@ def parse_subscription(logs: bytes | str) -> dict | None:
             )
         warning = _warning_window(info)
         event_id = event.get("uuid")
-        latest = {
-            "event_id": event_id if isinstance(event_id, str) else f"line:{index}",
-            "windows": windows,
-            "status": info.get("status"),
-            "warning": warning,
-        }
+        latest = SubscriptionObservation(
+            event_id=event_id if isinstance(event_id, str) else f"line:{index}",
+            windows=tuple(windows),
+            status=info.get("status") if isinstance(info.get("status"), str) else None,
+            warning=warning,
+        )
     return latest
 
 
@@ -742,7 +689,7 @@ def _valid_reset_timestamp(value: object) -> float | None:
     return timestamp if timestamp is not None and 0 < timestamp <= 253402300799 else None
 
 
-def _warning_window(info: dict) -> dict | None:
+def _warning_window(info: dict) -> SubscriptionWarning | None:
     """Identify only the bucket the provider itself marked as warning."""
     status = info.get("status")
     rate_type = info.get("rateLimitType")

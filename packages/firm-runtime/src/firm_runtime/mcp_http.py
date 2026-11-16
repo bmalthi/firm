@@ -107,7 +107,7 @@ def build_http_app(
         if token is None:
             return _auth_error()
         try:
-            result = runtime.begin_execution(token)
+            result = await anyio.to_thread.run_sync(runtime.begin_execution, token)
         except FirmError:
             return _auth_error()
         return JSONResponse(result)
@@ -121,7 +121,7 @@ def build_http_app(
         if token is None:
             return _auth_error()
         try:
-            result = runtime.summary_service.begin_execution(token)
+            result = await anyio.to_thread.run_sync(runtime.summary_service.begin_execution, token)
         except FirmError:
             return _auth_error()
         return JSONResponse(result)
