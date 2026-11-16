@@ -16,8 +16,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from .credential_files import failure as credential_failure
+from .credential_files import read_private_credential
 from .provider_contract import ProviderSetupError
-from .provider_support import read_private_credential
 
 TOKEN_PATH = Path(".gemini/antigravity-cli/antigravity-oauth-token")
 # Native tokens are read once and last about an hour; start with nearly a full token.
@@ -308,3 +309,70 @@ def force_renew(auth_file, *, replace):
     finally:
         # The backup also survives SIGKILL and is restored on the next locked pass.
         restore_expiry(auth_file, replace=replace)
+
+
+def read_auth(path):
+    profile_home(path)
+    return read_private_credential(path, "AGY")
+
+
+def project(raw):
+    try:
+        text = raw.decode() if isinstance(raw, bytes) else raw
+        document = json.loads(text)
+        if not isinstance(document, dict):
+            raise ValueError
+    except (UnicodeError, ValueError, AttributeError, TypeError):
+        raise credential_failure("credential_invalid") from None
+    return access_projection(document)
+
+
+def snapshot(files, force, *, margin, clock, refresh):
+    """Native renewal and interrupted-write recovery, independent of HTTP refresh."""
+    profile_home(files.path)
+    try:
+        raw, document = read_native(files.path)
+        snapshot = access_projection(document)
+    except ProviderSetupError:
+        pass  # A native mid-write gets a second read under the renewal lock.
+    else:
+        backup = _expiry_backup(files.path)
+        if (not force and not backup.exists() and not backup.is_symlink()
+                and (margin is None or snapshot["expires_at"] >= clock() + margin)):
+            return snapshot
+    with files.locked():
+        restore_expiry(files.path, replace=files.replace)
+        for _ in range(3):
+            raw, document = read_native(files.path)
+            current = access_projection(document)
+            if not force and (margin is None or current["expires_at"] >= clock() + margin):
+                return current
+            try:
+                renewed = force_renew(files.path, replace=files.replace)
+            except (ProviderSetupError, OSError) as exc:
+                if isinstance(exc, OSError):
+                    exc = credential_failure("credential_persist_unavailable", transient=True)
+                if read_native(files.path)[1] != document:
+                    force = False
+                    continue
+                # Native CLI has no structured HTTP rejection; do not infer from prose.
+                if exc.category == "transient":
+                    if current["expires_at"] > clock() + 300:
+                        return current
+                    if current["expires_at"] <= clock():
+                        raise credential_failure("credential_refresh_rejected") from None
+                raise exc from None
+            native, native_document = read_native(files.path)
+            if native_document != renewed:
+                force = False
+                continue
+            result = project(native)
+            if result["expires_at"] <= clock():
+                raise credential_failure("credential_refresh_invalid", transient=True)
+            try:
+                if files.replace(native, renewed):
+                    return result
+            except OSError:
+                raise credential_failure("credential_persist_unavailable", transient=True) from None
+            force = False
+    raise credential_failure("credential_refresh_conflict", transient=True)

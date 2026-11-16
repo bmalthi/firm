@@ -12,10 +12,13 @@ from firm_runtime.claude_provider import (
     parse_tool_calls,
     parse_usage,
 )
+from firm_runtime.mcp_server import TOOL_DESCRIPTIONS
 from firm_runtime.prompt_resources import prompt
 from firm_runtime.provider_contract import (
     MAX_RETRY_AFTER_SECONDS,
     ProviderSetupError,
+    RoleLaunchRequest,
+    SubscriptionObservation,
     reset_at,
     retry_after_seconds,
 )
@@ -61,10 +64,15 @@ def provider(tmp_path, *, auth=b"oauth-test-secret"):
 def test_builds_fresh_spec_with_explicit_settings_and_secret_token(tmp_path):
     call = invocation()
     spec = provider(tmp_path).build_spec(
-        call,
-        "r-example",
-        "run-example",
-        "http://firm.local:8421/mcp",
+        RoleLaunchRequest(
+            invocation=call,
+            role_id='r-example',
+            run_id='run-example',
+            mcp_url='http://firm.local:8421/mcp',
+            provider_session_id=None,
+            offered_tools=tuple(TOOL_DESCRIPTIONS),
+            task_timeout_seconds=600,
+        ),
         layout=Layout(),
     )
 
@@ -78,6 +86,7 @@ def test_builds_fresh_spec_with_explicit_settings_and_secret_token(tmp_path):
     assert spec.secrets["claude-auth"] == b"oauth-test-secret"
     assert spec.env["FIRM_ACTIVATION_START_URL"] == ("http://firm.local:8421/activation/start")
     assert spec.env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+    assert spec.env["CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS"] == "0"
 
     command = json.loads(spec.env["FIRM_CLAUDE_ARGV"])
     assert command[:2] == [f"{Layout().tools}/claude", "-p"]
@@ -101,6 +110,7 @@ def test_builds_fresh_spec_with_explicit_settings_and_secret_token(tmp_path):
                 "headers": {"Authorization": "Bearer ${FIRM_ACTIVATION_TOKEN}"},
                 "type": "http",
                 "url": "http://firm.local:8421/mcp",
+                "timeout": 665000,
             }
         }
     }
@@ -190,6 +200,7 @@ def test_isolated_claude_turn_always_has_an_empty_tool_set_and_no_mcp(
     assert not any(arg in command for arg in ("--mcp-config", "--allowedTools", "--allowed-tools"))
     assert "--strict-mcp-config" in command
     assert spec.env["FIRM_SUMMARY_RUN"] == "1"
+    assert "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS" not in spec.env
     assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in spec.env
 
 
@@ -267,11 +278,15 @@ def test_builds_exact_resume_and_rejects_noncanonical_native_id(tmp_path):
     )
     native_id = str(uuid4())
     spec = provider(tmp_path).build_spec(
-        call,
-        "r-example",
-        "run-example",
-        "https://bridge.example/mcp",
-        native_id,
+        RoleLaunchRequest(
+            invocation=call,
+            role_id='r-example',
+            run_id='run-example',
+            mcp_url='https://bridge.example/mcp',
+            provider_session_id=native_id,
+            offered_tools=tuple(TOOL_DESCRIPTIONS),
+            task_timeout_seconds=600,
+        ),
         layout=Layout(),
     )
     command = json.loads(spec.env["FIRM_CLAUDE_ARGV"])
@@ -281,11 +296,15 @@ def test_builds_exact_resume_and_rejects_noncanonical_native_id(tmp_path):
 
     with pytest.raises(ProviderSetupError, match="must be a UUID") as caught:
         provider(tmp_path).build_spec(
-            call,
-            "r-example",
-            "run-example",
-            "https://bridge.example/mcp",
-            "../../token",
+            RoleLaunchRequest(
+                invocation=call,
+                role_id='r-example',
+                run_id='run-example',
+                mcp_url='https://bridge.example/mcp',
+                provider_session_id='../../token',
+                offered_tools=tuple(TOOL_DESCRIPTIONS),
+                task_timeout_seconds=600,
+            ),
             layout=Layout(),
         )
     assert caught.value.category == "config"
@@ -297,7 +316,16 @@ def test_auth_file_is_private_explicit_and_read_at_build(tmp_path):
     adapter = ClaudeProvider(model="claude-sonnet-4-5", effort="medium", auth_file=auth_file)
     with pytest.raises(ProviderSetupError) as missing:
         adapter.build_spec(
-            invocation(), "r-example", "run-example", "http://firm/mcp", layout=Layout()
+            RoleLaunchRequest(
+                invocation=invocation(),
+                role_id='r-example',
+                run_id='run-example',
+                mcp_url='http://firm/mcp',
+                provider_session_id=None,
+                offered_tools=tuple(TOOL_DESCRIPTIONS),
+                task_timeout_seconds=600,
+            ),
+            layout=Layout(),
         )
     assert (missing.value.category, missing.value.code) == ("auth", "credential_unreadable")
 
@@ -305,7 +333,16 @@ def test_auth_file_is_private_explicit_and_read_at_build(tmp_path):
     auth_file.chmod(0o600)
     with pytest.raises(ProviderSetupError) as multiline:
         adapter.build_spec(
-            invocation(), "r-example", "run-example", "http://firm/mcp", layout=Layout()
+            RoleLaunchRequest(
+                invocation=invocation(),
+                role_id='r-example',
+                run_id='run-example',
+                mcp_url='http://firm/mcp',
+                provider_session_id=None,
+                offered_tools=tuple(TOOL_DESCRIPTIONS),
+                task_timeout_seconds=600,
+            ),
+            layout=Layout(),
         )
     assert (multiline.value.category, multiline.value.code) == (
         "auth",
@@ -316,7 +353,16 @@ def test_auth_file_is_private_explicit_and_read_at_build(tmp_path):
     auth_file.chmod(0o644)
     with pytest.raises(ProviderSetupError) as public:
         adapter.build_spec(
-            invocation(), "r-example", "run-example", "http://firm/mcp", layout=Layout()
+            RoleLaunchRequest(
+                invocation=invocation(),
+                role_id='r-example',
+                run_id='run-example',
+                mcp_url='http://firm/mcp',
+                provider_session_id=None,
+                offered_tools=tuple(TOOL_DESCRIPTIONS),
+                task_timeout_seconds=600,
+            ),
+            layout=Layout(),
         )
     assert (public.value.category, public.value.code) == (
         "auth",
@@ -327,14 +373,32 @@ def test_auth_file_is_private_explicit_and_read_at_build(tmp_path):
 def test_exported_credentials_json_is_copied_to_tmpfs_not_put_in_environment(tmp_path):
     adapter = provider(tmp_path, auth=b'{"claudeAiOauth":{"accessToken":"secret"}}')
     spec = adapter.build_spec(
-        invocation(), "r-example", "run-example", "http://firm.local/mcp", layout=Layout()
+        RoleLaunchRequest(
+            invocation=invocation(),
+            role_id='r-example',
+            run_id='run-example',
+            mcp_url='http://firm.local/mcp',
+            provider_session_id=None,
+            offered_tools=tuple(TOOL_DESCRIPTIONS),
+            task_timeout_seconds=600,
+        ),
+        layout=Layout(),
     )
     assert spec.env["FIRM_CLAUDE_AUTH_KIND"] == "credentials-json"
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in spec.secret_env
     assert spec.secrets["claude-auth"].startswith(b"{")
 
     token_spec = provider(tmp_path).build_spec(
-        invocation(), "r-example", "run-example", "http://firm.local/mcp", layout=Layout()
+        RoleLaunchRequest(
+            invocation=invocation(),
+            role_id='r-example',
+            run_id='run-example',
+            mcp_url='http://firm.local/mcp',
+            provider_session_id=None,
+            offered_tools=tuple(TOOL_DESCRIPTIONS),
+            task_timeout_seconds=600,
+        ),
+        layout=Layout(),
     )
     assert token_spec.env["FIRM_CLAUDE_AUTH_KIND"] == "oauth-token"
     assert token_spec.secret_env["CLAUDE_CODE_OAUTH_TOKEN"] == "claude-auth"
@@ -1040,17 +1104,17 @@ def test_latest_streamed_rate_limit_windows_become_percentages():
         )
 
     logs = "\n".join((event("old", 0.01, 0.5), event("new", 0.04, 0.54), "not json"))
-    assert parse_subscription(logs.encode()) == {
-        "event_id": "new",
-        "windows": [
+    assert parse_subscription(logs.encode()) == SubscriptionObservation(
+        event_id="new",
+        windows=(
             {"window": "five_hour", "used_percent": 4.0, "resets_at": 1789621200},
             {"window": "seven_day", "used_percent": 54.0, "resets_at": 1789858800},
-        ],
-        "status": "allowed",
-        "warning": None,
-    }
+        ),
+        status="allowed",
+        warning=None,
+    )
     malformed = parse_subscription(event("bad", 4, True))
-    assert malformed is not None and malformed["windows"] == []
+    assert malformed is not None and malformed.windows == ()
     assert parse_subscription(json.dumps({"type": "result"})) is None
 
 
@@ -1068,7 +1132,7 @@ def test_malformed_rate_limit_type_and_status_are_ignored_safely():
             }
         )
     )
-    assert result is not None and result["windows"] == [] and result["warning"] is None
+    assert result is not None and result.windows == () and result.warning is None
 
 
 def test_newer_empty_subscription_event_supersedes_older_windows():
@@ -1086,7 +1150,7 @@ def test_newer_empty_subscription_event_supersedes_older_windows():
     new = json.dumps(
         {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed"}}
     )
-    assert parse_subscription("\n".join([old, new]))["windows"] == []
+    assert parse_subscription("\n".join([old, new])).windows == ()
 
 
 def test_subscription_percentage_is_not_rounded_up_before_admission():
@@ -1096,8 +1160,8 @@ def test_subscription_percentage_is_not_rounded_up_before_admission():
             "unifiedWindows": {"five_hour": {"utilization": 0.7996, "resetsAt": 5000}},
         },
     }))
-    assert reading["windows"][0]["used_percent"] == pytest.approx(79.96)
-    assert reading["windows"][0]["used_percent"] < 80
+    assert reading.windows[0]["used_percent"] == pytest.approx(79.96)
+    assert reading.windows[0]["used_percent"] < 80
 
 
 def test_rejected_subscription_window_supplies_only_its_structured_reset():
@@ -1318,7 +1382,7 @@ def test_allowed_warning_identifies_window_from_provider_status():
             }
         )
     )
-    assert result["warning"] == {
+    assert result.warning == {
         "window": "seven_day_opus",
         "resets_at": 5000,
         "status": "allowed_warning",

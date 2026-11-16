@@ -3,6 +3,95 @@ import test from "node:test";
 import {age, bytes, clockTime, time, incidentTitle, vmState, runtimeState, decisionStatus, incidentStatus, inboxGroups, inboxWindow, machineName, needsYou, pageTitle, readinessPhrase, seconds, statusHeadline, statusSentence} from "../src/firm_runtime/web_console/format.js";
 import {buildRoleForest} from "../src/firm_runtime/web_console/role_tree.js";
 import {filePreviewable, fileFolder, fileDeliveries, resultHref, firmMenuLabel, fileReplyMatches} from "../src/firm_runtime/web_console/format.js";
+import {subscriptionQuotaDetail} from "../src/firm_runtime/web_console/format.js";
+import {createSystem} from "../src/firm_runtime/web_console/system.js";
+
+test("empty execution allowance explains unavailability with its source and observation time", () => {
+  for (const provider of ["Claude", "Codex"]) {
+    const detail = subscriptionQuotaDetail({
+      state: "unavailable", windows: [], polled: false, observed_at: 0,
+      source: `${provider} role stream`, capability: {stream: true, poll: "reading"},
+    }, (value) => `time:${value}`);
+    assert.match(detail, /latest execution stream contained no usable subscription allowance reading/);
+    assert.ok(detail.includes(`${provider} role stream · observed time:0`));
+  }
+});
+
+test("subscription allowance distinguishes auth capability, waiting and failed refresh", () => {
+  assert.equal(subscriptionQuotaDetail({state: "unavailable", capability: {poll: "unsupported_auth"}}), "This login does not support subscription polling.");
+  assert.match(subscriptionQuotaDetail({state: "awaiting_stream"}), /uses execution streams/);
+  assert.match(subscriptionQuotaDetail({state: "unavailable", error: "reading_unavailable"}), /unavailable; will retry/);
+  assert.match(subscriptionQuotaDetail({state: "stale", observed_at: 100, checked_at: 200, error: "rate_limited"}), /latest refresh unavailable/);
+  assert.equal(subscriptionQuotaDetail({state: "current", observed_at: 100}), "");
+});
+
+test("last recorded allowance identifies original poll evidence and newer unavailable stream", () => {
+  for (const provider of ["Claude", "Codex"]) {
+    const quota = {
+      state: "stale", polled: true, observed_at: 100, checked_at: 200,
+      source: `${provider} subscription usage`,
+      unavailable_stream: {source: `${provider} role stream`, observed_at: 150},
+    };
+    const detail = subscriptionQuotaDetail(quota, (value) => `time:${value}`, (value) => `age:${value}`);
+    assert.match(detail, /^Last recorded allowance/);
+    assert.ok(detail.includes(`${provider} subscription usage · observed time:100 · age:100 · checked time:200`));
+    assert.ok(detail.includes(`latest execution stream contained no usable subscription allowance reading: ${provider} role stream · observed time:150`));
+    assert.ok(!detail.includes("Latest refresh unavailable"));
+    assert.match(subscriptionQuotaDetail({...quota, error: "rate_limited"}), /Latest refresh unavailable/);
+  }
+});
+
+test("account freshness updates last recorded allowance age while retaining the account card", async () => {
+  class Node {
+    constructor(tagName, className = "", text = "") {
+      this.tagName = tagName.toUpperCase(); this.className = className; this.textContent = text;
+      this.children = []; this.dataset = {};
+    }
+    append(...nodes) { this.children.push(...nodes); }
+    replaceChildren(...nodes) { this.children = nodes; }
+    matches(selector) { return selector === "details.technical-details" && this.className === "technical-details"; }
+    querySelector() { return null; }
+    getAttribute() { return null; }
+  }
+  const element = (...args) => new Node(...args);
+  const roots = new Map();
+  const $ = (selector) => {
+    if (!roots.has(selector)) roots.set(selector, element("div"));
+    return roots.get(selector);
+  };
+  const originalNow = Date.now;
+  let now = 1000000;
+  Date.now = () => now;
+  try {
+    const system = createSystem({
+      $, api: async () => ({}), element, number: String, time: (value) => `time:${value}`,
+      sourceText: () => "", technicalDetails: (text) => element("details", "technical-details", text),
+      syncChildren: (root, nodes) => root.replaceChildren(...nodes),
+    });
+    const quota = {
+      state: "stale", windows: [{label: "Weekly allowance", used_percent: 5, resets_at: 2000}],
+      source: "Codex subscription usage", observed_at: 880, checked_at: 880, polled: true,
+      unavailable_stream: {source: "Codex role stream", observed_at: 900},
+    };
+    const snapshot = {
+      firm: {state: "running"}, infrastructure_state: "running", active: [], held: [], waiting_roles: 0,
+      accounts: {accounts: [{account_id: "a", provider: "codex", active: 0, max_active: 1, subscription_quota: quota}], incidents: []},
+      drain_outcomes: [], failure_history: [], github: {repositories: [], grants: [], revocations: []},
+      usage: {sessions: []},
+    };
+    await system.update(snapshot, {aborted: true});
+    const card = $("#accounts").children[0];
+    const detail = () => card.children.find((node) => node.className === "quota-detail").textContent;
+    assert.match(detail(), /Last recorded allowance.*2 min ago/);
+    now += 60000;
+    system.freshness();
+    assert.equal($("#accounts").children[0], card);
+    assert.match(detail(), /Last recorded allowance.*3 min ago/);
+    assert.equal(quota.observed_at, 880);
+  } finally {
+    Date.now = originalNow;
+  }
+});
 
 test("a follow-up draft belongs to its exact file and delivering message", () => {
   const file = {message_id: "m1", path: "shared", name: "report.md"};

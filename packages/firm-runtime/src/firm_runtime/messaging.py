@@ -86,6 +86,13 @@ CREATE TABLE IF NOT EXISTS message_deliveries (
 CREATE TABLE IF NOT EXISTS message_claim_sequence (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT
 );
+CREATE TABLE IF NOT EXISTS message_reads (
+    employee_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    PRIMARY KEY(employee_id,session_id,message_id),
+    FOREIGN KEY(message_id,employee_id) REFERENCES message_deliveries(message_id,employee_id)
+);
 CREATE INDEX IF NOT EXISTS pending_mail
     ON message_deliveries(employee_id, disposition, message_id);
 CREATE INDEX IF NOT EXISTS delivery_scheduling
@@ -264,6 +271,7 @@ class Messaging:
         attachments: list | None = None,
         request_id: str,
         session_id: str | None = None,
+        activation_id: str | None = None,
     ) -> dict:
         """Reply into the message's conversation, or into the larger one an addition makes.
 
@@ -302,7 +310,7 @@ class Messaging:
                 "reply",
                 payload,
                 lambda: self._reply(db, actor_id, message_id, body, additions, summary,
-                                    supplied),
+                                    supplied, activation_id=activation_id),
             )
 
     def _reply_target(
@@ -349,7 +357,12 @@ class Messaging:
         additions: list[str],
         summary: dict | None,
         attachments: list,
+        *,
+        activation_id: str | None = None,
     ) -> dict:
+        activation = (
+            self._activation(db, actor_id, activation_id) if activation_id is not None else None
+        )
         self._validate_content(body, None)
         attached = self._attachments(actor_id, attachments)
         target = self._reply_target(db, actor_id, message_id, additions)
@@ -393,12 +406,24 @@ class Messaging:
             attachments=attached,
         )
         result = self._send_result(db, new_id)
-        if actor_id == OWNER and db.execute(
-            "SELECT 1 FROM message_deliveries WHERE message_id=? AND employee_id=? "
-            "AND disposition='pending'",
-            (message_id, OWNER),
-        ).fetchone():
-            self._write_disposition(db, OWNER, [message_id], "dismissed")
+        if actor_id == OWNER or result["queued"]:
+            targets = [r["message_id"] for r in db.execute(
+                "SELECT m.message_id FROM messages m JOIN message_deliveries d USING(message_id) "
+                "WHERE d.employee_id=? AND d.disposition='pending' AND "
+                "(m.message_id=? OR (m.conversation_id=? AND m.sequence<? AND EXISTS "
+                "(SELECT 1 FROM message_reads r WHERE r.employee_id=d.employee_id "
+                "AND r.message_id=m.message_id AND r.session_id=?))) ORDER BY m.sequence",
+                (
+                    actor_id, message_id, source["conversation_id"], source["sequence"],
+                    (activation["session_id"]
+                     if activation is not None and actor_id != OWNER else None),
+                ),
+            )]
+            if targets:
+                self._write_disposition(
+                    db, actor_id, targets, "dismissed" if actor_id == OWNER else "claimed",
+                    activation_id=activation_id,
+                )
         if created:
             result["continues"] = source["conversation_id"]
         if summary is not None:
@@ -939,11 +964,16 @@ class Messaging:
                 *message_ids,
             ),
         )
+        db.execute(
+            f"DELETE FROM message_reads WHERE employee_id=? AND message_id IN ({placeholders})",
+            (actor_id, *message_ids),
+        )
 
     @staticmethod
     def _activation(db: sqlite3.Connection, actor_id: str, activation_id: str) -> sqlite3.Row:
         activation = db.execute(
-            "SELECT employee_id,state,inbox_seen_sequence FROM activations WHERE activation_id=?",
+            "SELECT employee_id,session_id,state,inbox_seen_sequence "
+            "FROM activations WHERE activation_id=?",
             (activation_id,),
         ).fetchone()
         if (
@@ -956,12 +986,25 @@ class Messaging:
 
     # ---------------------------------------------------------------- lookup
 
-    def messages(self, actor_id: str, message_ids: list[str]) -> dict:
+    def messages(
+        self, actor_id: str, message_ids: list[str], *, activation_id: str | None = None
+    ) -> dict:
         ids = self._validate_ids(message_ids)
-        with self.store.read() as db:
+        with self.store.transaction() as db:
             self.store.require_actor(db, actor_id)
+            activation = (
+                self._activation(db, actor_id, activation_id)
+                if activation_id is not None else None
+            )
             result = {"messages": self._envelopes(db, ids)}
             self._check_budget(result, MAX_RESULT_BYTES, "message lookup result")
+            if activation is not None:
+                db.executemany(
+                    "INSERT OR IGNORE INTO message_reads(employee_id,session_id,message_id) "
+                    "SELECT employee_id,?,message_id FROM message_deliveries "
+                    "WHERE employee_id=? AND message_id=? AND disposition='pending'",
+                    [(activation["session_id"], actor_id, mid) for mid in ids],
+                )
             return result
 
     def context(
@@ -1045,6 +1088,7 @@ class Messaging:
             "failure_reason='recipient retired' WHERE employee_id=? AND disposition='pending'",
             (now, employee_id),
         )
+        db.execute("DELETE FROM message_reads WHERE employee_id=?", (employee_id,))
         bounces: list[str] = []
         for delivery in pending:
             author_id = delivery["author_id"]

@@ -3,19 +3,39 @@
 from __future__ import annotations
 
 import json
-import os
-import stat
-from pathlib import Path
+import math
+import re
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
 from . import guidance
 from .prompt_resources import prompt, render
-from .provider_contract import ProviderSetupError
 from .runtime import Invocation
 from .store import OWNER
 
-MAX_AUTH_BYTES = 1024 * 1024
+
+def role_mcp_settings(request) -> tuple[tuple[str, ...], int]:
+    """Validate Firm exposure and budget a native call beyond task cleanup."""
+    # Keep metadata-only provider imports independent of the MCP implementation.
+    from .mcp_server import TOOL_DESCRIPTIONS
+
+    names = request.offered_tools
+    if (
+        not isinstance(names, tuple)
+        or any(
+            not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name)
+            for name in names
+        )
+        or len(set(names)) != len(names)
+        or not set(names) <= TOOL_DESCRIPTIONS.keys()
+    ):
+        raise ValueError("offered Firm tools must be a unique subset of the Firm catalog")
+    timeout = request.task_timeout_seconds
+    # Task cancellation permits a 60-second stop_child RPC. Five more seconds
+    # allow its result to cross the MCP transport. Claude's native timer is int32 ms.
+    if type(timeout) not in (int, float) or not 0 < timeout <= 2_147_418:
+        raise ValueError("task timeout must be finite, positive and at most 2147418 seconds")
+    return names, math.ceil(timeout) + 65
 
 
 def canonical_uuid(value: str, label: str) -> str:
@@ -234,59 +254,3 @@ def summary_instructions() -> str:
 
 def level_instructions() -> str:
     return prompt("runtime_level-choice.md") + "\n"
-
-
-def read_private_credential(path: Path, provider: str) -> bytes:
-    """Read an owner-private authentication file without following links or blocking.
-
-    It must be a regular file owned by this user, readable by no one else and at most
-    1 MiB. ``provider`` names the file in the owner-facing error; parsing the contents
-    belongs to the provider.
-    """
-    subject = f"configured {provider} authentication"
-
-    def refused(code: str, message: str) -> ProviderSetupError:
-        return ProviderSetupError(category="auth", code=code, message=f"{subject} {message}")
-
-    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except (OSError, ValueError):
-        raise refused("credential_unreadable", "file is not readable") from None
-    try:
-        details = os.fstat(descriptor)
-        if not stat.S_ISREG(details.st_mode):
-            raise refused("credential_invalid", "must be a regular file")
-        if hasattr(os, "getuid") and details.st_uid != os.getuid():
-            raise refused("credential_ownership", "has the wrong owner")
-        if details.st_mode & 0o077:
-            raise refused("credential_permissions", "is not private")
-        if details.st_size > MAX_AUTH_BYTES:
-            raise refused("credential_too_large", "exceeds 1 MiB")
-        data = b""
-        while len(data) <= MAX_AUTH_BYTES:
-            chunk = os.read(descriptor, min(64 * 1024, MAX_AUTH_BYTES + 1 - len(data)))
-            if not chunk:
-                break
-            data += chunk
-    except OSError:
-        raise refused("credential_unreadable", "file is not readable") from None
-    finally:
-        os.close(descriptor)
-    if len(data) > MAX_AUTH_BYTES:
-        raise refused("credential_too_large", "exceeds 1 MiB")
-    return data
-
-
-def access_credentials(provider: str, raw: bytes) -> bytes:
-    """Strip renewal authority before credentials cross into a role sandbox."""
-    import json
-
-    from .credential_store import guest_credentials
-
-    snapshot = guest_credentials(provider, raw)
-    return (
-        snapshot["data"].encode()
-        if snapshot["kind"] == "oauth-token"
-        else json.dumps(snapshot["data"]).encode()
-    )

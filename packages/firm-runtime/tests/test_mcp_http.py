@@ -1,10 +1,12 @@
 import asyncio
+import threading
 from contextlib import asynccontextmanager
 
 import httpx
 import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from runtime_test_support import summary_snapshot
 
 from firm_runtime.mcp_http import build_http_app
 from firm_runtime.runtime import Runtime
@@ -188,6 +190,75 @@ def test_activation_start_accepts_only_authorized_admitted_token(tmp_path):
             assert (await start(invocation.token)).status_code == 401
 
     asyncio.run(asyncio.wait_for(check(), timeout=20))
+
+
+@pytest.mark.parametrize("gate", ["activation", "summary"])
+@pytest.mark.parametrize("close_while_waiting", [False, True])
+def test_launch_gate_waiting_for_real_writer_keeps_http_loop_responsive(
+    tmp_path, monkeypatch, gate, close_while_waiting
+):
+    runtime = Runtime(Store.scratch(tmp_path / "firm.sqlite3"))
+    runtime.lifecycle.initialize("test", "Work", {
+        "max_active": 1, "staffing": False, "founder_profile": "default",
+        "profiles": {"default": {}},
+    })
+    runtime.start()
+    invocation = runtime.admit()
+    runtime.mark_launch_attempted(invocation.activation_id)
+    token = invocation.token
+    service = runtime
+    if gate == "summary":
+        service = runtime.summary_service
+        service.capacity = None
+        service.open()
+        _, reservation = service._reserve(summary_snapshot(), None)
+        token = reservation["start_token"]
+    entered, held, release, timed_out = (threading.Event() for _ in range(4))
+    original = service.begin_execution
+
+    def begin(token):
+        entered.set()
+        return original(token)
+
+    monkeypatch.setattr(service, "begin_execution", begin)
+
+    def writer():
+        with runtime.store.transaction() as db:
+            held.set()
+            if not release.wait(5):
+                timed_out.set()
+            if close_while_waiting:
+                db.execute("UPDATE firm SET state='stopping'")
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    assert held.wait(2)
+    app = build_http_app(runtime, **ALLOWED)
+
+    async def check():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as client:
+            pending = asyncio.create_task(client.post(
+                f"/{gate}/start", headers={"Authorization": f"Bearer {token}", "Origin": BASE_URL}
+            ))
+            try:
+                assert await asyncio.to_thread(entered.wait, 2)
+                heartbeat = await asyncio.wait_for(client.post(f"/{gate}/start"), timeout=1)
+                assert heartbeat.status_code == 401
+                assert not pending.done()
+                assert not release.is_set()
+                assert not timed_out.is_set()
+            finally:
+                release.set()
+                response = await asyncio.wait_for(pending, timeout=2)
+            assert response.status_code == (401 if close_while_waiting else 200)
+
+    try:
+        asyncio.run(asyncio.wait_for(check(), timeout=8))
+    finally:
+        release.set()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
 
 
 @pytest.mark.parametrize("during_refresh", ["finish", "reconfigure", "reconfigure_error"])

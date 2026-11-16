@@ -27,7 +27,7 @@ def configuration(path):
         "profiles": {
             "main": {
                 "provider": "agy",
-                "model": "gemini-3.8-flash",
+                "model": "gemini-4-hydrogen",
                 "effort": "medium",
                 "accounts": ["subscription"],
             }
@@ -51,8 +51,7 @@ def test_defaults_and_factory_keep_model_effort_separate(tmp_path, monkeypatch):
     accounts.validate_accounts(config)
     path = config["accounts"]["subscription"]["auth_file"]
     assert path.endswith("/subscription-agy/home/.gemini/antigravity-cli/antigravity-oauth-token")
-    assert accounts.SUMMARY_DEFAULTS["agy"] == {"model": "gemini-3.8-flash", "effort": "medium"}
-    assert config["task"]["agy"] == {"model": "gemini-3.8-flash", "effort": "high"}
+    assert config["task"]["agy"] == {"model": "gemini-4-hydrogen", "effort": "high"}
     assert isinstance(
         provider_adapter(config["profiles"]["main"], config["accounts"]["subscription"]),
         AgyProvider,
@@ -97,6 +96,40 @@ def test_google_cloud_is_rejected_even_if_agy_only_in_alternate(tmp_path):
         accounts.validate_accounts(config)
 
 
+def test_google_cloud_launch_defense_uses_retained_provider_binding(tmp_path, monkeypatch):
+    from runtime_test_support import FakeSandbox
+
+    from firm_runtime.sandbox_dispatcher import SandboxDispatcher
+
+    runtime = runtime_for(tmp_path)
+    providers = Providers(runtime)
+    runtime.start()
+    invocation = runtime.admit()
+    runtime.mark_started(invocation.activation_id)
+    runtime.finish(invocation.activation_id, "interrupted", category="owner_stop")
+    with runtime.store.transaction() as db:
+        config = runtime.accounts.config(db)
+        config["google_cloud"] = {"project": "synthetic"}
+        db.execute("UPDATE firm SET config_json=?", (json.dumps(config),))
+        retained = runtime.accounts.binding(db, invocation.session_id)
+        assert retained["provider"] == "agy"
+    monkeypatch.setattr(AgyProvider, "build_spec", lambda *a, **k: pytest.fail("built spec"))
+    # This check is about the captured launch policy, independent of token freshness.
+    monkeypatch.setattr(providers, "preflight", lambda: {"failures": []})
+    box = FakeSandbox(tmp_path / "sandbox")
+    with SandboxDispatcher(runtime, box, providers,
+                           mcp_url="http://127.0.0.1:9000/mcp") as dispatcher:
+        dispatcher.start()
+        assert dispatcher.tick() == []
+        assert not box.specs
+    with runtime.store.read() as db:
+        latest = db.execute("SELECT * FROM activations ORDER BY rowid DESC LIMIT 1").fetchone()
+        assert latest["activation_id"] != invocation.activation_id
+        assert latest["session_id"] == invocation.session_id
+        assert latest["state"] == "interrupted"
+        assert latest["failure_category"] == "config"
+
+
 def test_owner_staffing_model_defaults(tmp_path):
     config = configuration(tmp_path / "auth")
     config.pop("staffing")
@@ -108,10 +141,10 @@ def test_owner_staffing_model_defaults(tmp_path):
         )
         for name in ("low", "medium", "high", "chooser")
     ] == [
-        ("gemini-3.8-flash", "medium"),
-        ("gemini-3.8-flash", "high"),
+        ("gemini-4-hydrogen", "medium"),
+        ("gemini-4-hydrogen", "high"),
         ("gemini-4-argon", "medium"),
-        ("gemini-3.8-flash", "medium"),
+        ("gemini-4-hydrogen", "low"),
     ]
     result.pop("founder_profile")
     assert levels.founder_execution(result) == ("staffing-high", "high")
@@ -139,7 +172,7 @@ def test_xhigh_chooser_pick_routes_to_owner_selected_native_variant(tmp_path):
         assert record["state"] == "chosen" and record["effort"] == "xhigh"
         role = runtime.store.role(db, employee)
         profile = runtime.accounts.config(db)["profiles"][role["execution_profile"]]
-        assert profile["model"] == "gemini-3.8-flash"
+        assert profile["model"] == "gemini-4-hydrogen"
         assert native_model_id(profile["model"], role["effort"]) == "gemini-4-argon-high"
 
 
@@ -154,7 +187,7 @@ def test_retained_account_and_model_survive_config_edits_and_collision_guard(tmp
         config["profiles"]["main"]["model"] = "gemini-4-argon"
         db.execute("UPDATE firm SET config_json=?", (json.dumps(config),))
     adapter = providers.for_session(invocation.session_id)
-    assert adapter.model == "gemini-3.8-flash"
+    assert adapter.model == "gemini-4-hydrogen"
     assert adapter.auth_file == account(tmp_path)
     with runtime.store.transaction() as db:
         config["google_cloud"] = {"project": "synthetic"}
@@ -187,7 +220,10 @@ def test_quota_unsupported_never_polls_or_uses_stale_stream():
         lambda: {"subscription": {"provider": "agy"}},
         fetchers={"agy": lambda _: pytest.fail("AGY quota must not be polled")},
     )
-    expected = {"state": "unsupported", "windows": [], "polled": False}
+    expected = {
+        "state": "unsupported", "windows": [], "polled": False,
+        "capability": {"stream": False, "poll": "unsupported"},
+    }
     assert observer.snapshot("subscription") == expected
     observer.refresh()
     assert observer.snapshot("subscription", {"observed_at": 100, "windows": []}) == expected
@@ -217,7 +253,7 @@ def test_console_shows_reported_native_variant_separately_from_configured_base(t
     with _login(app) as client:
         roles = client.get("/api/snapshot").json()["roles"]
     founder = next(role for role in roles if role["employee_id"] == "founder")
-    assert founder["execution"]["model"] == "gemini-3.8-flash"
+    assert founder["execution"]["model"] == "gemini-4-hydrogen"
     assert founder["execution"]["resolved_model"] == "gemini-4-argon-high"
 
 

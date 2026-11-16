@@ -149,6 +149,25 @@ def provision_runtime_role(
             raise FirmError(f"workspace provisioning failed: {exc}") from exc
 
 
+def ensure_runtime_role(store: Store, sandbox_root: str | Path, employee_id: str, *, files) -> str:
+    """Reuse a successfully provisioned workspace, or serialize its repair as usual."""
+    if files.config.root != Path(sandbox_root).resolve():
+        raise FirmError("the file server must belong to this sandbox")
+    with store.read() as db:
+        grant = organization_for(store, employee_id)
+        namespace = db.execute(
+            "SELECT value FROM runtime_secrets WHERE name='discovery_cursor'"
+        ).fetchone()["value"]
+        path = files.ready_workspace(
+            sandbox_role_id(employee_id),
+            grant,
+            database_identity=hashlib.sha256(namespace.encode()).hexdigest(),
+        )
+    if path is not None:
+        return path
+    return provision_runtime_role(store, sandbox_root, employee_id, files=files)
+
+
 def workspace_path(files, employee_id: str) -> str | None:
     """The drive-relative current or archived workspace; never a private home."""
     return files.workspace_path(sandbox_role_id(employee_id))

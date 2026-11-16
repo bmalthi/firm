@@ -9,9 +9,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from firm_sandbox import Config, RunSpec
+
 from firm_runtime.runtime import Runtime
 from firm_runtime.store import Store
-from firm_sandbox import Config, RunSpec
+
+AUTH_PATH = "/PRIVATE/AGY-PROFILE/home/.gemini/antigravity-cli/antigravity-oauth-token"
 
 ACCEPTANCE = Path(__file__).resolve().parents[1] / "acceptance"
 
@@ -45,12 +48,12 @@ def access_document():
 def launch_spec(**kwargs):
     return RunSpec("role", ("guest-python", "launcher"), run_id="run-one", env={
         "FIRM_AGY_MODE": "task", "FIRM_AGY_ARGV": json.dumps([
-            "/usr/local/bin/agy", "--print=", "--model", "gemini-3.8-flash-high",
+            "/usr/local/bin/agy", "--print=", "--model", "gemini-4-hydrogen-high",
         ]),
     }, secrets={"agy-auth": json.dumps(access_document()).encode()}, **kwargs)
 
 
-def native_stream(*, model="gemini-3.8-flash-high", native_id="synthetic-native-id",
+def native_stream(*, model="gemini-4-hydrogen-high", native_id="synthetic-native-id",
                   tools=(), reason=None):
     events = [{"event": "init", "conversation_id": native_id,
                "init": {"model": model, "tools": list(tools)}}]
@@ -79,17 +82,22 @@ def test_cli_selects_agy_explicitly(module):
 
 def config():
     return {"max_active": 2, "staffing": False, "founder_profile": "agy",
-            "profiles": {"agy": {"provider": "agy", "model": "gemini-3.8-flash",
+            "profiles": {"agy": {"provider": "agy", "model": "gemini-4-hydrogen",
                                  "effort": "medium", "accounts": ["dedicated"]}},
             "accounts": {"dedicated": {"provider": "agy", "max_active": 2,
-                                       "auth_file": common.AGY_AUTH_FILE}}}
+                                       "auth_file": AUTH_PATH}}}
 
 
-def test_selected_profile_is_copy_free_and_rejects_normal_home_or_billing():
+def test_selected_profile_is_copy_free_and_rejects_normal_home_or_billing(tmp_path):
+    from firm_runtime.agy_auth import prepare_profile
+
+    auth = tmp_path / "profile/home/.gemini/antigravity-cli/antigravity-oauth-token"
+    prepare_profile(auth)
     source = config()
+    source["accounts"]["dedicated"]["auth_file"] = str(auth)
     profile, accounts = common.selected_profile(source, "agy", "agy")
     assert profile["provider"] == "agy"
-    assert accounts["dedicated"]["auth_file"] == common.AGY_AUTH_FILE
+    assert accounts["dedicated"]["auth_file"] == str(auth)
     with pytest.raises(ValueError, match="select --provider"):
         common.selected_profile(source, "agy", "claude")
     source["accounts"]["dedicated"]["auth_file"] = "~/.gemini/antigravity-oauth-token"
@@ -143,7 +151,7 @@ def test_launch_receipt_checks_actual_model_and_projection(tmp_path):
     spec = launch_spec()
     box.start(spec)
     evidence = launches[spec.run_id]
-    assert evidence["passed"] and evidence["native_model"] == "gemini-3.8-flash-high"
+    assert evidence["passed"] and evidence["native_model"] == "gemini-4-hydrogen-high"
     assert evidence["route"] == "native-subscription"
     assert evidence["quota"] == evidence["context"] == "unavailable"
     assert "synthetic-access" not in (tmp_path / "run-one.launch.json").read_text()
@@ -153,7 +161,7 @@ def test_launch_receipt_checks_actual_model_and_projection(tmp_path):
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("model", ["gemini-4-argon-high", "gemini-3.8-flash-medium",
+@pytest.mark.parametrize("model", ["gemini-4-argon-high", "gemini-4-hydrogen-medium",
                                   "gemini-4-argon-medium"])
 def test_native_model_and_resume_evidence_omit_payloads(model):
     logs = native_stream(model=model, tools=("mcp_firm_peek",))
@@ -171,12 +179,12 @@ def test_native_model_and_resume_evidence_omit_payloads(model):
 def test_output_cannot_claim_wrong_route_resume_or_terminal(failure):
     logs = native_stream(
         reason="print_timeout" if failure == "timeout" else None,
-        model="synthetic-secret-model" if failure == "unknown_model" else "gemini-3.8-flash-high")
+        model="synthetic-secret-model" if failure == "unknown_model" else "gemini-4-hydrogen-high")
     if failure == "missing_result":
         logs = logs.splitlines(keepends=True)[0]
     evidence = common.agy_output_evidence(
         logs, expected_model="gemini-4-argon-high" if failure == "wrong_model"
-        else "gemini-3.8-flash-high", expected_id="different" if failure == "wrong_id" else None,
+        else "gemini-4-hydrogen-high", expected_id="different" if failure == "wrong_id" else None,
         exit_code=1 if failure == "nonzero_exit" else 0)
     assert not (evidence["success"] and evidence["model_matches"])
     assert "synthetic-" not in json.dumps(evidence)
@@ -264,18 +272,23 @@ def test_resume_evidence_validates_launcher_marker(marker_id):
     marker = json.dumps({"type": "firm.agy_expected_session", "conversation_id": marker_id})
     evidence = common.agy_output_evidence(
         marker.encode() + b"\n" + native_stream(), expected_id="synthetic-native-id",
-        expected_model="gemini-3.8-flash-high")
+        expected_model="gemini-4-hydrogen-high")
     assert evidence["success"] is (marker_id == "synthetic-native-id")
     assert "synthetic-" not in json.dumps(evidence)
 
 
-def test_readme_configuration_recipe_matches_runtime_schema(tmp_path):
+def test_readme_configuration_recipe_matches_runtime_schema(tmp_path, monkeypatch):
+    from firm_runtime.agy_auth import prepare_profile
+
+    auth = tmp_path / "profile/home/.gemini/antigravity-cli/antigravity-oauth-token"
+    prepare_profile(auth)
     from firm_runtime.lifecycle import validate_config
 
-    recipe = (ACCEPTANCE / "README.md").read_text().split(
+    recipe = (ACCEPTANCE / "providers.md").read_text().split(
         "## Experimental AGY integrated acceptance", 1)[1]
     firm, sandbox = re.findall(r"```toml\n(.*?)```", recipe, re.S)[:2]
     configured = validate_config(tomllib.loads(firm))
+    configured["accounts"]["agy-dedicated"]["auth_file"] = str(auth)
     profile, accounts = common.selected_profile(configured, "agy", "agy")
     assert profile["effort"] == "medium"
     assert accounts["agy-dedicated"]["max_active"] == 2
@@ -297,7 +310,7 @@ def test_provider_capture_preserves_incremental_log_api(tmp_path):
 
     box = SimpleNamespace(logs=read)
     outputs = provider.capture_provider_logs(
-        box, tmp_path, "agy", {run.run_id: {"native_model": "gemini-3.8-flash-high"}})
+        box, tmp_path, "agy", {run.run_id: {"native_model": "gemini-4-hydrogen-high"}})
     midpoint = len(logs) // 2
     assert box.logs(run, offset=0, until=midpoint) == logs[:midpoint]
     assert not outputs[run.run_id][0]["success"]
@@ -334,7 +347,7 @@ def test_resume_recall_requires_exact_previous_nonce_without_saving_response(
     box = SimpleNamespace(logs=lambda run, **kwargs: logs)
     run = SimpleNamespace(run_id="run-one")
     outputs = provider.capture_provider_logs(
-        box, tmp_path, "agy", {run.run_id: {"native_model": "gemini-3.8-flash-high"}},
+        box, tmp_path, "agy", {run.run_id: {"native_model": "gemini-4-hydrogen-high"}},
         "synthetic-native-id", nonce)
     box.logs(run)
     assert outputs[run.run_id][0]["recall_matches"] is matches

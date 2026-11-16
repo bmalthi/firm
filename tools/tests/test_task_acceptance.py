@@ -8,10 +8,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from firm_sandbox import RunSpec
+
 from firm_runtime.agy_provider import AgyProvider
 from firm_runtime.claude_provider import ClaudeProvider
 from firm_runtime.codex_provider import CodexProvider
-from firm_sandbox import RunSpec
 
 spec = importlib.util.spec_from_file_location(
     "task_acceptance", Path(__file__).resolve().parents[1] / "acceptance" / "task.py",
@@ -208,7 +209,7 @@ def test_agy_task_wrapper_separates_receipt_from_native_parser(monkeypatch):
     }}
     spec = RunSpec("role", ("python", "launcher"), env={
         "FIRM_AGY_MODE": "task", "FIRM_AGY_ARGV": json.dumps([
-            "agy", "--model", "gemini-3.8-flash-high"]),
+            "agy", "--model", "gemini-4-hydrogen-high"]),
     }, secrets={"agy-auth": json.dumps(projection).encode()}, stdin=b"synthetic instruction")
     parsed = []
     monkeypatch.setattr(task.Providers, "__init__", lambda *args: None)

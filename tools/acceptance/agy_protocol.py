@@ -1,4 +1,4 @@
-"""Conservative offline AGY CLI protocol probe, not a registered Firm provider.
+"""Sanitized AGY protocol analysis for integrated acceptance checks.
 
 Native event shape: https://antigravity.google/docs/cli/headless/
 Fixtures identify synthetic versus sanitized captures from the pinned runtime.

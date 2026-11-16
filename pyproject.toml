@@ -1,6 +1,5 @@
 [tool.uv.workspace]
 members = ["packages/firm-runtime", "packages/firm-sandbox"]
-exclude = ["tools"]
 
 [tool.uv.sources]
 firm-runtime = { workspace = true }

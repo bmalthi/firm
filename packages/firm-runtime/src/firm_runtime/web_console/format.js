@@ -260,3 +260,22 @@ export function statusSentence(snapshot, connected = true) {
     return `${roleName(row)}: ${readinessPhrase(row, snapshot)}.`;
   })].join(" ");
 }
+export function subscriptionQuotaDetail(quota, formatTime = time, formatAge = age) {
+  if (quota.state === "unsupported") return "Subscription quota and context unavailable for experimental AGY.";
+  if (quota.unavailable_stream) {
+    const stream = quota.unavailable_stream;
+    return `Last recorded allowance · ${quota.source} · observed ${formatTime(quota.observed_at)} · ${formatAge(quota.observed_at)}${quota.checked_at != null ? ` · checked ${formatTime(quota.checked_at)}` : ""}. The latest execution stream contained no usable subscription allowance reading: ${stream.source} · observed ${formatTime(stream.observed_at)}.${quota.error ? " Latest refresh unavailable." : ""}`;
+  }
+  if (quota.state === "unavailable" && quota.observed_at != null && !quota.polled) {
+    return `The latest execution stream contained no usable subscription allowance reading. ${quota.source} · observed ${formatTime(quota.observed_at)}.`;
+  }
+  if (quota.capability?.poll === "unsupported_auth" && quota.observed_at == null) {
+    return "This login does not support subscription polling.";
+  }
+  if (quota.state === "awaiting_stream") return "This login uses execution streams for subscription allowance. Allowance appears after a role runs.";
+  if (quota.observed_at == null) return quota.state === "loading" ? "Checking subscription allowance…" : "Subscription allowance unavailable; will retry.";
+  if (quota.state === "stale" || quota.error) {
+    return `Stale quota reading · observed ${formatTime(quota.observed_at)}${quota.checked_at != null ? ` · checked ${formatTime(quota.checked_at)}` : ""}${quota.error ? " · latest refresh unavailable" : ""}`;
+  }
+  return "";
+}

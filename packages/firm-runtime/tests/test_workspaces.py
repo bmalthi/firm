@@ -7,6 +7,7 @@ from firm_runtime.errors import FirmError
 from firm_runtime.runtime import Runtime
 from firm_runtime.store import Store
 from firm_runtime.workspaces import (
+    ensure_runtime_role,
     grants_for,
     provision_runtime_role,
     sandbox_config,
@@ -117,6 +118,29 @@ def test_hierarchy_authority_cannot_drift_from_manager_relationship(firm):
         db.execute("UPDATE roles SET manager_id='founder' WHERE employee_id=?", (analyst,))
     with pytest.raises(FirmError, match="workspace hierarchy"):
         grants_for(runtime.store, analyst, Layout())
+    with pytest.raises(FirmError, match="workspace hierarchy"):
+        ensure_runtime_role(runtime.store, firm[1], analyst, files=runtime.discovery.files)
+
+
+def test_ready_workspace_reuse_needs_no_writer_guest_call_or_file_lock(firm, monkeypatch):
+    runtime, root = firm
+    files = runtime.discovery.files
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("ready workspace reuse must only read")
+
+    monkeypatch.setattr(runtime.store, "transaction", unexpected)
+    monkeypatch.setattr(files, "_lock", unexpected)
+    monkeypatch.setattr(files, "run", unexpected)
+    assert ensure_runtime_role(runtime.store, root, "founder", files=files) == "org/founder/work"
+
+
+def test_unreplayed_workspace_falls_back_to_serialized_provisioning(firm):
+    runtime, root = firm
+    original = runtime.discovery.files
+    files = FileServer(original.config, original.run)
+    assert ensure_runtime_role(runtime.store, root, "founder", files=files) == "org/founder/work"
+    assert files._ready_roles == {"r-founder"}
 
 
 def test_retry_after_hiring_transaction_rollback_archives_orphaned_workspace(firm):

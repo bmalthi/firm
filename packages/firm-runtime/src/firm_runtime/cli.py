@@ -28,6 +28,7 @@ from .onboarding import (
     login_provider,
 )
 from .provider_contract import ProviderSetupError
+from .provider_definitions import PROVIDER_NAMES
 from .runtime import Runtime
 from .store import OWNER, Store
 
@@ -132,7 +133,7 @@ def _show_check(report: dict) -> bool:
 
 def _announce_first_run(provider: str, *, directory: Path | None = None) -> None:
     model = {"codex": "gpt-6-luna", "claude": "Claude Sonnet",
-             "agy": "Gemini 3.8 Flash (experimental)"}[provider]
+             "agy": "Gemini 4 Hydrogen (experimental)"}[provider]
     allocation = "8 GiB of RAM and a 60 GiB maximum virtual disk"
     if directory is not None and (directory / "sandbox.toml").is_file():
         try:
@@ -584,10 +585,10 @@ def main(argv=None):
         help="Store credentials read from stdin as the account's default private auth_file",
     )
     save.add_argument("account")
-    save.add_argument("--provider", choices=("claude", "codex", "agy"), required=True)
+    save.add_argument("--provider", choices=PROVIDER_NAMES, required=True)
     login = commands.add_parser("login", help="Sign in using an isolated provider profile")
     login.add_argument("account")
-    login.add_argument("--provider", choices=("claude", "codex", "agy"), required=True)
+    login.add_argument("--provider", choices=PROVIDER_NAMES, required=True)
     login.add_argument("--auth-file", type=Path, help="Configured account auth_file")
     listing = commands.add_parser(
         "list", help="List firms under a firms directory with state and durable size"

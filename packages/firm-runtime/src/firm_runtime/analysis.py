@@ -1013,11 +1013,14 @@ class AnalysisReader:
                 "claimed_without_notice": never_announced,
                 "semantics": "Claimed mail, by whether the claiming work period had already "
                 "started when the message arrived. while_running means the role was mid-period "
-                "and claimed it there; before_work_period means it waited for a wake. Those two "
+                "and claimed it there; before_work_period means it arrived before that period. "
+                "Those two "
                 "measure from arrival; after_notice measures from the waiting-mail notice that "
-                "first named the message, so it is the reaction to being told. Mail claimed "
-                "without a notice was seen at wake or through the role's own peek. A peek that "
-                "claimed nothing is still invisible here.",
+                "first named the message. These measure recorded claims (including reply "
+                "acknowledgments), not when mail "
+                "was first read, answered, understood, or its work completed. Mail claimed "
+                "without a notice has no recorded notice for that claiming period. Reads and "
+                "replies can precede a claim; a peek that claimed nothing is invisible here.",
             },
             "pending_deliveries_from_before_window": len(backlog),
             "dispositions": dict(

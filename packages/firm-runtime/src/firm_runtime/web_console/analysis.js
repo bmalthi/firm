@@ -195,9 +195,10 @@ function messaging(items) {
   const conversations = items.filter((r) => r.type === "conversation");
   const traffic = items.filter((r) => r.type === "traffic");
   const backlog = items.filter((r) => r.type === "backlog");
-  const nodes = [el("p", `${pageMeta.message_count} messages · typical time to pick up mail: ${seconds(pageMeta.claim_delay.median_seconds)}.`, "role-meta")];
+  const nodes = [el("p", `${pageMeta.message_count} messages · median time to claim: ${seconds(pageMeta.claim_delay.median_seconds)}.`, "role-meta"),
+    el("p", "Pending means not claimed or dismissed; it does not establish whether mail was read, answered, or its work completed.", "role-meta")];
   if (conversations.length) nodes.push(el("h3", "Conversations"),
-    table(["Between", "First subject in window", "Messages", "Waiting to be picked up"], conversations.sort((a, b) => b.messages - a.messages).map((r) => [detail(r.id, r.participants.map(label).join(", "), conversationDetail(r.conversation_id)), r.subject || "", r.messages, r.dispositions.pending || 0])));
+    table(["Between", "First subject in window", "Messages", "Pending deliveries"], conversations.sort((a, b) => b.messages - a.messages).map((r) => [detail(r.id, r.participants.map(label).join(", "), conversationDetail(r.conversation_id)), r.subject || "", r.messages, r.dispositions.pending || 0])));
   if (traffic.length) nodes.push(el("h3", "Who is talking to whom"), table(["From", "To", "Messages delivered"], traffic.map((r) => [label(r.author_id), label(r.employee_id), r.deliveries])));
   if (backlog.length) nodes.push(el("h3", "Older mail still waiting"), table(["Recipient", "Waiting for", "Conversation"], backlog.map((r) => [label(r.employee_id), seconds(r.pending_age_seconds), detail(r.id, "Read conversation", conversationDetail(r.conversation_id, r.id))])));
   const undeliverable = Object.entries(pageMeta.undeliverable_reasons || {}).sort((a, b) => b[1] - a[1]);

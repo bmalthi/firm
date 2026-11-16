@@ -16,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
+from firm_sandbox import Config, RunSpec, Sandbox
+
 from firm_runtime.analysis import AnalysisReader
 from firm_runtime.hosting import LocalServer
 from firm_runtime.mcp_http import build_http_app
@@ -25,7 +27,6 @@ from firm_runtime.runtime import Runtime
 from firm_runtime.sandbox_dispatcher import SandboxDispatcher
 from firm_runtime.store import OWNER, Store
 from firm_runtime.task_runner import read_child_logs
-from firm_sandbox import Config, RunSpec, Sandbox
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from provider_checks.acceptance_common import (  # noqa: E402
@@ -207,7 +208,34 @@ class Parent:
     def __init__(self, fixture, marker):
         self.fixture, self.marker, self.invocation = fixture, marker, None
 
-    def build_spec(self, invocation, role_id, run_id, mcp_url, provider_session_id=None, *, layout):
+    name = "probe"
+    model = "probe"
+
+    def validate_credentials(self):
+        return None
+
+    def build_summary_spec(self, request, layout):
+        raise NotImplementedError("probe only executes roles")
+
+    def build_task_spec(self, request, layout):
+        raise NotImplementedError("probe only executes roles")
+
+    def parse_summary(self, logs, exit_code):
+        raise NotImplementedError("probe only executes roles")
+
+    def parse_usage(self, logs):
+        return None
+
+    def parse_tool_calls(self, logs):
+        return {}
+
+    def parse_subscription(self, logs):
+        return None
+
+    def build_spec(self, request, *, layout):
+        self.request = request
+        invocation = request.invocation
+        role_id, run_id, mcp_url = request.role_id, request.run_id, request.mcp_url
         self.invocation = invocation
         return RunSpec(
             role_id, (layout.python, layout.credential("probe"), "parent"), run_id=run_id,
