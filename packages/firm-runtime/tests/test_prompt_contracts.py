@@ -11,8 +11,9 @@ from test_agy_credentials import account
 from firm_runtime.agy_provider import AgyProvider
 from firm_runtime.claude_provider import ClaudeProvider
 from firm_runtime.codex_provider import CodexProvider
+from firm_runtime.mcp_server import TOOL_DESCRIPTIONS
 from firm_runtime.prompt_resources import prompt, render
-from firm_runtime.provider_contract import ProviderUsage
+from firm_runtime.provider_contract import ProviderUsage, RoleLaunchRequest
 from firm_runtime.provider_support import _orientation, render_invocation, standing
 from firm_runtime.role_output import render_tool_result
 from firm_runtime.runtime import Invocation, Runtime
@@ -70,17 +71,21 @@ def test_provider_parity_and_literal_source_across_memory_states(tmp_path, state
         CodexProvider(model="test", effort="high", auth_file=codex_auth),
         ClaudeProvider(model="test", effort="high", auth_file=claude_auth),
         AgyProvider(
-            model="gemini-3.8-flash", effort="medium",
+            model="gemini-4-hydrogen", effort="medium",
             auth_file=account(tmp_path, expiry=4102444800),
         ),
     )
     specs = [
         adapter.build_spec(
-            invocation,
-            "e2",
-            "run-test",
-            "http://firm.local/mcp",
-            provider_session_id=native,
+            RoleLaunchRequest(
+                invocation=invocation,
+                role_id='e2',
+                run_id='run-test',
+                mcp_url='http://firm.local/mcp',
+                provider_session_id=native,
+                offered_tools=tuple(TOOL_DESCRIPTIONS),
+                task_timeout_seconds=600,
+            ),
             layout=Layout(),
         )
         for adapter in adapters
@@ -89,7 +94,7 @@ def test_provider_parity_and_literal_source_across_memory_states(tmp_path, state
     assert (
         specs[0].secrets["role-instructions"]
         == specs[1].secrets["role-instructions"]
-        == specs[2].secrets["agy-instructions"]
+        == specs[2].secrets["role-instructions"]
     )
     instructions = specs[0].secrets["role-instructions"].decode()
     assert instructions == standing(data)

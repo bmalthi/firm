@@ -19,7 +19,7 @@ from firm_runtime.telemetry import context_policy
         ("claude", "opus", 500_000),
         ("claude", "claude-fable-5-1", 500_000),
         ("claude", "sonnet", 500_000),
-        ("agy", "gemini-3.8-flash", None),
+        ("agy", "gemini-4-hydrogen", None),
         ("codex", "gpt-5.6-sol", 256_000),
         ("codex", "gpt-6-astra", 256_000),
     ],
@@ -157,6 +157,33 @@ def test_role_guidance_and_claim_gate_use_current_context_and_packaged_checklist
     diagnostics = runtime.usage_diagnostics()
     assert diagnostics["sessions"][0]["high_water_context_tokens"] == 9_100
     assert diagnostics["sessions"][0]["native_compactions"] == 1
+
+
+def test_reply_claims_only_target_with_activation_even_at_handoff_pressure(tmp_path):
+    runtime = make_runtime(tmp_path)
+    target = runtime.messaging.send(OWNER, ["founder"], "Investigate", request_id="target")
+    invocation = start(runtime)
+    tools = runtime.tools(invocation.token)
+    tools.messages([target["message_id"]])
+    late = runtime.messaging.send(OWNER, ["founder"], "New requirement", request_id="late")
+    runtime.record_usage(invocation.activation_id, usage(9_100))
+    assert tools.claim("blocked", [target["message_id"]])["status"] == "blocked"
+    assert tools.reply(target["message_id"], "Investigation continues after handoff.",
+                       "reply")["status"] == "sent"
+    with runtime.store.read() as db:
+        row = db.execute(
+            "SELECT disposition,claimed_activation_id,claim_sequence FROM message_deliveries "
+            "WHERE message_id=? AND employee_id='founder'", (target["message_id"],),
+        ).fetchone()
+        assert row["disposition"] == "claimed"
+        assert row["claimed_activation_id"] == invocation.activation_id
+        assert row["claim_sequence"] is not None
+        assert runtime.messaging.recent_claims(db, "founder", invocation.session_id)[0][
+            "message_id"
+        ] == target["message_id"]
+        assert db.execute(
+            "SELECT disposition FROM message_deliveries WHERE message_id=?", (late["message_id"],),
+        ).fetchone()[0] == "pending"
 
 
 def test_required_handoff_and_drain_controls_fit_reserved_result_space(tmp_path):

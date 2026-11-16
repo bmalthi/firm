@@ -1,5 +1,6 @@
 """Local HTTP server lifetime, independent of firm execution and VM lifetime."""
 
+import errno
 import socket
 import threading
 import time
@@ -22,11 +23,17 @@ class LocalServer:
             try:
                 self.socket.bind((self.host, self.port))
             except OSError as exc:
-                raise FirmError(
-                    f"cannot listen on {self.host}:{self.port} ({exc.strerror}); another firm's "
-                    "host is probably running. Give this one free ports with --mcp-port and "
-                    "--console-port."
-                ) from None
+                message = f"cannot listen on {self.host}:{self.port} ({exc})"
+                if exc.errno == errno.EADDRINUSE:
+                    message += (
+                        "; another firm's host is probably running. Give this one free ports "
+                        "with --mcp-port and --console-port."
+                    )
+                elif exc.errno in {errno.EACCES, errno.EPERM}:
+                    message += (
+                        "; check process permissions or sandbox restrictions on listening sockets."
+                    )
+                raise FirmError(message) from None
             self.port = self.socket.getsockname()[1]
             self.socket.listen(128)
             self.server = uvicorn.Server(

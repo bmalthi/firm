@@ -1,13 +1,16 @@
 """Validate a web backend inspected by a headless browser inside a Linux role.
 
-Run with uv against an explicitly selected disposable firm. Roles have no root and
-the Linux image carries no browser libraries, so the role uses only its rootless
-Docker: a Compose project in its home serves a page from a small Python HTTP
-server, and the official Playwright image loads it over the Compose network. The
+Run with uv against an explicitly selected disposable firm. The default native
+mode installs Playwright and Chromium in an ordinary role's home, without sudo or
+Docker, and exercises the base image's browser libraries with trusted local HTML.
+It uses Playwright's default disabled Chromium sandbox; --chromium-sandbox tests
+the stricter launch, which stock Ubuntu AppArmor user-namespace policy may deny.
+Optional --mode docker
+retains the Compose backend and official Playwright image check. The
 page's JavaScript fetches data from the backend, sets the title and an element's
 text and logs a console message; the browser waits for the title, reads the text,
-collects the console and takes a full-page screenshot. The host checks the values,
-the PNG's header and dimensions, Compose's exit code, the run's settlement with an
+collects the console and produces a full-page screenshot and PDF. The host checks
+the values, PNG dimensions, PDF framing, the run's settlement with an
 empty slice and that the VMs stop. No [mac] is needed.
 """
 
@@ -63,14 +66,34 @@ fetch("/data.json")
 
 DATA = json.dumps({"title": EXPECTED_TITLE, "text": EXPECTED_TEXT, "console": EXPECTED_CONSOLE})
 
-PROBE = f"""import json
+PROBE = f"""import functools
+import http.server
+import json
+import os
+import subprocess
+import sys
+import threading
 import time
 import traceback
 import urllib.request
+from pathlib import Path
 
 URL = "http://web:8000/"
-result = {{"url": URL}}
+native = os.environ.get("FIRM_BROWSER_NATIVE") == "1"
+chromium_sandbox = "--chromium-sandbox" in sys.argv
+out = Path("out" if native else "/out")
+result = {{"native": native, "uid": os.getuid(), "chromium_sandbox": chromium_sandbox}}
+server = None
 try:
+    if native:
+        result["sudo_denied"] = subprocess.run(
+            ["sudo", "-n", "true"], capture_output=True, timeout=10).returncode != 0
+        result["outside_container"] = not Path("/.dockerenv").exists()
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0),
+            functools.partial(http.server.SimpleHTTPRequestHandler, directory="site"))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        URL = f"http://127.0.0.1:{{server.server_port}}/"
+    result["url"] = URL
     deadline = time.monotonic() + 120
     while True:
         try:
@@ -87,7 +110,7 @@ try:
     console, errors = [], []
     started = time.monotonic()
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch()
+        browser = playwright.chromium.launch(chromium_sandbox=chromium_sandbox)
         result["browser_version"] = browser.version
         page = browser.new_page(viewport={{"width": {VIEWPORT[0]}, "height": {VIEWPORT[1]}}})
         page.on("console", lambda message: console.append(
@@ -100,14 +123,19 @@ try:
         )
         result["title"] = page.title()
         result["text"] = page.text_content("#status")
-        page.screenshot(path="/out/page.png", full_page=True)
+        page.screenshot(path=str(out / "page.png"), full_page=True)
+        page.pdf(path=str(out / "page.pdf"), format="A4", print_background=True)
         result["user_agent"] = page.evaluate("navigator.userAgent")
         browser.close()
     result.update(console=console, page_errors=errors,
                   browser_seconds=round(time.monotonic() - started, 3), ok=True)
 except Exception:
     result.update(ok=False, error=traceback.format_exc())
-with open("/out/result.json", "w") as handle:
+finally:
+    if server:
+        server.shutdown()
+        server.server_close()
+with (out / "result.json").open("w") as handle:
     json.dump(result, handle)
 print("PROBE_DONE", result.get("ok"), flush=True)
 raise SystemExit(0 if result["ok"] else 1)
@@ -130,6 +158,10 @@ services:
       web:
         condition: service_healthy
     shm_size: 1gb
+    environment:
+      # The backend is on the Compose network, not an external proxy destination.
+      NO_PROXY: web,localhost,127.0.0.1
+      no_proxy: web,localhost,127.0.0.1
     volumes: ["./probe:/probe:ro", "./out:/out"]
     command:
       - sh
@@ -139,7 +171,43 @@ services:
         && python /probe/probe.py
 """
 
-SCRIPT = r"""set -eux
+ARTIFACTS = r"""set +x
+if [ -f out/result.json ]; then
+    printf '\nBROWSER_RESULT_JSON %s\n' "$(tr -d '\n' < out/result.json)"
+fi
+for artifact in SCREENSHOT PDF; do
+    case "$artifact" in SCREENSHOT) file=page.png ;; PDF) file=page.pdf ;; esac
+    if [ -f "out/$file" ]; then
+        printf '\nBROWSER_%s_BEGIN\n' "$artifact"
+        base64 -w 76 "out/$file"
+        printf 'BROWSER_%s_END\n' "$artifact"
+    fi
+done
+set -x
+"""
+
+NATIVE_SCRIPT = r"""set -eux
+test "$(id -u)" -ne 0
+test ! -e /.dockerenv
+if sudo -n true; then echo 'Role unexpectedly has sudo'; exit 1; fi
+project="$HOME/browser-probe-native"
+mkdir -p "$project/site" "$project/probe" "$project/out"
+cd "$project"
+cp "$FIRM_CREDENTIALS_DIR/page" site/index.html
+cp "$FIRM_CREDENTIALS_DIR/data" site/data.json
+cp "$FIRM_CREDENTIALS_DIR/probe" probe/probe.py
+if [ ! -f pyproject.toml ]; then
+    uv init --bare --name firm-browser-probe --no-workspace --no-managed-python
+fi
+uv add 'playwright==PLAYWRIGHT_VERSION'
+uv run playwright install chromium
+set +e
+FIRM_BROWSER_NATIVE=1 uv run probe/probe.py "$@"
+code=$?
+set -e
+""".replace("PLAYWRIGHT_VERSION", PLAYWRIGHT_VERSION) + ARTIFACTS + 'exit "$code"\n'
+
+DOCKER_SCRIPT = r"""set -eux
 command -v docker
 id -u
 test -n "$DOCKER_HOST"
@@ -151,8 +219,8 @@ cp "$FIRM_CREDENTIALS_DIR/compose" compose.yaml
 cp "$FIRM_CREDENTIALS_DIR/page" site/index.html
 cp "$FIRM_CREDENTIALS_DIR/data" site/data.json
 cp "$FIRM_CREDENTIALS_DIR/probe" probe/probe.py
-# Bash's own clock: the image's date ignores the %3N width and prints more digits.
-now() { local t=$EPOCHREALTIME; echo $(( ${t/./} / 1000 )); }
+# Use full nanoseconds: date ignores %3N, and systemd expands braced shell variables.
+now() { local t; t=$(date +%s%N); echo $(( t / 1000000 )); }
 start=$(now)
 timeout 1800 docker compose pull
 printf '\nPULL_MS %s\n' "$(( $(now) - start ))"
@@ -166,16 +234,7 @@ timeout 900 docker compose up --abort-on-container-exit --exit-code-from browser
 code=$?
 set -e
 printf '\nUP_MS %s\nCOMPOSE_EXIT %s\n' "$(( $(now) - start ))" "$code"
-set +x
-if [ -f out/result.json ]; then
-    printf '\nBROWSER_RESULT_JSON %s\n' "$(tr -d '\n' < out/result.json)"
-fi
-if [ -f out/page.png ]; then
-    printf '\nBROWSER_SCREENSHOT_BEGIN\n'
-    base64 -w 76 out/page.png
-    printf 'BROWSER_SCREENSHOT_END\n'
-fi
-set -x
+""" + ARTIFACTS + r"""
 docker compose down --volumes --remove-orphans
 test -z "$(docker compose ps -aq)"
 printf '\nCOMPOSE_DOWN_CLEAN\n'
@@ -196,10 +255,10 @@ def marker(lines, name):
     return values[-1] if values else None
 
 
-def screenshot(lines):
+def artifact(lines, name):
     try:
-        begin = lines.index("BROWSER_SCREENSHOT_BEGIN")
-        end = lines.index("BROWSER_SCREENSHOT_END", begin)
+        begin = lines.index(f"BROWSER_{name}_BEGIN")
+        end = lines.index(f"BROWSER_{name}_END", begin)
     except ValueError:
         return None
     return base64.b64decode("".join(line.strip() for line in lines[begin + 1:end]))
@@ -225,13 +284,20 @@ def main():
     parser.add_argument("--root", type=Path, required=True, help="Firm containing sandbox.toml")
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--role", default="browser-probe")
+    parser.add_argument("--mode", choices=("native", "docker"), default="native")
+    parser.add_argument("--chromium-sandbox", action="store_true",
+                        help="Require Chromium's sandbox (native only; stock AppArmor may deny it)")
     args = parser.parse_args()
+    if args.chromium_sandbox and args.mode != "native":
+        parser.error("--chromium-sandbox requires --mode native")
+    args.evidence.mkdir(mode=0o700, parents=True, exist_ok=False)
     box = Sandbox(Config.load(args.root / "sandbox.toml"))
-    args.evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
     record = {
         "role": args.role,
+        "mode": args.mode,
+        "chromium_sandbox": args.chromium_sandbox,
         "mac": "not used" if not box.mac else "configured but not used",
-        "images": {"browser": PLAYWRIGHT_IMAGE, "web": WEB_IMAGE},
+        "images": {"browser": PLAYWRIGHT_IMAGE, "web": WEB_IMAGE} if args.mode == "docker" else {},
         "playwright_package": PLAYWRIGHT_VERSION,
         "passed": False,
     }
@@ -242,8 +308,13 @@ def main():
         organization = Organization(args.role)
         box.file_server.provision(args.role, organization)
         started = time.monotonic()
+        script = NATIVE_SCRIPT if args.mode == "native" else DOCKER_SCRIPT
+        command = ("/bin/bash", "-lc", script, "browser-probe")
+        if args.chromium_sandbox:
+            command += ("--chromium-sandbox",)
         run = box.start(RunSpec(
-            args.role, ("/bin/bash", "-lc", SCRIPT), organization=organization,
+            args.role, command,
+            organization=organization,
             secrets={
                 "compose": COMPOSE.encode(), "page": PAGE.encode(),
                 "data": DATA.encode(), "probe": PROBE.encode(),
@@ -254,9 +325,12 @@ def main():
         output = box.logs(run).decode(errors="replace")
         (args.evidence / "role.log").write_text(output)
         lines = output.splitlines()
-        image = screenshot(lines)
+        image = artifact(lines, "SCREENSHOT")
         if image is not None:
             (args.evidence / "page.png").write_bytes(image)
+        pdf = artifact(lines, "PDF")
+        if pdf is not None:
+            (args.evidence / "page.pdf").write_bytes(pdf)
         raw = marker(lines, "BROWSER_RESULT_JSON")
         browser = json.loads(raw) if raw else {}
         (args.evidence / "browser-result.json").write_text(json.dumps(browser, indent=2))
@@ -276,13 +350,13 @@ def main():
             "browser": {key: value for key, value in browser.items() if key != "error"},
             "browser_error": browser.get("error"),
             "screenshot": png_facts(image),
+            "pdf_bytes": len(pdf) if pdf else 0,
         })
         png = record["screenshot"]
         checks = {
             "settled_clean": result.get("exit_code") == 0 and not result.get("unresolved"),
             "slice_inactive": record["slice_after"] == "inactive",
-            "compose_exit_zero": record["compose_exit"] == 0,
-            "compose_down_clean": record["compose_down_clean"],
+            "browser_succeeded": browser.get("ok") is True,
             "backend_served_static_page": browser.get("served_static_title") is True,
             "title_set_by_javascript": browser.get("title") == EXPECTED_TITLE,
             "text_set_by_javascript": browser.get("text") == EXPECTED_TEXT,
@@ -294,7 +368,20 @@ def main():
             "screenshot_width": png.get("width") == VIEWPORT[0],
             "screenshot_full_page": (png.get("height") or 0) >= TALL,
             "screenshot_size": 2_000 <= (png.get("bytes") or 0) <= 20_000_000,
+            "pdf_document": bool(pdf and pdf.startswith(b"%PDF-")
+                                 and pdf.rstrip().endswith(b"%%EOF") and len(pdf) > 1000),
         }
+        if args.mode == "native":
+            checks.update(
+                native_browser=browser.get("native") is True,
+                ordinary_role=2000 <= browser.get("uid", 0) <= 49999,
+                sudo_denied=browser.get("sudo_denied") is True,
+                outside_container=browser.get("outside_container") is True,
+                chromium_sandbox_setting=browser.get("chromium_sandbox") is args.chromium_sandbox,
+            )
+        else:
+            checks.update(compose_exit_zero=record["compose_exit"] == 0,
+                          compose_down_clean=record["compose_down_clean"])
         record["checks"] = checks
         failed = [name for name, ok in checks.items() if not ok]
         if failed:

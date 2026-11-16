@@ -31,7 +31,7 @@ Each message is stored once (`m1`, `m2`, …), with independent per-recipient de
 | **`claim`** | Returns full message bodies (by conversation ID or exact message IDs) and removes them from `pending`. |
 | **`dismiss`** | Removes a conversation's waiting mail (or exact message IDs) from `pending` as read/set-aside without returning bodies. (Labeled **Mark done** in the Owner Console; replying as the Owner automatically dismisses the replied-to message.) |
 | **`clear`** | Dismisses all pending messages up to the sequence watermark of the work period's last complete `peek`. |
-| **`messages`** | Read-only lookup of exact stored messages by ID (`messages(message_ids=["m42"])`) regardless of disposition. |
+| **`messages`** | Lookup of exact stored messages by ID (`messages(message_ids=["m42"])`) regardless of disposition. Records full reads for the current session without changing dispositions. |
 | **`context`** | Read-only LLM summary of a conversation and up to 5 ancestors along its `continues` chain. |
 
 ### Watermarked `clear` & Atomic Claims
@@ -49,7 +49,10 @@ Each message is stored once (`m1`, `m2`, …), with independent per-recipient de
 
 * **Subjects:** Optional `1–80` character string; if omitted on `send`, defaults to the first 80 characters of the body (replies inherit the target message's subject).
 * **Deliverable Attachments:** `send` and `reply` accept up to 10 file paths under the role's drive (`shared/...` or `org/<address>/work/...`). Paths are validated at send time and stored as drive-relative `{path, name}` references for the Owner Console's **Results** reader.
-* **Idempotency:** Every mutating inbox/mail call takes a `request_id` scoped to the role; identical retries replay the stored receipt.
+* **Idempotency:** Inbox disposition and send/reply calls take a `request_id` scoped to the role; identical retries replay the stored receipt. Full-read tracking on `messages` is idempotent by session and message ID.
+* **Reply receipt:** A role's reply with at least one queued recipient atomically claims its pending delivery of the target and earlier pending deliveries in the target's original conversation whose complete bodies were returned by `messages` in the same retained session. Nothing after the target is claimed, even if read. Other recipients, unread messages, and other conversations remain untouched, including when the reply introduces people or attaches a summary. Existing dispositions and claim timestamps are preserved on replay. Owner replies retain their target-only dismissal behavior. A claim acknowledges receipt, not task completion; unfinished work belongs in working memory and handoff notes.
+* **Full-message reads:** Successful, within-budget role `messages` results record only that role's pending message IDs against its current session. Reads do not change inbox dispositions. Headers, excerpts and derived summaries do not establish full reads. A fresh session does not inherit the old session's read evidence; retained sessions do. Read records are removed when a delivery leaves pending. This means bodies were returned by a tool, not proof of comprehension or completed work.
+* **Handoff pressure:** Reply remains available and may acknowledge its target and qualifying earlier reads while new claims are gated, because it retrieves no new message bodies. Exact message lookup and context summaries still leave dispositions unchanged.
 * **Deterministic Bounces:** Each recipient is evaluated independently. Sending to an unknown or retired address reports the failed recipient inline in the tool result (or queues a single deterministic Operations bounce if a recipient retires before delivery) while delivering normally to valid recipients.
 
 ---

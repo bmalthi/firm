@@ -50,8 +50,17 @@ creating the Linux VM. Editing it leaves an existing firm's disk unchanged.
 New VMs clone a shared software base image cached at
 `~/Library/Caches/firm/linux-base/`. Firm builds it once per Mac on ordinary Apple
 Virtualization networking, outside the firm's network and egress proxy. The base
-contains Docker, Samba, cifs-utils, uv, Node, Claude Code, Codex and AGY. Each firm's
-boot performs only offline configuration behind its sandbox network and creates
+contains Docker, Samba, cifs-utils, uv, Node, Claude Code, Codex and AGY, plus
+Chromium's OS libraries and fonts from Playwright 1.63.0's Ubuntu 26.04 ARM64
+dependency set. Roles can install Playwright in a project (`uv add playwright==1.63.0`)
+and download Chromium (`uv run playwright install chromium`) without sudo or
+Docker, then render HTML, screenshots and PDFs directly. Browser binaries remain
+in the role's home; the base does not preinstall Playwright or its browsers.
+Native rendering of trusted local HTML uses Playwright's default
+`chromium_sandbox=False`. Ubuntu's AppArmor restriction on unprivileged user
+namespaces remains enabled, so `chromium_sandbox=True` can fail with "No usable
+sandbox"; the dependency installation does not change this security policy.
+Each firm's boot performs only offline configuration behind its sandbox network and creates
 its own machine ID, SSH host keys, Samba SID and certificate.
 
 Firm builds a new base when there is none or its recipe or generalize script

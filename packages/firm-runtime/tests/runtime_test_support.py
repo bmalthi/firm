@@ -237,29 +237,46 @@ class FakeNetwork:
 
 
 class FakeProvider:
+    name = "test"
+    model = "test"
+
     def __init__(self):
         self.resumed = []
+        self.requests = []
         self.setup_error = None
 
-    def build_spec(
-        self,
-        invocation,
-        role_id,
-        run_id,
-        mcp_url,
-        provider_session_id=None,
-        *,
-        layout=None,
-    ):
+    def validate_credentials(self):
+        return None
+
+    def build_spec(self, request, *, layout):
         if self.setup_error:
             raise RuntimeError(self.setup_error)
-        self.resumed.append(provider_session_id)
+        self.requests.append(request)
+        self.resumed.append(request.provider_session_id)
         return RunSpec(
-            role_id,
+            request.role_id,
             ("analyst",),
-            run_id=run_id,
-            secrets={"activation-token": invocation.token.encode()},
+            run_id=request.run_id,
+            secrets={"activation-token": request.invocation.token.encode()},
         )
+
+    def build_summary_spec(self, request, layout):
+        raise NotImplementedError("role fake has no isolated runner")
+
+    def build_task_spec(self, request, layout):
+        raise NotImplementedError("role fake has no isolated runner")
+
+    def parse_summary(self, logs, exit_code):
+        raise NotImplementedError("role fake has no isolated runner")
+
+    def parse_usage(self, logs):
+        return None
+
+    def parse_tool_calls(self, logs):
+        return {}
+
+    def parse_subscription(self, logs):
+        return None
 
     def parse_result(self, logs, exit_code):
         result = json.loads(logs or b"{}")

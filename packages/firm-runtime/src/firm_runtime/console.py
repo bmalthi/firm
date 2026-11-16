@@ -1172,13 +1172,12 @@ def build_console_app(
                 "profile": binding["profile"] if binding else row["execution_profile"],
                 "provider": binding["provider"] if binding else settings.get("provider"),
                 "model": settings.get("model"),
+                "resolved_model": native_models.get(row["session_id"]),
                 "effort": settings.get("effort"),
                 "context_window": context["soft_context_window"] if context else window,
                 "context_advisory_fraction": context["advisory_fraction"] if context else fraction,
                 "handoff_reserve": context["handoff_reserve"] if context else reserve,
             }
-            if execution["provider"] == "agy":
-                execution["resolved_model"] = native_models.get(row["session_id"])
             enriched.append(
                 {
                     **role,

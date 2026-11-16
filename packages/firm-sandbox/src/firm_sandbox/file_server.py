@@ -121,6 +121,9 @@ class FileServer:
         self.run = runner
         self.forwards = forwards
         self.record = config.durable / LEDGER
+        # The write-ahead ledger alone cannot prove its guest steps completed.
+        # Only this live instance's successful provision/start replay can do so.
+        self._ready_roles: set[str] = set()
 
     # ---- ledger -------------------------------------------------------------
 
@@ -145,12 +148,23 @@ class FileServer:
         save(self.record, ledger)
 
     def _remote(self, *steps: dict) -> list[dict]:
-        return self.run({"root": TREE, "steps": list(steps)})
+        try:
+            return self.run({"root": TREE, "steps": list(steps)})
+        except BaseException:
+            # A partial grants operation can affect other roles as well as its
+            # target. Replay before trusting any prior success after guest failure.
+            if any(
+                step["action"] in {"setup", "provision", "account", "grants", "archive", "retire"}
+                for step in steps
+            ):
+                self._ready_roles.clear()
+            raise
 
     # ---- lifecycle ----------------------------------------------------------
 
     def start(self) -> dict:
         with self._lock():
+            self._ready_roles.clear()
             ledger = self._load()
             if ledger["port"] is None:
                 with socket.socket() as probe:
@@ -191,9 +205,17 @@ class FileServer:
             self._remote(*steps)
             for tunnel in self.forwards(ledger["port"]):
                 tunnel.start()
+            if not ledger["pending_archive"]:
+                self._ready_roles.update(
+                    role_id for role_id, record in ledger["roles"].items()
+                    if not record["archived"]
+                    and (entry := ledger["accounts"].get(role_id))
+                    and entry.get("account") and not entry.get("retired")
+                )
             return self.owner_access()
 
     def stop(self) -> None:
+        self._ready_roles.clear()
         if not self.record.exists():
             return
         port = read_record(self.record)["port"]
@@ -219,6 +241,7 @@ class FileServer:
 
     def discard(self) -> None:
         """Forget every account and address; the guest disk is gone with them."""
+        self._ready_roles.clear()
         self.record.unlink(missing_ok=True)
 
     def owner_access(self) -> dict:
@@ -289,6 +312,7 @@ class FileServer:
     def retire_role(self, role_id: str) -> dict:
         identifier(role_id)
         with self._lock():
+            self._ready_roles.discard(role_id)
             ledger = self._load()
             entry = ledger["accounts"].get(role_id)
             if entry is None:
@@ -311,6 +335,31 @@ class FileServer:
             return {"role_id": role_id, "retired": True}
 
     # ---- organization -------------------------------------------------------
+
+    def ready_workspace(
+        self, role_id: str, grant: Organization, *, database_identity: str
+    ) -> str | None:
+        """Read an already replayed workspace locally, without waiting for guest I/O."""
+        identifier(role_id)
+        if role_id not in self._ready_roles:
+            return None
+        ledger = self._load()
+        record = ledger["roles"].get(role_id)
+        account = ledger["accounts"].get(role_id) or {}
+        if (
+            ledger["database_identity"] != database_identity
+            or ledger["port"] is None
+            or ledger["pending_archive"] is not None
+            or ledger["addresses"].get(grant.address) != role_id
+            or record is None or record["archived"]
+            or record["address"] != grant.address
+            or record["directory"] != "org/" + grant.address
+            or account.get("retired") or not account.get("account")
+            or not account.get("password") or account.get("uid") is None
+            or role_id not in self._ready_roles
+        ):
+            return None
+        return record["directory"] + "/work"
 
     def bind_identity(self, identity: str) -> None:
         if (
@@ -466,6 +515,7 @@ class FileServer:
         if replace_role_id is not None:
             identifier(replace_role_id)
         with self._lock():
+            self._ready_roles.discard(role_id)
             ledger = self._load()
             pending = ledger["pending_archive"]
             if pending:
@@ -505,6 +555,7 @@ class FileServer:
                     "grants": [g.argv for g in self._role_grants(ledger, role_id)],
                 },
             )
+            self._ready_roles.add(role_id)
             return record["directory"] + "/work"
 
     def _finish_archive(self, ledger) -> None:
@@ -514,6 +565,7 @@ class FileServer:
         moved = []
         for role_id, record in ledger["roles"].items():
             if record["directory"] == source or record["directory"].startswith(source + "/"):
+                self._ready_roles.discard(role_id)
                 record["directory"] = destination + record["directory"][len(source) :]
                 record["archived"] = True
                 moved.append(record)

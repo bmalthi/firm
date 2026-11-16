@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from .errors import FirmError
 from .prompt_resources import render
-from .provider_contract import SUPPORTED_EFFORTS
+from .provider_definitions import PROVIDER_DEFINITIONS, incompatible_service
 from .store import CONTROL_PRIORITY, OPERATIONS, ORDINARY_PRIORITY, OWNER, encoded
 from .telemetry import CONTEXT_POLICY_KEYS
 
@@ -18,22 +18,16 @@ from .telemetry import CONTEXT_POLICY_KEYS
 CREDENTIALS_DIR = Path("~/.config/firm-runtime/credentials")
 ACCOUNT_NAME = re.compile(r"[A-Za-z0-9_-]+")
 
-SUMMARY_DEFAULTS = {
-    "agy": {"model": "gemini-3.8-flash", "effort": "medium"},
-    "codex": {"model": "gpt-6-luna", "effort": "medium"},
-    "claude": {"model": "sonnet", "effort": "medium"},
-}
-
 SUBSCRIPTION_READING_FRESH_SECONDS = 5 * 60
 
 TASK_DEFAULTS = {
-    "agy": {"model": "gemini-3.8-flash", "effort": "high"},
+    "agy": PROVIDER_DEFINITIONS["agy"].task.as_dict(),
     "max_concurrent": 2,
     "timeout_seconds": 600,
     "max_instruction_bytes": 16384,
     "max_answer_bytes": 16384,
-    "codex": {"model": "gpt-6.1-sol", "effort": "medium"},
-    "claude": {"model": "opus", "effort": "medium"},
+    "codex": PROVIDER_DEFINITIONS["codex"].task.as_dict(),
+    "claude": PROVIDER_DEFINITIONS["claude"].task.as_dict(),
 }
 
 
@@ -52,7 +46,7 @@ def task_settings(value):
                 raise FirmError(f"task.{key}.model must be non-empty")
             if (
                 not isinstance(setting["effort"], str)
-                or setting["effort"] not in SUPPORTED_EFFORTS[key]
+                or setting["effort"] not in PROVIDER_DEFINITIONS[key].supported_efforts
             ):
                 raise FirmError(f"unsupported task effort for {key}")
         elif type(setting) is not int or setting <= 0:
@@ -142,26 +136,36 @@ def validate_accounts(config):
     config["task"] = task_settings(config.get("task", {}))
     summary = config.get("summary")
     if summary is not None:
-        if not isinstance(summary, dict) or set(summary) - set(SUMMARY_DEFAULTS):
+        if not isinstance(summary, dict) or set(summary) - set(PROVIDER_DEFINITIONS):
             raise FirmError("summary must contain only codex, claude and agy settings")
-        for provider, defaults in SUMMARY_DEFAULTS.items():
+        for provider, definition in PROVIDER_DEFINITIONS.items():
+            defaults = definition.summary.as_dict()
             setting = summary.get(provider, defaults)
             if not isinstance(setting, dict) or set(setting) - set(defaults):
                 raise FirmError(f"summary.{provider} has unsupported settings")
             if not isinstance(setting.get("model"), str) or not setting["model"].strip():
                 raise FirmError(f"summary.{provider}.model must be non-empty")
             effort = setting.get("effort")
-            if not isinstance(effort, str) or effort not in SUPPORTED_EFFORTS[provider]:
+            if (
+                not isinstance(effort, str)
+                or effort not in PROVIDER_DEFINITIONS[provider].supported_efforts
+            ):
                 raise FirmError(f"unsupported summary effort for {provider}")
     if "accounts" not in config:
         return
     accounts, profiles = config["accounts"], config["profiles"]
-    if config.get("google_cloud") and any(
-        isinstance(item, dict) and item.get("provider") == "agy"
-        for collection in (accounts, profiles) if isinstance(collection, dict)
-        for item in collection.values()
-    ):
-        raise FirmError("AGY subscription inference cannot coexist with [google_cloud]")
+    for collection in (accounts, profiles):
+        if not isinstance(collection, dict):
+            continue
+        for item in collection.values():
+            if not isinstance(item, dict) or not isinstance(item.get("provider"), str):
+                continue
+            provider = item["provider"]
+            service = incompatible_service(provider, config)
+            if service is not None:
+                raise FirmError(
+                    f"{provider.upper()} subscription inference cannot coexist with [{service}]"
+                )
     if not isinstance(accounts, dict) or not accounts:
         raise FirmError("accounts must be a nonempty mapping")
     for name, account in accounts.items():
@@ -174,7 +178,7 @@ def validate_accounts(config):
         }:
             raise FirmError(f"unknown account setting for {name}")
         provider = account.get("provider")
-        if not isinstance(provider, str) or provider not in ("codex", "claude", "agy"):
+        if not isinstance(provider, str) or provider not in PROVIDER_DEFINITIONS:
             raise FirmError(f"invalid account provider for {name}")
         if "auth_file" not in account:
             account["auth_file"] = str(credentials_path(name, provider))
@@ -216,12 +220,15 @@ def validate_accounts(config):
         }:
             raise FirmError(f"unsupported execution setting in {name}")
         provider = profile.get("provider")
-        if not isinstance(provider, str) or provider not in ("codex", "claude", "agy"):
+        if not isinstance(provider, str) or provider not in PROVIDER_DEFINITIONS:
             raise FirmError(f"invalid profile provider for {name}")
         if not isinstance(profile.get("model"), str) or not profile["model"].strip():
             raise FirmError(f"profile {name} requires a model")
         effort = profile.get("effort")
-        if not isinstance(effort, str) or effort not in SUPPORTED_EFFORTS[provider]:
+        if (
+            not isinstance(effort, str)
+            or effort not in PROVIDER_DEFINITIONS[provider].supported_efforts
+        ):
             raise FirmError(f"unsupported effort for {name}")
         names = profile.get("accounts")
         if not isinstance(names, list) or not names or any(not isinstance(n, str) for n in names):
@@ -385,7 +392,9 @@ class Accounts:
             return None
         provider = binding["provider"]
         account_ids = [binding["account_id"]]
-        setting = config.get("summary", {}).get(provider, SUMMARY_DEFAULTS[provider])
+        setting = config.get("summary", {}).get(
+            provider, PROVIDER_DEFINITIONS[provider].summary.as_dict()
+        )
         candidates = []
         for account_id in account_ids:
             account = config["accounts"].get(account_id)
@@ -876,7 +885,7 @@ class Accounts:
                     (self.store.clock(),),
                 )
             ]
-        from .credential_store import setup_token_warning
+        from .claude_auth import setup_token_warning
 
         warnings = [
             warning

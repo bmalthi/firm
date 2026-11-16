@@ -204,9 +204,9 @@ class entries are ordered low, medium, high. Quota and context depend on provide
 | Host credentials | `ACCOUNT.json` | `ACCOUNT.json` | `ACCOUNT-agy/home/.gemini/antigravity-cli/antigravity-oauth-token` |
 | VM credentials | OAuth access bundle, blank refresh token; or static API key | Setup token as-is; or OAuth access bundle without refresh token | Access-only token file, blank refresh token |
 | [Renewal](#renewal) | Host OAuth exchange within 10 min of expiry; API keys static | Repeat setup-token sign-in; OAuth JSON uses host exchange within 10 min | Host `agy models` below 50 min; macOS Keychain sandbox |
-| [Model classes](#firm-configuration): low, medium, high | `gpt-6-luna` / high; `gpt-6.1-sol` / high; `gpt-6-astra` / medium | `sonnet` / high; `opus` / high; `claude-fable-5-1` / high | `gemini-3.8-flash` / medium; `gemini-3.8-flash` / high; `gemini-4-argon` / medium |
-| Chooser / [summary](#correspondence-summaries) default | `gpt-6-luna` / medium | `sonnet` / medium | `gemini-3.8-flash` / medium |
-| [Task](#tasks) default | `gpt-6.1-sol` / medium | `opus` / medium | `gemini-3.8-flash` / high |
+| [Model classes](#firm-configuration): low, medium, high | `gpt-6-luna` / high; `gpt-6.1-sol` / high; `gpt-6-astra` / medium | `sonnet` / high; `opus` / high; `claude-fable-5-1` / high | `gemini-4-hydrogen` / medium; `gemini-4-hydrogen` / high; `gemini-4-argon` / medium |
+| Chooser / [summary](#correspondence-summaries) default | `gpt-6-luna` / medium | `sonnet` / medium | `gemini-4-hydrogen` / low (chooser), medium (summary) |
+| [Task](#tasks) default | `gpt-6.1-sol` / medium | `opus` / medium | `gemini-4-hydrogen` / high |
 | Accepted efforts | low, medium, high, xhigh, max, ultra | low, medium, high, xhigh, max | low, medium, high; Firm `xhigh` → `gemini-4-argon-high` |
 | Resume / retained conversation | `exec resume`; private `sessions` tree | `--resume`; private `projects` tree | `--conversation`; private HOME and checked conversation DB |
 | [Web search](installation.md#4-default-firewall-web-search-and-network-egress) | Provider-side `web_search` | Provider-side `WebSearch` | Provider-side `search_web` for roles/tasks |
@@ -725,6 +725,10 @@ waits for confirmed VM shutdown, then closes the foreground host. Repeated Ctrl-
 silently escalate. Choose **Firm → Stop after current work** to drain while keeping its
 host available. Use `firm stop DIRECTORY --force` when hard termination is required.
 
+Before admitting activations, startup prepares the workspaces of every active role.
+If any workspace preparation fails, startup force-stops the firm, including adopted
+runs; this is a firm-wide startup failure, not an isolated role failure.
+
 The console can finish opening while a new VM is still booting. If guest setup fails,
 the console remains available and displays the startup cause. A short package-download
 retry may recover transient network errors; if setup remains incomplete, Firm keeps the
@@ -951,6 +955,22 @@ allowance readings are collected every five minutes; cards show window usage, re
 and observation age, with failed refreshes marked stale. Token usage is not an account
 quota reading. This collector is display-only; admission uses recorded provider-stream
 readings, and the owner-entered `quota` command remains separate.
+
+Claude OAuth JSON and Codex subscription logins support polling. Claude setup tokens
+use execution streams; Codex API-key logins have no subscription polling endpoint.
+The card identifies these capabilities without reading credentials during a console
+request. Experimental AGY has no subscription observation capability.
+
+The latest usable whole observation is displayed, with execution streams winning ties.
+If a stream at least as recent as the retained poll contains no usable allowance, the
+card shows the poll as stale **Last recorded allowance**, with its original source,
+observation time and age, and separately identifies the unavailable stream and its time.
+Without a usable poll in the console's cache, the stream is shown as unavailable;
+earlier stream readings are not retained for display. Windows are never merged across
+sources. Failed polls retain the last successful poll's original observation time and
+show the failed refresh time separately. Ordinary display readings
+become stale after ten minutes. Admission uses its separate five-minute freshness
+rule, and existing timed holds continue until their recorded reset.
 
 ## Analysis
 
@@ -1259,7 +1279,7 @@ founder_profile = "agy"
 
 [profiles.agy]
 provider = "agy"
-model = "gemini-3.8-flash"
+model = "gemini-4-hydrogen"
 effort = "medium"
 accounts = ["agy-personal"]
 
@@ -1269,9 +1289,9 @@ max_active = 1
 ```
 
 Firm stores model and effort separately. Low/medium classes select
-`gemini-3.8-flash`; high selects `gemini-4-argon`, with class default efforts
+`gemini-4-hydrogen`; high selects `gemini-4-argon`, with class default efforts
 medium/high/medium respectively. The founder's high/high override selects Argon
-high. Chooser/summary defaults are Flash medium; tasks default to Flash high.
+high. Chooser defaults to Hydrogen low, summary defaults to Hydrogen medium, and tasks default to Hydrogen high.
 Efforts low, medium and high append a suffix to the base model. **Firm xhigh
 selects `gemini-4-argon-high` regardless of class**; native xhigh is unsupported.
 The command passes only `--model`. Console diagnostics report native `init.model`;

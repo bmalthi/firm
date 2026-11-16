@@ -180,6 +180,7 @@ def _mcp_settings(mode):
                 "headers": {"Authorization": "Bearer " + os.environ["FIRM_ACTIVATION_TOKEN"]},
                 # AGY 1.5.3 silently ignores the whole server when this is a JSON float.
                 "timeoutSeconds": math.ceil(timeout),
+                "enabledTools": names,
                 "tools": {name: {"eager": True} for name in names},
             }
         }
@@ -245,7 +246,8 @@ def _prepare_home(mode):
         _link_ephemeral(mcp_path, credentials / "agy-mcp")
     else:
         mcp_path.unlink(missing_ok=True)
-    instructions = (credentials / "agy-instructions").read_text()
+    instructions_name = "role-instructions" if mode == "role" else "summary-instructions"
+    instructions = (credentials / instructions_name).read_text()
     _write(
         home / f".gemini/config/agents/firm-{mode}.md",
         f"---\nname: firm-{mode}\ndescription: Firm-owned {mode} agent.\n"

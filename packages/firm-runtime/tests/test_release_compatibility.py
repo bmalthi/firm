@@ -94,9 +94,10 @@ def test_store_refuses_incompatible_firm_before_any_database_write(tmp_path, mon
     assert not database.with_name(database.name + "-shm").exists()
 
 
-def test_store_refuses_pre_guidance_generation_before_touching_existing_state(tmp_path):
+@pytest.mark.parametrize("generation", [1, 2])
+def test_store_refuses_older_generations_before_touching_existing_state(tmp_path, generation):
     record = initialize_firm(tmp_path)
-    record["compatibility_generation"] = 1
+    record["compatibility_generation"] = generation
     (tmp_path / FIRM_RECORD).write_text(json.dumps(record), encoding="utf-8")
     database = tmp_path / "durable" / "firm.sqlite3"
     database.parent.mkdir()

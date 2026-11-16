@@ -10,6 +10,7 @@ from firm_runtime.analysis import AnalysisReader
 from firm_runtime.console import build_console_app
 from firm_runtime.errors import FirmError
 from firm_runtime.messaging import MAX_BODY_BYTES
+from firm_runtime.provider_contract import ProviderUsage, SubscriptionPollResult
 from firm_runtime.requests import MAX_REASON
 from firm_runtime.runtime import Runtime
 from firm_runtime.store import OWNER, Store
@@ -1472,18 +1473,21 @@ def test_github_repositories_requested_grants_and_revocations_are_listed(tmp_pat
 
 
 @pytest.mark.parametrize(
-    "provider,model,next_model,window",
+    "provider,model,next_model,resolved_model,window",
     [
-        ("claude", "opus", "sonnet", 500000),
-        ("codex", "gpt-5.6-sol", "gpt-6-astra", 256000),
+        ("claude", "opus", "sonnet", "claude-opus-4-8", 500000),
+        ("codex", "gpt-5.6-sol", "gpt-6-astra", "gpt-5.6-sol-resolved", 256000),
     ],
 )
+@pytest.mark.parametrize("observed", [False, True])
 def test_role_parameters_use_retained_binding_before_new_profile_settings(
     tmp_path,
     provider,
     model,
     next_model,
+    resolved_model,
     window,
+    observed,
 ):
     runtime, founder, analyst, app = _system(tmp_path)
     config = {
@@ -1510,6 +1514,11 @@ def test_role_parameters_use_retained_binding_before_new_profile_settings(
     runtime.start()
     invocation = runtime.admit()
     assert invocation.employee_id == founder
+    assert resolved_model not in (model, next_model)
+    if observed:
+        runtime.record_usage(
+            invocation.activation_id, ProviderUsage(resolved_model=resolved_model)
+        )
     config["profiles"]["default"].update(model=next_model, effort="low")
     runtime.owner.configure(OWNER, config)
     with runtime.store.read() as db:
@@ -1523,6 +1532,7 @@ def test_role_parameters_use_retained_binding_before_new_profile_settings(
             "profile": "default",
             "provider": provider,
             "model": model,
+            "resolved_model": resolved_model if observed else None,
             "effort": "high",
             "context_window": window,
             "context_advisory_fraction": 0.6,
@@ -1531,10 +1541,18 @@ def test_role_parameters_use_retained_binding_before_new_profile_settings(
         fresh = roles[analyst]["execution"]
         assert fresh["source"] == "configured_profile"
         assert (fresh["model"], fresh["effort"]) == (next_model, "low")
+        assert fresh["resolved_model"] is None
         tree = client.get("/api/roles/tree").json()
         assert tree["root"]["execution"] == retained
+        assert next(
+            role["execution"] for role in tree["nodes"] if role["employee_id"] == analyst
+        ) == fresh
         search = client.get("/api/roles/search?query=analyst").json()
         assert search["roles"][0]["execution"] == fresh
+        search = client.get("/api/roles/search?query=founder").json()
+        assert next(
+            role["execution"] for role in search["roles"] if role["employee_id"] == founder
+        ) == retained
         assert "/private/secret-auth" not in json.dumps(roles)
         assert data["accounts"]["accounts"][0]["auth_file"] == "/private/secret-auth"
     with runtime.store.read() as db:
@@ -1548,7 +1566,10 @@ def test_console_attaches_display_quota_for_both_providers(tmp_path, monkeypatch
     class TestObserver(QuotaObserver):
         def __init__(self, accounts):
             def reading(_):
-                return [{"label": "Weekly allowance", "used_percent": 100, "resets_at": 200}]
+                return SubscriptionPollResult(
+                    "reading",
+                    ({"label": "Weekly allowance", "used_percent": 100, "resets_at": 200},),
+                )
 
             super().__init__(
                 accounts, fetchers={"claude": reading, "codex": reading}, clock=lambda: 100
@@ -1598,7 +1619,9 @@ def test_console_shows_recorded_stream_allowance_for_setup_token_accounts(tmp_pa
 
     class TestObserver(QuotaObserver):
         def __init__(self, accounts):
-            super().__init__(accounts, fetchers={"claude": lambda _: None})
+            super().__init__(
+                accounts, fetchers={"claude": lambda _: SubscriptionPollResult("stream_only")}
+            )
 
         def start(self):
             self.refresh()
@@ -1632,7 +1655,11 @@ def test_console_shows_recorded_stream_allowance_for_setup_token_accounts(tmp_pa
             account["account_id"]: account["subscription_quota"]
             for account in client.get("/api/snapshot").json()["accounts"]["accounts"]
         }
-    assert accounts["waiting"] == {"state": "awaiting_stream", "windows": []}
+    assert accounts["waiting"] == {
+        "state": "awaiting_stream",
+        "windows": [],
+        "capability": {"stream": True, "poll": "stream_only"},
+    }
     assert accounts["streamed"]["state"] == "current"
     assert accounts["streamed"]["windows"][0]["label"] == "Weekly allowance"
     assert accounts["streamed"]["windows"][0]["used_percent"] == 54.0
@@ -2012,3 +2039,73 @@ def test_console_exposes_effective_guidance_in_all_owner_enrichment_paths(tmp_pa
         detail = client.get(f"/api/roles/{analyst}?section=profile").json()
         assert detail["owner_facts"]["guidance"] == expected
     assert "guidance" not in runtime.lifecycle.get_role(analyst, analyst)
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_console_retains_poll_with_newer_empty_recorded_stream_without_durable_writes(
+    tmp_path,
+    monkeypatch,
+    provider,
+):
+    from firm_runtime import console
+    from firm_runtime.quota_observer import QuotaObserver
+
+    class TestObserver(QuotaObserver):
+        def __init__(self, accounts):
+            super().__init__(
+                accounts,
+                fetchers={
+                    provider: lambda _: SubscriptionPollResult(
+                        "reading",
+                        ({"window": "polled", "used_percent": 10, "resets_at": 4000},),
+                    )
+                },
+                clock=lambda: 100,
+            )
+
+        def start(self):
+            self.refresh()
+
+    monkeypatch.setattr(console, "QuotaObserver", TestObserver)
+    runtime, _, _, app = _system(tmp_path)
+    runtime.owner.configure(
+        OWNER,
+        {
+            "max_active": 1,
+            "staffing": False,
+            "founder_profile": "default",
+            "profiles": {
+                "default": {
+                    "provider": provider,
+                    "model": "test",
+                    "effort": "high",
+                    "accounts": ["a"],
+                }
+            },
+            "accounts": {"a": {"provider": provider, "auth_file": "/unused", "max_active": 1}},
+        },
+    )
+    # The real durable boundary records unavailable telemetry as an explicit [].
+    runtime.accounts.record_subscription("a", [])
+    with runtime.store.read() as db:
+        stream = runtime.accounts.subscription_reading(db, "a")
+    with _login(app) as client:
+        with runtime.store.read() as db:
+            before = list(db.iterdump())
+        quota = client.get("/api/snapshot").json()["accounts"]["accounts"][0]["subscription_quota"]
+        with runtime.store.read() as db:
+            assert list(db.iterdump()) == before
+            assert runtime.accounts.subscription_reading(db, "a") == stream
+    assert stream["windows"] == []
+    assert quota["state"] == "stale"
+    assert quota["windows"] == [
+        {"window": "polled", "used_percent": 10, "resets_at": 4000, "expired": False}
+    ]
+    assert quota["polled"] is True
+    assert quota["observed_at"] == quota["checked_at"] == 100
+    assert quota["source"] == f"{provider.capitalize()} subscription usage"
+    assert quota["unavailable_stream"] == {
+        "source": f"{provider.capitalize()} role stream",
+        "observed_at": stream["observed_at"],
+    }
+    assert quota["capability"] == {"stream": True, "poll": "reading"}

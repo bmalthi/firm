@@ -105,7 +105,8 @@ def test_omitted_staffing_enables_chooser_with_same_provider_and_accounts(tmp_pa
     assert chooser["accounts"] == ["personal"]
     assert chooser["effort"] == "medium"
     assert [resolved["profiles"][staffing["classes"][c]]["model"] for c in levels.CLASSES] == list(
-        levels.DEFAULT_MODELS[provider]
+        {"codex": ("gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra"),
+         "claude": ("sonnet", "opus", "claude-fable-5-1")}[provider]
     )
     assert all(p["provider"] == provider for p in resolved["profiles"].values())
     assert (role(runtime, "founder")["execution_profile"], role(runtime, "founder")["effort"]) == (
@@ -683,18 +684,13 @@ def test_isolated_staffing_turn_carries_instructions_kind_and_reservation(system
 
     runtime.start()
     service = SummaryService(Runner(), store=runtime.store, capacity=runtime.accounts)
-    outcome = service.run_isolated(
-        "{}",
-        kind="staffing",
-        instructions="choose",
-        reserve=runtime.accounts.reserve_staffing,
-        max_input_bytes=levels.MAX_STAFFING_PROMPT_BYTES,
-    )
-    assert outcome["status"] == "completed" and outcome["output_tokens"] == 12
+    runtime.summary_service = service
+    assert runtime.levels._choose("{}") == {"model_class": "medium", "effort": "high"}
     (request,) = seen
-    assert (request.kind, request.instructions) == ("staffing", "choose")
+    assert request.kind == "staffing" and request.instructions
     assert request.run_id.startswith("run-")
     assert request.max_input_bytes == levels.MAX_STAFFING_PROMPT_BYTES
+    assert request.timeout == levels.CHOOSER_TIMEOUT_SECONDS == 120.0
     with runtime.store.read() as db:
         (row,) = db.execute("SELECT kind,state,output_tokens FROM summary_runs").fetchall()
     assert tuple(row) == ("staffing", "summarized", 12)

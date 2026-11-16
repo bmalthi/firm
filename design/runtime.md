@@ -61,6 +61,34 @@ The mandate is the single authoritative delegation document managed through MCP:
 
 ---
 
+## Credential backend boundaries
+
+`credential_store.py` is the public account credential facade. Its explicit backend
+selection depends only on the provider name. `claude_auth.py` and `codex_auth.py` own
+native parsing, validation, access-only projections, expiry scheduling, renewal eligibility,
+and OAuth field mapping; `oauth_auth.py` shares HTTP transport and renewal race handling.
+`agy_auth.py` keeps its dedicated retained profile and native snapshot/recovery state machine.
+`credential_files.py` owns owner-private bounded reads, the existing account lock, and
+same-directory atomic saves with compare-before-replace. Provider launch modules do
+not own credential readers, and read-only quota polling never invokes renewal.
+
+`CredentialStore.snapshot(force=False, *, margin=DEFAULT_MARGIN)` uses a 600-second
+HTTP OAuth trigger or a 3,000-second AGY trigger by default. Explicit `margin=None`
+projects without age-triggered renewal while retaining AGY interrupted-write and expiry
+backup recovery. A numeric margin must be finite and non-negative. HTTP renews at
+equality; AGY accepts equality. The trigger does not guarantee a minimum lifetime:
+AGY preserves its transient-failure fallback when more than 300 seconds remain.
+AGY validation uses `margin=None`, launch staging uses 301 seconds, and credential
+requests use the default. Claude/Codex spec construction remains read/project only.
+
+The standalone guest mirror and launchers do not import host backends. The credential
+wire shape stays `{kind, data, expires_at}` with Unix-second or unknown expiry and
+access-only allowlists; native refresh authority stays on the host. External writers
+that ignore the lock retain the existing compare/read/replace guarantee, rather than
+an atomic coordination promise. No persisted credential formats change.
+
+---
+
 ## Storage & Durable Memory
 
 Every run mounts the firm's internal SMB file server at `<home>/drive`:
@@ -121,7 +149,17 @@ The handoff request stores `clean_up` in its payload (default `false`). When a p
 
 ## Provider Execution, Routing, and Context Policy
 
-Named `[profiles.<name>]` configure provider (`codex` or `claude`), model, effort, context limits, and `[accounts.<id>]`.
+Named `[profiles.<name>]` configure provider (`codex`, `claude`, or experimental `agy`), model, effort, context limits, and `[accounts.<id>]`.
+
+### Provider Boundaries
+
+`provider_definitions.py` owns immutable configured defaults, supported efforts, soft context windows, and service constraints. It imports no runtime implementations. `provider_registry.py` lazily selects the built-in constructor and stateless parsers; metadata consumers use definitions directly.
+
+The `ExecutionProvider` protocol separates role launches from tool-free summary/staffing turns and native-tool task workers. Every role adapter receives a `RoleLaunchRequest` with its invocation, sandbox identities, MCP URL, retained native session ID, offered Firm tool catalog, and configured task-service deadline. Codex restricts Firm discovery with `enabled_tools`; Claude excludes the complement of the authoritative Firm catalog through `--disallowedTools`, preserving ordinary native tools and existing delegation restrictions. AGY 1.5.3 uses [`enabledTools`](https://antigravity.google/docs/mcp#mcp-configuration-properties) for exposure and eagerly registers each offered schema; empty catalogs are explicitly unsupported because native empty-allowlist behavior has not been verified. Each adapter rejects malformed or unknown tool names. Server authorization remains enforced independently of client discovery.
+
+Native Firm calls receive `ceil(task.timeout_seconds) + 65` seconds: the task still reaches its execution deadline at the configured time, with 60 seconds for the existing child-stop RPC and five seconds for transport and result delivery. This bounds the native call without guaranteeing cleanup completes. Codex writes `tool_timeout_sec`, AGY writes integer `timeoutSeconds`, and Claude writes per-server integer milliseconds in `timeout`, which also raises its HTTP idle timeout for a silent call. Claude role launches disable automatic MCP backgrounding so a long task result remains synchronous. Requests outside the shared supported timer range (positive task deadlines up to 2,147,418 seconds) fail before launch rather than silently clamping or disabling a deadline. Claude and Codex MCP startup settings are unchanged; AGY's native `timeoutSeconds` also controls connection and discovery.
+
+Active roles parse results through their model-bound adapter instance, preserving configured/native model attribution on errors. Summary and task output uses stateless parsers selected from the provider captured when the work launched, without constructing an adapter or reading current credentials. Builders still reject an account that has changed provider. Unknown telemetry remains unknown, historical logs do not create fresh subscription readings, and AGY subscription parsing returns no observation.
 
 ### Session Binding & Account Selection
 * **Retained sessions stay pinned:** A warm session is bound to its provider, account, and model settings; lowering an account's `max_active` steers *new* sessions away without stranding warm ones.

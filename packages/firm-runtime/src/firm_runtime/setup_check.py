@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import platform
@@ -18,7 +19,7 @@ from firm_sandbox import Config, linux_base
 from firm_sandbox.compatibility import validate_firm_directories
 from firm_sandbox.host_paths import read_text_file
 
-from .credential_store import setup_token_warning
+from .claude_auth import setup_token_warning
 from .errors import FirmError
 from .lifecycle import validate_config
 from .provider_contract import ProviderSetupError
@@ -241,18 +242,26 @@ def _check_ports(ports: tuple[tuple[str, int], ...]) -> list[dict]:
                 reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 reservation.bind(("127.0.0.1", port))
                 reservation.listen(1)
-            except OSError:
+            except OSError as exc:
                 if reservation is not None:
                     reservation.close()
+                if exc.errno == errno.EADDRINUSE:
+                    action = (
+                        "Stop the process using this port or choose a different "
+                        f"--{name.replace('_', '-')} value."
+                    )
+                elif exc.errno in {errno.EACCES, errno.EPERM}:
+                    action = (
+                        "Check process permissions or sandbox restrictions on listening sockets."
+                    )
+                else:
+                    action = "Resolve the reported socket error and rerun firm check."
                 results.append(
                     _result(
                         name,
                         "failure",
-                        f"Loopback port {port} is unavailable.",
-                        action=(
-                            "Stop the process using this port or choose a different "
-                            f"--{name.replace('_', '-')} value."
-                        ),
+                        f"Cannot listen on loopback port {port}: {exc}.",
+                        action=action,
                     )
                 )
             else:

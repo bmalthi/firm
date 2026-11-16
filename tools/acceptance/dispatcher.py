@@ -11,13 +11,14 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from firm_sandbox import Config, RunSpec, Sandbox
+
 from firm_runtime.hosting import LocalServer
 from firm_runtime.mcp_http import build_http_app
 from firm_runtime.runtime import Runtime
 from firm_runtime.sandbox_dispatcher import SandboxDispatcher
 from firm_runtime.store import Store
 from firm_runtime.workspaces import sandbox_role_id
-from firm_sandbox import Config, RunSpec, Sandbox
 
 PROGRAM = r"""
 import json, os, time, urllib.request, urllib.error
@@ -73,16 +74,34 @@ class ProbeProvider:
     def __init__(self, founder, box):
         self.founder, self.box = founder, box
 
-    def build_spec(
-        self,
-        invocation,
-        role_id,
-        run_id,
-        mcp_url,
-        provider_session_id=None,
-        *,
-        layout=None,
-    ):
+    name = "probe"
+    model = "probe"
+
+    def validate_credentials(self):
+        return None
+
+    def build_summary_spec(self, request, layout):
+        raise NotImplementedError("probe only executes roles")
+
+    def build_task_spec(self, request, layout):
+        raise NotImplementedError("probe only executes roles")
+
+    def parse_summary(self, logs, exit_code):
+        raise NotImplementedError("probe only executes roles")
+
+    def parse_usage(self, logs):
+        return None
+
+    def parse_tool_calls(self, logs):
+        return {}
+
+    def parse_subscription(self, logs):
+        return None
+
+    def build_spec(self, request, *, layout):
+        self.request = request
+        invocation = request.invocation
+        role_id, run_id, mcp_url = request.role_id, request.run_id, request.mcp_url
         founder_layout = self.box.layout(sandbox_role_id(self.founder))
         return RunSpec(
             role_id,

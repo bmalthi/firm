@@ -18,6 +18,7 @@ from .accounts import credentials_path
 from .credential_store import CredentialStore
 from .errors import FirmError
 from .provider_contract import ProviderSetupError
+from .provider_definitions import PROVIDER_DEFINITIONS
 
 
 @dataclass(frozen=True)
@@ -119,18 +120,13 @@ def _write_new_file(path: Path, content: str) -> None:
 
 def generated_files(directory: Path, provider: str, mandate: str) -> dict[Path, str]:
     """Return the ordinary files consumed by existing init/check/start paths."""
-    if provider not in {"codex", "claude", "agy"}:
+    if provider not in PROVIDER_DEFINITIONS:
         raise FirmError("choose Codex, Claude or experimental AGY")
     if not isinstance(mandate, str) or not mandate.strip():
         raise FirmError("the first task must not be empty")
     firm_id = Path(directory).name.lower()
     account = f"{provider}-personal"
-    if provider == "codex":
-        model, effort = "gpt-6-luna", "low"
-    elif provider == "agy":
-        model, effort = "gemini-3.8-flash", "medium"
-    else:
-        model, effort = "sonnet", "medium"
+    settings = PROVIDER_DEFINITIONS[provider].onboarding
     firm_toml = (
         "# One provider for the first firm; the staffing chooser sizes each hire and picks\n"
         "# its guidance. Set staffing = false to give every role the founder's profile.\n"
@@ -140,8 +136,8 @@ def generated_files(directory: Path, provider: str, mandate: str) -> dict[Path, 
         f'founder_profile = "{provider}"\n\n'
         f"[profiles.{provider}]\n"
         f'provider = "{provider}"\n'
-        f'model = "{model}"\n'
-        f'effort = "{effort}"\n'
+        f'model = "{settings.model}"\n'
+        f'effort = "{settings.effort}"\n'
         f'accounts = ["{account}"]\n\n'
         f"[accounts.{account}]\n"
         f'provider = "{provider}"\n'
@@ -456,7 +452,7 @@ def login_provider(
 def _login_agy(account, *, target_credentials_path=None, force_login=False):
     """Retain the host-owned native profile for subsequent native renewal."""
     from .agy_auth import environment, host_argv, prepare_profile
-    from .provider_support import read_private_credential
+    from .credential_files import read_private_credential
 
     target = (credentials_path(account, "agy") if target_credentials_path is None
               else Path(target_credentials_path).expanduser())

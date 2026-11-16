@@ -7,7 +7,72 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict
+
+if TYPE_CHECKING:
+    from firm_sandbox import Layout, RunSpec
+
+    from .runtime import Invocation
+    from .summaries import SummaryLaunch, SummaryOutput
+
+
+class SubscriptionWindow(TypedDict):
+    """Provider-reported allowance; identity and optional keys remain native."""
+
+    window: str
+    used_percent: float | int
+    resets_at: float | int
+    limit_id: NotRequired[str | None]
+    label: NotRequired[str]
+
+
+class SubscriptionWarning(TypedDict):
+    window: str
+    resets_at: float | int
+    status: str
+
+
+@dataclass(frozen=True)
+class SubscriptionObservation:
+    """An empty relevant observation supersedes earlier allowance telemetry."""
+
+    event_id: str
+    windows: tuple[SubscriptionWindow, ...]
+    status: str | None = None
+    warning: SubscriptionWarning | None = None
+
+
+PollOutcome = Literal["reading", "stream_only", "unsupported_auth", "unavailable"]
+PollReason = Literal[
+    "rate_limited", "authentication_unavailable", "provider_unavailable", "reading_unavailable"
+]
+
+
+@dataclass(frozen=True)
+class SubscriptionPollResult:
+    """Bounded display-only result, independent of execution and admission."""
+
+    outcome: PollOutcome
+    windows: tuple[SubscriptionWindow, ...] = ()
+    reason: PollReason | None = None
+
+    def __post_init__(self):
+        if self.outcome not in ("reading", "stream_only", "unsupported_auth", "unavailable"):
+            raise ValueError("Unknown subscription poll outcome")
+        if (self.outcome == "reading") != bool(self.windows):
+            raise ValueError("Only a reading contains subscription windows")
+        reasons = {
+            "rate_limited",
+            "authentication_unavailable",
+            "provider_unavailable",
+            "reading_unavailable",
+        }
+        if self.outcome == "unavailable":
+            if self.reason not in reasons:
+                raise ValueError("Unavailable subscription poll requires a bounded reason")
+        elif self.reason is not None:
+            raise ValueError("Only unavailable subscription polls contain a reason")
+
 
 FailureCategory = Literal[
     "refusal",
@@ -29,12 +94,53 @@ SetupCategory = Literal["auth", "config", "transient"]
 
 MAX_RETRY_AFTER_SECONDS = 7 * 24 * 60 * 60
 SAFE_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
-SUPPORTED_EFFORTS = {
-    # Owner mapping: Firm xhigh selects native Argon high, never native xhigh.
-    "agy": frozenset({"low", "medium", "high", "xhigh"}),
-    "codex": frozenset({"low", "medium", "high", "xhigh", "max", "ultra"}),
-    "claude": frozenset({"low", "medium", "high", "xhigh", "max"}),
-}
+
+
+@dataclass(frozen=True)
+class RoleLaunchRequest:
+    """Role launch context, translated according to each native provider's needs.
+
+    Adapters enforce the offered catalog through supported native controls or
+    reject unsupported exposure. Native call budgets include bounded task cleanup.
+    Invocation.context remains mutable, as it is throughout admission and launch.
+    """
+
+    invocation: Invocation
+    role_id: str
+    run_id: str
+    mcp_url: str
+    provider_session_id: str | None
+    offered_tools: tuple[str, ...]
+    task_timeout_seconds: float
+
+
+class ExecutionProvider(Protocol):
+    """Model-bound execution surface; credentials fail through ProviderSetupError."""
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def model(self) -> str: ...
+
+    def validate_credentials(self) -> None: ...
+
+    def build_spec(self, request: RoleLaunchRequest, *, layout: Layout) -> RunSpec: ...
+
+    def build_summary_spec(self, request: SummaryLaunch, layout: Layout) -> RunSpec: ...
+
+    def build_task_spec(self, request: SummaryLaunch, layout: Layout) -> RunSpec: ...
+
+    def parse_result(self, logs: bytes | str, exit_code: int) -> ProviderResult: ...
+
+    def parse_usage(self, logs: bytes | str) -> ProviderUsage | None: ...
+
+    def parse_tool_calls(self, logs: bytes | str) -> dict[str, int]: ...
+
+    def parse_summary(self, logs: bytes | str, exit_code: int) -> SummaryOutput: ...
+
+    def parse_subscription(self, logs: bytes | str) -> SubscriptionObservation | None: ...
+
 
 _CATEGORIES: dict[str, FailureCategory] = {
     "rate_limit_exceeded": "quota",

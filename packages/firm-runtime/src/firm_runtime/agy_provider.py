@@ -9,25 +9,28 @@ from dataclasses import replace
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
-from firm_sandbox import RunSpec
+from firm_sandbox import Layout, RunSpec
 
 from . import agy_launch, credential_mirror
 from .provider_contract import (
-    SUPPORTED_EFFORTS,
     ProviderError,
     ProviderResult,
     ProviderSetupError,
     ProviderUsage,
+    RoleLaunchRequest,
+    SubscriptionObservation,
     category_for_code,
     safe_code,
     summary_error,
     token_count,
     tool_name,
 )
+from .provider_definitions import PROVIDER_DEFINITIONS
 from .provider_support import (
     activation_url,
     canonical_uuid,
     render_invocation,
+    role_mcp_settings,
     standing,
     summary_instructions,
     text_setting,
@@ -39,13 +42,15 @@ NATIVE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 
 def native_model_id(model, effort):
     """Firm stores model and effort separately; only this boundary joins them."""
-    if not isinstance(effort, str) or effort not in SUPPORTED_EFFORTS["agy"]:
+    if not isinstance(effort, str) or effort not in PROVIDER_DEFINITIONS["agy"].supported_efforts:
         raise ProviderSetupError(
             category="config",
             code="invalid_effort",
             message="AGY supports low, medium, high and the Firm xhigh mapping",
         )
-    if not isinstance(model, str) or model not in {"gemini-3.8-flash", "gemini-4-argon"}:
+    if not isinstance(model, str) or model not in {
+        "gemini-4-argon", "gemini-4-hydrogen"
+    }:
         raise ProviderSetupError(
             category="config",
             code="invalid_model",
@@ -259,7 +264,7 @@ def parse_summary(logs, exit_code):
     )
 
 
-def parse_subscription(logs):
+def parse_subscription(logs: bytes | str) -> SubscriptionObservation | None:
     return None
 
 
@@ -285,7 +290,7 @@ class AgyProvider:
     def validate_credentials(self):
         from .credential_store import CredentialStore
 
-        CredentialStore(self.name, self.auth_file)._agy_snapshot(False, margin=None)
+        CredentialStore(self.name, self.auth_file).snapshot(margin=None)
 
     def _spec(
         self,
@@ -364,7 +369,7 @@ class AgyProvider:
                 "agy-auth": self._access_snapshot(),
                 "agy-launcher": Path(agy_launch.__file__).read_bytes(),
                 "credential-mirror": Path(credential_mirror.__file__).read_bytes(),
-                "agy-instructions": instructions.encode(),
+                "role-instructions" if role else "summary-instructions": instructions.encode(),
             },
             secret_env={"FIRM_ACTIVATION_TOKEN" if role else "FIRM_SUMMARY_TOKEN": token_name},
             stdin=(json.dumps({"event": "user", "message": {"content": prompt}}) + "\n").encode(),
@@ -374,27 +379,27 @@ class AgyProvider:
         from .credential_store import CredentialStore
 
         # Like other providers, stage locally; the first mirror fetch obtains headroom.
-        snapshot = CredentialStore(self.name, self.auth_file)._agy_snapshot(
-            False, margin=agy_launch.STARTUP_MARGIN + 1
+        snapshot = CredentialStore(self.name, self.auth_file).snapshot(
+            margin=agy_launch.STARTUP_MARGIN + 1
         )
         return json.dumps(snapshot["data"]).encode()
 
-    def build_spec(
-        self,
-        invocation,
-        role_id,
-        run_id,
-        mcp_url,
-        provider_session_id=None,
-        *,
-        layout,
-        mcp_tools=None,
-        mcp_timeout=600,
-    ):
-        if mcp_tools is None:
-            from .mcp_server import TOOL_DESCRIPTIONS
-
-            mcp_tools = list(TOOL_DESCRIPTIONS)
+    def build_spec(self, request: RoleLaunchRequest, *, layout: Layout) -> RunSpec:
+        invocation = request.invocation
+        role_id, run_id = request.role_id, request.run_id
+        mcp_url, provider_session_id = request.mcp_url, request.provider_session_id
+        try:
+            mcp_tools, mcp_timeout = role_mcp_settings(request)
+        except ValueError as exc:
+            raise ProviderSetupError(
+                category="config", code="invalid_invocation", message=str(exc)
+            ) from None
+        # Empty enabledTools has not been verified to hide every discovered tool.
+        if not mcp_tools:
+            raise ProviderSetupError(
+                category="config", code="unsupported_mcp_catalog",
+                message="empty Firm tool catalogs are unsupported for AGY",
+            )
         return self._spec(
             role_id=role_id,
             run_id=run_id,

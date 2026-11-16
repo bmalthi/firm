@@ -12,9 +12,9 @@ import json
 import re
 from pathlib import Path
 
+from .credential_files import read_private_credential
 from .errors import FirmError
 from .provider_contract import ProviderSetupError
-from .provider_support import read_private_credential
 
 # https://cloud.google.com/resource-manager/reference/rest/v1/projects
 PROJECT = re.compile(r"[a-z][a-z0-9-]{4,28}[a-z0-9]")

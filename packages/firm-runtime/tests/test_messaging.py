@@ -270,7 +270,7 @@ def test_failed_owner_reply_rolls_back_delivery_message_and_receipt(mailroom, mo
     assert messaging.reply(OWNER, target, "Answer", request_id="answer")["status"] == "sent"
 
 
-def test_role_reply_leaves_pending_delivery_and_notice_metadata_is_console_only(mailroom):
+def test_role_reply_claims_target_and_notice_metadata_is_console_only(mailroom):
     store, messaging, founder, (alice, *_), _ = mailroom
     target = messaging.send(founder, [alice], "Question", request_id="question")["message_id"]
     messaging.reply(alice, target, "Answer", request_id="answer")
@@ -280,7 +280,7 @@ def test_role_reply_leaves_pending_delivery_and_notice_metadata_is_console_only(
                 "SELECT disposition FROM message_deliveries WHERE message_id=? AND employee_id=?",
                 (target, alice),
             ).fetchone()[0]
-            == "pending"
+            == "claimed"
         )
         notice = messaging.notice(
             db, [alice], "Status", subject="Status", regarding={"kind": "request", "id": "q1"}
@@ -290,6 +290,62 @@ def test_role_reply_leaves_pending_delivery_and_notice_metadata_is_console_only(
         ).fetchone()
         assert (row["regarding_kind"], row["regarding_id"]) == ("request", "q1")
     assert "regarding" not in messaging.messages(alice, [notice["message_id"]])["messages"][0]
+
+
+@pytest.mark.parametrize("add", [False, True])
+def test_role_reply_claims_only_own_target_and_replay_preserves_time(mailroom, add):
+    store, messaging, founder, (alice, bob, carol, *_), now = mailroom
+    target = messaging.send(founder, [alice, bob], "Question", request_id="target")
+    sibling = messaging.send(founder, [alice, bob], "Also this", request_id="sibling")
+    messaging.messages(alice, [target["message_id"], sibling["message_id"]])
+    now[0] += 10
+    kwargs = {"add": [carol]} if add else {}
+    result = messaging.reply(alice, target["message_id"], "I will investigate.",
+                             request_id="answer", **kwargs)
+    now[0] += 10
+    assert messaging.reply(alice, target["message_id"], "I will investigate.",
+                           request_id="answer", **kwargs) == result
+    with store.read() as db:
+        rows = db.execute(
+            "SELECT message_id,employee_id,disposition,disposition_at "
+            "FROM message_deliveries WHERE message_id IN (?,?)",
+            (target["message_id"], sibling["message_id"]),
+        ).fetchall()
+    for row in rows:
+        claimed = row["message_id"] == target["message_id"] and row["employee_id"] == alice
+        assert row["disposition"] == ("claimed" if claimed else "pending")
+        assert row["disposition_at"] == (1010 if claimed else None)
+
+
+def test_failed_role_reply_rolls_back_claim_and_receipt(mailroom, monkeypatch):
+    store, messaging, founder, (alice, *_), _ = mailroom
+    target = messaging.send(founder, [alice], "Question", request_id="target")["message_id"]
+    write = messaging._write_disposition
+
+    def fail_after_claim(*args, **kwargs):
+        write(*args, **kwargs)
+        raise FirmError("injected reply failure")
+
+    monkeypatch.setattr(messaging, "_write_disposition", fail_after_claim)
+    with pytest.raises(FirmError, match="injected reply failure"):
+        messaging.reply(alice, target, "Answer", request_id="answer")
+    with store.read() as db:
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 1
+        assert db.execute(
+            "SELECT disposition FROM message_deliveries WHERE message_id=?", (target,),
+        ).fetchone()[0] == "pending"
+        assert store.operation_result(db, alice, "answer") is None
+
+
+def test_role_reply_with_no_deliverable_recipients_keeps_target_pending(mailroom):
+    store, messaging, founder, (alice, *_), _ = mailroom
+    target = messaging.send(alice, [founder], "Question", request_id="target")["message_id"]
+    with store.transaction() as db:
+        db.execute("UPDATE roles SET employment='retired' WHERE employee_id=?", (alice,))
+    result = messaging.reply(founder, target, "Answer", request_id="answer")
+    assert not result["queued"]
+    assert scalar(store, "SELECT disposition FROM message_deliveries WHERE message_id=?",
+                  (target,)) == "pending"
 
 
 @pytest.mark.parametrize(
@@ -1014,7 +1070,8 @@ def test_recent_claims_uses_claim_order_at_equal_timestamps(mailroom):
     assert all(set(item) == {"message_id", "subject", "claimed_at"} for item in recent)
 
 
-def test_claim_retry_from_a_later_activation_keeps_original_claim_record(mailroom):
+@pytest.mark.parametrize("operation", ["claim", "reply"])
+def test_claim_retry_from_a_later_activation_keeps_original_claim_record(mailroom, operation):
     store, messaging, founder, (alice, *_), _ = mailroom
     sent = messaging.send(founder, [alice], "Retry this claim", request_id="send")
     with store.transaction() as db:
@@ -1023,9 +1080,17 @@ def test_claim_retry_from_a_later_activation_keeps_original_claim_record(mailroo
             "context_json,created_at) VALUES('a1',?,?,'running','[]','{}',1000)",
             (alice, "first-session"),
         )
-    original = messaging.claim(
-        alice, [sent["message_id"]], request_id="same-claim", activation_id="a1"
-    )
+    def act(activation_id):
+        if operation == "reply":
+            return messaging.reply(
+                alice, sent["message_id"], "Acknowledged, still working.",
+                request_id="same-reply", activation_id=activation_id,
+            )
+        return messaging.claim(
+            alice, [sent["message_id"]], request_id="same-claim", activation_id=activation_id,
+        )
+
+    original = act("a1")
     with store.transaction() as db:
         db.execute("UPDATE activations SET state='completed' WHERE activation_id='a1'")
         db.execute(
@@ -1033,9 +1098,7 @@ def test_claim_retry_from_a_later_activation_keeps_original_claim_record(mailroo
             "context_json,created_at) VALUES('a2',?,?,'running','[]','{}',1000)",
             (alice, "second-session"),
         )
-    retry = messaging.claim(
-        alice, [sent["message_id"]], request_id="same-claim", activation_id="a2"
-    )
+    retry = act("a2")
     assert retry == original
     with store.read() as db:
         recorded = db.execute(
@@ -1044,6 +1107,63 @@ def test_claim_retry_from_a_later_activation_keeps_original_claim_record(mailroo
             (sent["message_id"], alice),
         ).fetchone()
     assert dict(recorded) == {"claimed_activation_id": "a1", "claim_sequence": 1}
+
+
+@pytest.mark.parametrize("same_session", [False, True])
+@pytest.mark.parametrize("add_person", [False, True])
+def test_reply_claims_only_full_read_predecessors_in_retained_session(
+    mailroom, same_session, add_person
+):
+    store, messaging, founder, (alice, bob, carol, *_), _ = mailroom
+    ids = [
+        messaging.send(founder, [alice, bob], body, request_id=body)["message_id"]
+        for body in ("read earlier", "unread earlier", "target", "read later")
+    ]
+    other = messaging.send(founder, [alice], "Other thread", request_id="other")["message_id"]
+    with store.transaction() as db:
+        db.execute(
+            "INSERT INTO activations(activation_id,employee_id,session_id,state,wake_snapshot,"
+            "context_json,created_at) VALUES('read',?,'session','running','[]','{}',1000)",
+            (alice,),
+        )
+    messaging.peek(alice)
+    messaging.messages(alice, [ids[0], ids[3], other], activation_id="read")
+    with store.transaction() as db:
+        db.execute("UPDATE activations SET state='completed' WHERE activation_id='read'")
+        db.execute(
+            "INSERT INTO activations(activation_id,employee_id,session_id,state,wake_snapshot,"
+            "context_json,created_at) VALUES('reply',?,?,'running','[]','{}',1000)",
+            (alice, "session" if same_session else "fresh-session"),
+        )
+    messaging.reply(
+        alice, ids[2], "Acknowledged", request_id="reply", activation_id="reply",
+        add=[carol] if add_person else None,
+    )
+    with store.read() as db:
+        dispositions = {
+            (r["employee_id"], r["message_id"]): r["disposition"]
+            for r in db.execute("SELECT * FROM message_deliveries")
+        }
+    assert [dispositions[alice, mid] for mid in ids] == [
+        "claimed" if same_session else "pending", "pending", "claimed", "pending"
+    ]
+    assert dispositions[alice, other] == "pending"
+    assert all(dispositions[bob, mid] == "pending" for mid in ids)
+
+
+def test_failed_full_lookup_does_not_record_reads(mailroom, monkeypatch):
+    store, messaging, founder, (alice, *_), _ = mailroom
+    sent = messaging.send(founder, [alice], "Body", request_id="body")["message_id"]
+    with store.transaction() as db:
+        db.execute(
+            "INSERT INTO activations(activation_id,employee_id,session_id,state,wake_snapshot,"
+            "context_json,created_at) VALUES('read',?,'session','running','[]','{}',1000)",
+            (alice,),
+        )
+    monkeypatch.setattr("firm_runtime.messaging.MAX_RESULT_BYTES", 1)
+    with pytest.raises(FirmError):
+        messaging.messages(alice, [sent], activation_id="read")
+    assert scalar(store, "SELECT COUNT(*) FROM message_reads") == 0
 
 
 def test_bounds_validation_and_base36_ids(mailroom):

@@ -21,7 +21,7 @@ def main():
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--replace", action="store_true", required=True)
     args = parser.parse_args()
-    args.evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
+    args.evidence.mkdir(mode=0o700, parents=True, exist_ok=False)
     firm = Sandbox(Config.load(args.root / "sandbox.toml"))
     results = []
 

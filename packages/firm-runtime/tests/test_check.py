@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import socket
@@ -7,6 +8,7 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -526,3 +528,40 @@ def test_check_reports_port_collision_and_duplicate_requested_ports(tmp_path, mo
     report = _invoke(monkeypatch, capsys, directory, ports=(duplicate, duplicate), fails=True)
     assert _checks(report)["mcp_port"]["status"] == "good"
     assert _checks(report)["console_port"]["status"] == "failure"
+
+
+@pytest.mark.parametrize("operation", ["socket", "bind", "listen"])
+@pytest.mark.parametrize(
+    "failure,expected_action",
+    [
+        (OSError(errno.EADDRINUSE, "Address already in use"), "Stop the process"),
+        (OSError(errno.EACCES, "Permission denied"), "permissions or sandbox restrictions"),
+        (OSError(errno.EPERM, "Operation not permitted"), "permissions or sandbox restrictions"),
+        (OSError(errno.EADDRNOTAVAIL, "Cannot assign requested address"), "reported socket error"),
+        (OSError("socket setup failed"), "reported socket error"),
+    ],
+)
+def test_check_port_failures_preserve_the_cause_and_appropriate_action(
+    monkeypatch, operation, failure, expected_action
+):
+    from firm_runtime.setup_check import _check_ports
+
+    listener = Mock()
+    socket_factory = Mock(return_value=listener)
+    if operation == "socket":
+        socket_factory.side_effect = failure
+    else:
+        getattr(listener, operation).side_effect = failure
+    monkeypatch.setattr("firm_runtime.setup_check.socket.socket", socket_factory)
+
+    result, = _check_ports((("mcp_port", 8765),))
+
+    assert result["status"] == "failure"
+    assert "8765" in result["message"]
+    assert str(failure) in result["message"]
+    assert expected_action in result["action"]
+    if failure.errno != errno.EADDRINUSE:
+        assert "Stop the process" not in result["action"]
+        assert "--mcp-port" not in result["action"]
+    if operation != "socket":
+        listener.close.assert_called_once_with()

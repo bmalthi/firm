@@ -7,11 +7,11 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from firm_sandbox import Layout, Run, RunSpec
+from firm_sandbox import Layout, Organization, Run, RunSpec
 from runtime_test_support import FakeProvider, FakeSandbox
 
 from firm_runtime.errors import FirmError
-from firm_runtime.provider_contract import ProviderUsage
+from firm_runtime.provider_contract import ProviderUsage, SubscriptionObservation
 from firm_runtime.runtime import Runtime
 from firm_runtime.sandbox_dispatcher import SandboxDispatcher
 from firm_runtime.store import OWNER, Store
@@ -59,6 +59,270 @@ def test_opening_creates_the_firm_lock_directory_the_sandbox_can_lock(system):
         assert box.config.locks.stat().st_mode & 0o777 == 0o700
         with lifecycle_locked(box.config.locks, exclusive=True):
             pass
+
+
+def test_ready_admission_and_http_gate_do_not_wait_for_unrelated_file_provision(
+    system, monkeypatch
+):
+    from starlette.testclient import TestClient
+
+    from firm_runtime.mcp_http import build_http_app
+    from firm_runtime.workspaces import provision_runtime_role
+
+    runtime, box, _ = system
+    files = box.file_server
+    entered, release, timed_out = (threading.Event() for _ in range(3))
+    original = files.run
+
+    def delayed(request):
+        if any("org/unrelated/work" in step.get("directories", []) for step in request["steps"]):
+            entered.set()
+            if not release.wait(3):
+                timed_out.set()
+        return original(request)
+
+    errors = []
+
+    def unrelated_provision():
+        try:
+            files.provision("r-unrelated", Organization("unrelated"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    with host(system) as dispatcher:
+        dispatcher.start()
+        provision_runtime_role(runtime.store, box.config.root, "founder", files=files)
+        monkeypatch.setattr(files, "run", delayed)
+        thread = threading.Thread(target=unrelated_provision)
+        thread.start()
+        try:
+            assert entered.wait(2)
+            (invocation,) = dispatcher.tick()
+            app = build_http_app(
+                runtime, allowed_hosts=["testserver"], allowed_origins=["http://testserver"]
+            )
+            with TestClient(app) as client:
+                response = client.post(
+                    "/activation/start", headers={"Authorization": f"Bearer {invocation.token}"}
+                )
+            assert response.status_code == 200
+            assert not timed_out.is_set()
+            assert not release.is_set()
+        finally:
+            release.set()
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+            for future in dispatcher._launches.values():
+                future.result(timeout=2)
+        assert not errors
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_start_prepares_existing_workspaces_before_the_first_guest_gate(system, monkeypatch, mixed):
+    from starlette.testclient import TestClient
+
+    from firm_runtime.mcp_http import build_http_app
+    from firm_runtime.workspaces import provision_runtime_role
+
+    runtime, box, provider = system
+    manager = runtime.lifecycle.hire(
+        "founder", "engineering", "Build", "codex", request_id="eng"
+    )["employee_id"]
+    child = runtime.lifecycle.hire(
+        manager, "api", "Build API", "codex", request_id="api"
+    )["employee_id"]
+    if mixed:
+        provision_runtime_role(runtime.store, box.config.root, "founder", files=box.file_server)
+    entered, release = threading.Event(), threading.Event()
+    provisioned, errors = [], []
+    original = box.file_server.run
+
+    def delayed(request):
+        for step in request["steps"]:
+            if step["action"] == "provision":
+                provisioned.extend(step["directories"])
+                if "org/founder/engineering/api/work" in step["directories"]:
+                    entered.set()
+                    if not release.wait(5):
+                        raise TimeoutError("test did not release workspace preparation")
+        return original(request)
+
+    monkeypatch.setattr(box.file_server, "run", delayed)
+    with host(system) as dispatcher:
+        thread = threading.Thread(target=lambda: _record_error(errors, dispatcher.start))
+        thread.start()
+        try:
+            assert entered.wait(2)
+            assert not box.invocations
+            assert not provider.requests
+            with runtime.store.read() as db:
+                infrastructure = db.execute(
+                    "SELECT infrastructure_state FROM execution_host"
+                ).fetchone()[0]
+                assert infrastructure == "starting"
+            release.set()
+            thread.join(timeout=3)
+            assert not thread.is_alive()
+            assert not errors
+            assert box.file_server._ready_roles == {"r-founder", sandbox_role_id(manager),
+                                                    sandbox_role_id(child)}
+            before = list(provisioned)
+            invocations = dispatcher.tick()
+            assert len(invocations) == 2
+            app = build_http_app(
+                runtime, allowed_hosts=["testserver"], allowed_origins=["http://testserver"]
+            )
+            with TestClient(app) as client:
+                for invocation in invocations:
+                    response = client.post(
+                        "/activation/start", headers={"Authorization": f"Bearer {invocation.token}"}
+                    )
+                    assert response.status_code == 200
+            assert provisioned == before
+        finally:
+            release.set()
+            thread.join(timeout=3)
+            assert not thread.is_alive()
+            for future in dispatcher._launches.values():
+                future.result(timeout=2)
+
+
+def test_restarting_ready_workspaces_does_not_provision_them_again(system, monkeypatch):
+    runtime, box, _ = system
+    runtime.lifecycle.hire("founder", "engineering", "Build", "codex", request_id="eng")
+    with host(system) as dispatcher:
+        dispatcher.start()
+        dispatcher.stop(force=True)
+        dispatcher.tick()
+
+        def unexpected(*args, **kwargs):
+            raise AssertionError("ready startup workspaces must not be reprovisioned")
+
+        monkeypatch.setattr(box.file_server, "provision", unexpected)
+        dispatcher.start()
+        assert len(dispatcher.tick()) == 2
+
+
+def test_startup_reconciles_retired_runs_before_replacement_and_skips_inactive_roles(
+    system, monkeypatch
+):
+    runtime, box, provider = system
+    old = runtime.lifecycle.hire(
+        "founder", "engineering", "Build", "codex", request_id="old"
+    )["employee_id"]
+    with host(system) as dispatcher:
+        dispatcher.start()
+        invocations = dispatcher.tick()
+        for future in dispatcher._launches.values():
+            future.result(timeout=2)
+        for invocation in invocations:
+            runtime.begin_execution(invocation.token)
+        old_workspace = box.file_server.tree / box.file_server.workspace_path(sandbox_role_id(old))
+        saved = old_workspace / "work.txt"
+        saved.write_text("preserved work")
+    runtime.lifecycle.fire("founder", old, reason="Replace", request_id="fire-old")
+    replacement = runtime.lifecycle.hire(
+        "founder", "engineering", "Build again", "codex", request_id="new"
+    )["employee_id"]
+    paused = runtime.lifecycle.hire(
+        "founder", "paused", "Wait", "codex", request_id="paused"
+    )["employee_id"]
+    runtime.owner.stop_role(OWNER, paused, "pause")
+    retired = runtime.lifecycle.hire(
+        "founder", "retired", "Finished", "codex", request_id="retired"
+    )["employee_id"]
+    runtime.lifecycle.fire("founder", retired, reason="Finished", request_id="fire-retired")
+    reopened = Runtime(Store.scratch(runtime.store.path))
+    provisioned = []
+    original = box.file_server.provision
+
+    def record(role_id, *args, **kwargs):
+        provisioned.append(role_id)
+        return original(role_id, *args, **kwargs)
+
+    monkeypatch.setattr(box.file_server, "provision", record)
+    with host((reopened, box, provider)) as dispatcher:
+        dispatcher.start()
+        assert provisioned == [sandbox_role_id(replacement)]
+        assert reopened.status()["active"] == []
+        with reopened.store.read() as db:
+            for invocation in invocations:
+                activation = reopened._activation(db, invocation.activation_id)
+                assert activation["state"] == "interrupted"
+                assert activation["failure_category"] == "host_restart"
+        archived = box.file_server.workspace_path(sandbox_role_id(old))
+        assert archived.startswith("org/.retired/")
+        assert (box.file_server.tree / archived / "work.txt").read_text() == "preserved work"
+        assert box.file_server.workspace_path(sandbox_role_id(replacement)) == (
+            "org/founder/engineering/work"
+        )
+        assert box.file_server.workspace_path(sandbox_role_id(paused)) is None
+        assert box.file_server.workspace_path(sandbox_role_id(retired)) is None
+
+
+@pytest.mark.parametrize("already_running", [False, True])
+def test_startup_workspace_failure_closes_admission(system, monkeypatch, already_running):
+    runtime, box, provider = system
+    if already_running:
+        runtime.start()
+
+    def fail(*args, **kwargs):
+        raise OSError("workspace guest is unreachable")
+
+    monkeypatch.setattr(box.file_server, "provision", fail)
+    with host(system) as dispatcher:
+        with pytest.raises(FirmError, match="workspace guest is unreachable"):
+            dispatcher.start()
+        assert runtime.status()["state"] == "stopping"
+        assert not provider.requests
+        assert not box.invocations
+        assert dispatcher.tick() == []
+        assert runtime.status()["state"] == "stopped"
+
+
+@pytest.mark.parametrize("settle_stop", [False, True])
+def test_stop_during_workspace_preparation_never_reopens_admission(
+    system, monkeypatch, settle_stop
+):
+    from firm_runtime import sandbox_dispatcher
+
+    runtime, box, provider = system
+    entered, release = threading.Event(), threading.Event()
+    errors = []
+    original = sandbox_dispatcher.ensure_runtime_role
+
+    def delayed(*args, **kwargs):
+        result = original(*args, **kwargs)
+        entered.set()
+        if not release.wait(5):
+            raise TimeoutError("test did not release workspace preparation")
+        return result
+
+    monkeypatch.setattr(sandbox_dispatcher, "ensure_runtime_role", delayed)
+    with host(system) as dispatcher:
+        thread = threading.Thread(target=lambda: _record_error(errors, dispatcher.start))
+        thread.start()
+        try:
+            assert entered.wait(2)
+            dispatcher.stop(force=True)
+            if settle_stop:
+                dispatcher.tick()
+                assert runtime.status()["state"] == "stopped"
+            release.set()
+            thread.join(timeout=3)
+            assert not thread.is_alive()
+            assert len(errors) == 1
+            assert isinstance(errors[0], FirmError)
+            assert "startup was interrupted" in str(errors[0])
+            assert runtime.status()["state"] != "running"
+            assert not provider.requests
+            assert not box.invocations
+            assert dispatcher.tick() == []
+            assert runtime.status()["state"] == "stopped"
+        finally:
+            release.set()
+            thread.join(timeout=3)
+            assert not thread.is_alive()
 
 
 @pytest.mark.parametrize("force", [False, True])
@@ -129,6 +393,26 @@ def test_launch_handoff_shutdown_and_real_session_resume(system):
         dispatcher.stop(force=True)
         dispatcher.tick()
         assert not box.live
+
+
+def test_role_launch_request_carries_catalog_and_configured_task_deadline(system):
+    runtime, box, provider = system
+    with runtime.store.transaction() as db:
+        config = runtime.accounts.config(db)
+        config["task"]["timeout_seconds"] = 947
+        db.execute("UPDATE firm SET config_json=?", (json.dumps(config),))
+    with host(system) as dispatcher:
+        dispatcher.start()
+        call = launch(dispatcher, runtime)
+        (request,) = provider.requests
+        assert request.invocation is call
+        assert request.role_id == sandbox_role_id(call.employee_id)
+        assert request.run_id == sandbox_run_id(call.activation_id)
+        assert request.mcp_url == "http://127.0.0.1:9000/mcp"
+        assert request.provider_session_id is None
+        assert request.offered_tools == tuple(tool["name"] for tool in dispatcher._tool_catalog)
+        assert "task" in request.offered_tools
+        assert request.task_timeout_seconds == 947
 
 
 def usage_row(runtime):
@@ -494,7 +778,7 @@ def test_a_failed_tally_write_leaves_the_period_untallied_and_the_tick_whole(sys
 def test_streamed_allowance_is_recorded_once_per_event_for_the_bound_account(system, monkeypatch):
     runtime, box, provider = system
     provider.parse_subscription = lambda logs: (
-        {"event_id": logs.decode(), "windows": [{"window": "five_hour"}]} if logs else None
+        SubscriptionObservation(logs.decode(), ({"window": "five_hour"},)) if logs else None
     )
     recorded = []
     bound = {"account_id": "acct", "profile": "codex", "provider": None, "settings_json": "{}"}

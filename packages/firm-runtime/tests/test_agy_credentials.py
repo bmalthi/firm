@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from firm_runtime import agy_auth, onboarding
+from firm_runtime.credential_files import CredentialFile
 from firm_runtime.credential_store import CredentialStore, guest_credentials
 from firm_runtime.provider_contract import ProviderSetupError
 
@@ -293,9 +294,9 @@ def test_native_renewal_failure_is_auth_only_after_expiry(tmp_path, monkeypatch,
 def test_fresh_snapshot_and_build_do_not_take_renewal_lock(tmp_path, monkeypatch):
     from firm_runtime.agy_provider import AgyProvider
     path = account(tmp_path, 4102444800)
-    monkeypatch.setattr(CredentialStore, "_lock", lambda *_: pytest.fail("lock acquired"))
+    monkeypatch.setattr(CredentialFile, "locked", lambda *_: pytest.fail("lock acquired"))
     assert CredentialStore("agy", path).snapshot()["kind"] == "agy-access"
-    adapter = AgyProvider(model="gemini-3.8-flash", effort="medium", auth_file=path)
+    adapter = AgyProvider(model="gemini-4-hydrogen", effort="medium", auth_file=path)
     assert json.loads(adapter._access_snapshot())["token"]["refresh_token"] == ""
 
 
@@ -326,7 +327,7 @@ path.write_text(json.dumps(data))
 def test_failed_login_names_exit_and_retained_state_without_lock(tmp_path, monkeypatch):
     executable = fake_agy(tmp_path, "import sys\nsys.exit(7)\n")
     monkeypatch.setattr(agy_auth, "native_command", lambda: str(executable))
-    monkeypatch.setattr(CredentialStore, "_lock", lambda *_: pytest.fail("interactive lock"))
+    monkeypatch.setattr(CredentialFile, "locked", lambda *_: pytest.fail("interactive lock"))
     from firm_runtime.errors import FirmError
     path = tmp_path / "profile/home" / agy_auth.TOKEN_PATH
     with pytest.raises(FirmError, match="status 7; profile retained at") as error:
@@ -388,10 +389,10 @@ def test_native_midwrite_is_retried_under_lock(tmp_path, monkeypatch, build):
     def read(target, provider):
         reads.append(bool(locked))
         return b"{" if len(reads) == 1 else original(target, provider)
-    monkeypatch.setattr(CredentialStore, "_lock", lock)
+    monkeypatch.setattr(CredentialFile, "locked", lock)
     monkeypatch.setattr(agy_auth, "read_private_credential", read)
     if build:
-        result = AgyProvider(model="gemini-3.8-flash", effort="medium",
+        result = AgyProvider(model="gemini-4-hydrogen", effort="medium",
                              auth_file=path)._access_snapshot()
         assert json.loads(result)["token"]["refresh_token"] == ""
     else:
@@ -424,8 +425,8 @@ from firm_runtime import agy_auth
 from firm_runtime.credential_store import CredentialStore
 store = CredentialStore('agy', sys.argv[1])
 agy_auth.renew = lambda *_: os._exit(9)
-with store._lock():
-    agy_auth.force_renew(store.path, replace=store._replace)
+with store.files.locked():
+    agy_auth.force_renew(store.path, replace=store.files.replace)
 """
     result = subprocess.run([sys.executable, "-c", script, str(path)], timeout=10)
     assert result.returncode == 9
@@ -558,3 +559,63 @@ def test_expiry_backup_io_failure_falls_back_without_config_hold(tmp_path, monke
     monkeypatch.setattr(agy_auth, "force_renew", unavailable)
     result = CredentialStore("agy", path, clock=lambda: 1000).snapshot()
     assert result["expires_at"] == 2000
+
+
+@pytest.mark.parametrize("margin,remaining,renew", [
+    (None, -10, False), (None, 0, False), (None, 100, False),
+    (0, 0, False), (0, 1, False), (301, 300, True), (301, 301, False),
+    (3000, 2999, True), (3000, 3000, False), (3000, 3001, False),
+])
+def test_public_native_snapshot_margin_policy(tmp_path, monkeypatch, margin, remaining, renew):
+    path = account(tmp_path, 1000 + remaining)
+    path.with_name(path.name + ".lock").unlink()
+    calls = []
+
+    def force_renew(target, *, replace):
+        calls.append(target)
+        raw, _ = agy_auth.read_native(target)
+        renewed = bundle(10000)
+        assert replace(raw, renewed)
+        return renewed
+
+    monkeypatch.setattr(agy_auth, "force_renew", force_renew)
+    result = CredentialStore("agy", path, clock=lambda: 1000,
+                             refresh=lambda *_: pytest.fail("HTTP refresh")).snapshot(margin=margin)
+    assert bool(calls) is renew
+    assert result["expires_at"] == (10000 if renew else 1000 + remaining)
+    assert path.with_name(path.name + ".lock").exists() is renew
+
+
+def test_validation_snapshot_recovers_pending_expiry_backup_without_renewing(tmp_path, monkeypatch):
+    path = account(tmp_path, 2000)
+    original = json.loads(path.read_bytes())
+    backup = agy_auth._expiry_backup(path)
+    backup.write_text(json.dumps({key: original["token"][key]
+                                  for key in ("access_token", "expiry")}))
+    backup.chmod(0o600)
+    original["token"]["expiry"] = agy_auth.FORCED_EXPIRY
+    path.write_text(json.dumps(original))
+    monkeypatch.setattr(agy_auth, "force_renew", lambda *a, **k: pytest.fail("native renewal"))
+    result = CredentialStore("agy", path, clock=lambda: 1000).snapshot(margin=None)
+    assert result["expires_at"] == 2000
+    assert not backup.exists()
+    assert json.loads(path.read_text())["token"]["expiry"] == bundle(2000)["token"]["expiry"]
+
+
+@pytest.mark.parametrize("margin", [None, 0, 3000])
+def test_force_native_snapshot_overrides_public_margin(tmp_path, monkeypatch, margin):
+    path = account(tmp_path, 10000)
+    calls = []
+
+    def force_renew(target, *, replace):
+        calls.append(target)
+        raw, _ = agy_auth.read_native(target)
+        renewed = bundle(20000)
+        assert replace(raw, renewed)
+        return renewed
+
+    monkeypatch.setattr(agy_auth, "force_renew", force_renew)
+    store = CredentialStore("agy", path, clock=lambda: 1000,
+                            refresh=lambda *_: pytest.fail("HTTP refresh"))
+    assert store.snapshot(force=True, margin=margin)["expires_at"] == 20000
+    assert calls == [path]
