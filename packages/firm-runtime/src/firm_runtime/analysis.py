@@ -1153,10 +1153,14 @@ class AnalysisReader:
         }
 
     @staticmethod
-    def readiness(db, now, employee_id=None, cutoff=None):
+    def readiness(db, now, employee_id=None, cutoff=None, *, can_select=None):
+        from . import guidance
+        from .levels import level_of
         firm = db.execute("SELECT state,config_json FROM firm").fetchone()
         config = json.loads(firm["config_json"])
         host = db.execute("SELECT infrastructure_state FROM execution_host").fetchone()
+        if can_select is None:
+            can_select = host is not None
         active = {
             r["employee_id"]: dict(r)
             for r in db.execute(
@@ -1223,9 +1227,7 @@ class AnalysisReader:
             )
         )
         query = (
-            "SELECT rowid,employee_id,address,public_profile,employment,session_id,"
-            "execution_profile,"
-            "hold_reason,retry_at,attempt_count,recovery_episode FROM roles"
+            "SELECT rowid,* FROM roles"
         )
         rows = []
         for role in db.execute(query):
@@ -1277,6 +1279,10 @@ class AnalysisReader:
                 stable.append(pinned["incident_id"])
             if eid in pending_levels:
                 add("level_pending", pending_levels[eid])
+            if (can_select and config.get("staffing") is not False and not role["birth_delivered"]
+                    and role["guidance_state"] == "pending"):
+                add("guidance_pending", {"attempts": role["guidance_attempts"],
+                                         "retry_at": role["guidance_retry_at"]})
             appointment = terms.get(eid, {"kind": "durable"})
             if appointment["kind"] == "temporary" and appointment["remaining_periods"] == 0:
                 add("temporary_exhausted", appointment)
@@ -1418,6 +1424,8 @@ class AnalysisReader:
                     "employee_id": eid,
                     "address": role["address"],
                     "identity": identity(dict(role)),
+                    "level": level_of(role, config),
+                    "guidance": guidance.view(db, role, config),
                     "activity": activity,
                     "primary_reason": reasons[0],
                     "reasons": reasons,
@@ -1454,10 +1462,10 @@ class AnalysisReader:
         return rows
 
     @classmethod
-    def console_readiness(cls, db, now):
+    def console_readiness(cls, db, now, *, can_select=None):
         """Compact current readiness on the caller's connection, without reader pagination."""
         rows = []
-        for row in cls.readiness(db, now):
+        for row in cls.readiness(db, now, can_select=can_select):
             blockers = []
             pinned = {fact["incident_id"] for fact in row["evidence"] if "incident_id" in fact}
             incidents = set(pinned)

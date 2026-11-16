@@ -26,6 +26,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
 
+from . import guidance
 from .accounts import credentials_path, incident_resolution
 from .analysis import SECTIONS, AnalysisNotFound, AnalysisQueryError, AnalysisReader
 from .errors import FirmError
@@ -315,7 +316,9 @@ def build_console_app(
                 "host_epoch": host_epoch,
                 "console": {"state": "available"},
                 "needs_you": needs_you,
-                "readiness": AnalysisReader.console_readiness(db, runtime.store.clock()),
+                "readiness": AnalysisReader.console_readiness(
+                    db, runtime.store.clock(), can_select=runtime.levels.can_select()
+                ),
                 "infrastructure_state": host["infrastructure_state"] if host is not None else None,
                 "mac": runtime.mac.summary(),
                 "github": github,
@@ -1068,8 +1071,7 @@ def build_console_app(
             rows = {
                 row["employee_id"]: row
                 for row in db.execute(
-                    "SELECT employee_id,execution_profile,effort,hold_reason,recovery_episode,"
-                    "retry_at,created_at,session_id "
+                    "SELECT * "
                     f"FROM roles WHERE employee_id IN ({placeholders})",
                     ids,
                 )
@@ -1082,6 +1084,7 @@ def build_console_app(
                     ids,
                 )
             }
+            guidance_views = {eid: guidance.view(db, row, config) for eid, row in rows.items()}
             mandate_revisions = {
                 row["employee_id"]: row["revision"]
                 for row in db.execute(
@@ -1182,6 +1185,7 @@ def build_console_app(
                     "execution_profile": row["execution_profile"],
                     "execution": execution,
                     "level": level_view(row, levels.get(role["employee_id"]), config),
+                    "guidance": guidance_views[role["employee_id"]],
                     "created_at": row["created_at"],
                     "mandate_revision": mandate_revisions.get(role["employee_id"]),
                     "tokens": tokens.get(role["employee_id"], {}),
@@ -1269,9 +1273,11 @@ def build_console_app(
         with runtime.store.read() as db:
             config = runtime.accounts.config(db)
             record = runtime.levels.record(db, employee_id)
+            guidance_view = guidance.view(db, role, config)
         result["owner_facts"] = {
             "execution_profile": role["execution_profile"],
             "level": level_view(role, record, config),
+            "guidance": guidance_view,
             "hold_reason": role["hold_reason"],
             "attempt_count": role["attempt_count"],
             "retry_at": role["retry_at"],

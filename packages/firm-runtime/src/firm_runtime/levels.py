@@ -15,7 +15,7 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-from . import analysis_history
+from . import analysis_history, guidance
 from .errors import FirmError
 from .prompt_resources import render
 from .provider_contract import SUPPORTED_EFFORTS
@@ -32,6 +32,7 @@ EFFORTS = ("low", "medium", "high", "xhigh")
 FOUNDER_LEVEL = ("high", "high")
 FALLBACK_LEVEL = ("medium", "high")
 MAX_ATTEMPTS = 3
+MAX_CHOICE_REASON_CHARS = 1000
 RETRY_DELAY_SECONDS = 60.0
 MAX_STAFFING_PROMPT_BYTES = 256 * 1024
 # The hire's mandate is authoritative input and is passed through unchanged.
@@ -204,14 +205,16 @@ def _mandate_body(db, employee_id: str) -> str:
     return row["body"] if row else ""
 
 
-def build_prompt(db, store, role: dict, config: dict) -> str:
+def build_prompt(
+    db, store, role: dict, config: dict, *, level=True, guides=True
+) -> tuple[str, int]:
     """Render the complete hire mandate with bounded surrounding context as JSON."""
     # A promoted appointment keeps its row with kind 'durable'.
     terms = db.execute(
         "SELECT * FROM appointments WHERE employee_id=? AND kind='temporary'",
         (role["employee_id"],),
     ).fetchone()
-    manager = store.role(db, role["manager_id"])
+    manager = store.role(db, role["manager_id"]) if role["manager_id"] != OWNER else None
 
     def described(person: dict, *, excerpt: bool = False) -> dict:
         body = _mandate_body(db, person["employee_id"])
@@ -224,24 +227,29 @@ def build_prompt(db, store, role: dict, config: dict) -> str:
             item["mandate_truncated"] = len(body) > MAX_CONTEXT_CHARS
         return item
 
-    if manager["manager_id"] == OWNER:
-        above: dict[str, Any] | None = {"address": "owner", "note": "The firm's owner."}
-    else:
-        above = described(store.role(db, manager["manager_id"]))
-    report_filter = "manager_id=? AND employment!='retired' AND employee_id!=?"
-    report_parameters = (manager["employee_id"], role["employee_id"])
-    total_reports = db.execute(
-        f"SELECT COUNT(*) AS count FROM roles WHERE {report_filter}", report_parameters
-    ).fetchone()["count"]
-    reports = [
-        dict(r)
-        for r in db.execute(
-            "SELECT * FROM roles WHERE "
-            + report_filter
-            + " ORDER BY created_at, address, employee_id LIMIT ?",
-            (*report_parameters, MAX_REPORTS),
+    above = None
+    reports = []
+    total_reports = 0
+    if manager is not None:
+        above = (
+            {"address": "owner", "note": "The firm's owner."}
+            if manager["manager_id"] == OWNER
+            else described(store.role(db, manager["manager_id"]))
         )
-    ]
+        report_filter = "manager_id=? AND employment!='retired' AND employee_id!=?"
+        report_parameters = (manager["employee_id"], role["employee_id"])
+        total_reports = db.execute(
+            f"SELECT COUNT(*) AS count FROM roles WHERE {report_filter}", report_parameters
+        ).fetchone()["count"]
+        reports = [
+            dict(r)
+            for r in db.execute(
+                "SELECT * FROM roles WHERE "
+                + report_filter
+                + " ORDER BY created_at, address, employee_id LIMIT ?",
+                (*report_parameters, MAX_REPORTS),
+            )
+        ]
     hire = {
         "address": role["address"],
         "employment": "temporary" if terms else "durable",
@@ -251,18 +259,25 @@ def build_prompt(db, store, role: dict, config: dict) -> str:
     }
     if terms:
         hire["temporary_work_periods"] = terms["remaining_periods"] + terms["used_periods"]
-    return encoded(
-        {
-            "hire": hire,
-            "hiring_manager": described(manager),
-            "managers_manager": above,
-            "existing_reports_of_hiring_manager": [described(r, excerpt=True) for r in reports],
-            "existing_reports_total": total_reports,
-            "existing_reports_included": len(reports),
-            "existing_reports_omitted": total_reports - len(reports),
-            "levels_available": {"model_class": list(CLASSES), "effort": list(EFFORTS)},
-        }
-    )
+    value = {
+        "hire": hire,
+        "hiring_manager": described(manager)
+        if manager
+        else {"address": "owner", "note": "The firm's owner."},
+        "managers_manager": above,
+        "existing_reports_of_hiring_manager": [described(r, excerpt=True) for r in reports],
+        "existing_reports_total": total_reports,
+        "existing_reports_included": len(reports),
+        "existing_reports_omitted": total_reports - len(reports),
+    }
+    if level:
+        value["levels_available"] = {"model_class": list(CLASSES), "effort": list(EFFORTS)}
+    if guides:
+        value["guidance_catalog"] = guidance.chooser_entries()
+    revision = db.execute(
+        "SELECT MAX(revision) FROM mandates WHERE employee_id=?", (role["employee_id"],)
+    ).fetchone()[0]
+    return encoded(value), revision
 
 
 _OBJECT = re.compile(r"\{.*\}", re.DOTALL)
@@ -279,6 +294,10 @@ def parse_choice(text: str) -> tuple[str, str, str]:
         raise ValueError("chooser reply is not valid JSON") from exc
     if not isinstance(value, dict):
         raise ValueError("chooser reply must be a JSON object")
+    return parse_level(value)
+
+
+def parse_level(value: dict) -> tuple[str, str, str]:
     model_class, effort = value.get("model_class"), value.get("effort")
     if model_class not in CLASSES:
         raise ValueError("chooser reply has an unknown model_class")
@@ -287,7 +306,7 @@ def parse_choice(text: str) -> tuple[str, str, str]:
     reason = value.get("reason", "")
     if not isinstance(reason, str):
         raise ValueError("chooser reason must be a string")
-    return model_class, effort, reason.strip()[:1000]
+    return model_class, effort, _clip(reason.strip(), MAX_CHOICE_REASON_CHARS)
 
 
 def register(db, employee_id: str, now: float) -> None:
@@ -318,80 +337,205 @@ class Levels:
             (self.store.clock(), employee_id),
         )
 
+    def can_select(self) -> bool:
+        return self.chooser is not None or self.runtime.summary_service.provider is not None
+
+    @staticmethod
+    def _due(record, now, prefix=""):
+        return (
+            record is not None
+            and record[prefix + "state"] == "pending"
+            and (record[prefix + "retry_at"] is None or record[prefix + "retry_at"] <= now)
+        )
+
     def tick(self, *, background: bool = True) -> list[str]:
-        """Start every due assessment once; return the employee IDs started."""
-        started = []
-        with self.store.read() as db:
+        """Start each employee's due decisions together, preserving independent retries."""
+        with self.store.transaction() as db:
             if self.store.firm(db)["state"] != "running":
-                return started
-            now = self.store.clock()
-            due = [
-                r["employee_id"]
-                for r in db.execute(
-                    "SELECT h.employee_id FROM hire_levels h JOIN roles r USING(employee_id) "
-                    "WHERE h.state='pending' AND r.employment='active' "
-                    "AND (h.retry_at IS NULL OR h.retry_at<=?) ORDER BY h.updated_at",
-                    (now,),
+                return []
+            staffing = self.runtime.accounts.config(db).get("staffing") is not False
+            if not staffing or not self.can_select():
+                reason = "staffing disabled" if not staffing else "no isolated runner"
+                pending = db.execute(
+                    "SELECT employee_id,guidance_attempts FROM roles "
+                    "WHERE guidance_state='pending' AND employment='active'"
+                ).fetchall()
+                db.execute(
+                    "UPDATE roles SET guidance_state='defaulted',guidance_retry_at=NULL,"
+                    "guidance_reason=? WHERE guidance_state='pending' AND employment='active'",
+                    (reason,),
                 )
-            ]
+                for role in pending:
+                    analysis_history.record(
+                        db, self.store.clock(), "guidance.defaulted", role["employee_id"],
+                        reason=reason, attempts=role["guidance_attempts"],
+                    )
+            now = self.store.clock()
+            due = (
+                [
+                    r["employee_id"]
+                    for r in db.execute(
+                        "SELECT r.employee_id FROM roles r "
+                        "LEFT JOIN hire_levels h USING(employee_id) "
+                        "WHERE r.employment='active' AND ((h.state='pending' AND "
+                        "(h.retry_at IS NULL OR h.retry_at<=?)) OR (r.guidance_state='pending' AND "
+                        "(r.guidance_retry_at IS NULL OR r.guidance_retry_at<=?))) "
+                        "ORDER BY COALESCE(h.updated_at,r.created_at),r.address",
+                        (now, now),
+                    )
+                ]
+            )
         with self._lock:
             due = [e for e in due if e not in self._inflight]
             self._inflight.update(due)
         for employee_id in due:
-            started.append(employee_id)
             if background:
                 threading.Thread(
                     target=self._assess, args=(employee_id,), daemon=True, name="firm-level"
                 ).start()
             else:
                 self._assess(employee_id)
-        return started
+        return due
 
     def _assess(self, employee_id: str) -> None:
+        level_request = guide_request = None
         try:
-            with self.store.read() as db:
-                record = self.record(db, employee_id)
-                if record is None or record["state"] != "pending":
-                    return
-                role = self.store.role(db, employee_id)
-                config = self.runtime.accounts.config(db)
-                prompt = build_prompt(db, self.store, role, config)
             try:
-                model_class, effort, reason = self._choose(prompt)
-                self._apply(employee_id, model_class, effort, reason)
-            except SummaryInputTooLarge as exc:
-                self._failed(employee_id, str(exc), retry=False)
+                with self.store.read() as db:
+                    role = self.store.role(db, employee_id)
+                    config = self.runtime.accounts.config(db)
+                    if role["employment"] != "active":
+                        return
+                    now = self.store.clock()
+                    record = self.record(db, employee_id)
+                    level_request = record if self._due(record, now) else None
+                    # Staffing off stops guidance selection only; a pending level still fails
+                    # and defaults through the usual bounded retries rather than staying pending.
+                    staffing = config.get("staffing") is not False
+                    due_guides = staffing and self._due(role, now, "guidance_")
+                    guide_request = role if due_guides else None
+                    if level_request is None and guide_request is None:
+                        return
+                    prompt, _revision = build_prompt(
+                        db,
+                        self.store,
+                        role,
+                        config,
+                        level=level_request is not None,
+                        guides=guide_request is not None,
+                    )
+                value = self._choose(prompt)
             except (FirmError, ValueError) as exc:
-                self._failed(employee_id, str(exc))
+                self._fail_decisions(
+                    employee_id,
+                    level_request,
+                    guide_request,
+                    str(exc),
+                    retry=not isinstance(exc, SummaryInputTooLarge),
+                )
                 return
+            level_error = guide_error = None
+            if level_request is not None:
+                try:
+                    self._apply(employee_id, *parse_level(value), request=level_request)
+                except (FirmError, ValueError) as exc:
+                    level_error = str(exc)
+            if guide_request is not None:
+                try:
+                    selection = guidance.parse_selection(value, guidance.chooser_entries())
+                    reason = value.get("reason", "")
+                    if not isinstance(reason, str):
+                        raise ValueError("chooser reason must be a string")
+                    guidance.apply(
+                        self.runtime, employee_id, guide_request, selection,
+                        _clip(reason.strip(), MAX_CHOICE_REASON_CHARS),
+                    )
+                except (FirmError, ValueError) as exc:
+                    guide_error = str(exc)
+            self._fail_decisions(
+                employee_id,
+                level_request if level_error else None,
+                guide_request if guide_error else None,
+                level_error or guide_error or "",
+                guide_reason=guide_error,
+            )
         finally:
             with self._lock:
                 self._inflight.discard(employee_id)
 
-    def _choose(self, prompt: str) -> tuple[str, str, str]:
+    def _fail_decisions(
+        self, employee_id, level_request, guide_request, reason, *, retry=True, guide_reason=None
+    ):
+        # Defer notices so a call that defaults both decisions sends one message.
+        with self.store.transaction() as db:
+            level = (
+                self._failed(employee_id, reason, retry=retry, request=level_request, notice=False)
+                if level_request is not None
+                else None
+            )
+            guide = (
+                guidance.failed(
+                    self.runtime,
+                    employee_id,
+                    guide_request,
+                    guide_reason or reason,
+                    retry=retry,
+                    notice=False,
+                )
+                if guide_request is not None
+                else None
+            )
+            if guide:
+                guidance.default_notice(self.runtime, db, guide, level)
+            elif level:
+                role = self.store.role(db, employee_id)
+                self.runtime.messaging.notice(
+                    db,
+                    [OWNER],
+                    render("notices", "level_default", address=role["address"], **level),
+                    subject=render("notices", "level_default_subject"),
+                )
+
+    def _choose(self, prompt: str) -> dict:
         check_prompt_size(prompt, MAX_STAFFING_PROMPT_BYTES)
         if self.chooser is not None:
-            return parse_choice(encoded(self.chooser(prompt)))
-        from .provider_support import level_instructions
+            value = self.chooser(prompt)
+            text = encoded(value)
+        else:
+            from .provider_support import level_instructions
 
-        outcome = self.runtime.summary_service.run_isolated(
-            prompt,
-            kind="staffing",
-            instructions=level_instructions(),
-            reserve=self.runtime.accounts.reserve_staffing,
-            max_input_bytes=MAX_STAFFING_PROMPT_BYTES,
-        )
-        if outcome.get("reason") == "input_limit":
-            raise SummaryInputTooLarge("staffing prompt exceeds the isolated runner's input limit")
-        if outcome["status"] != "completed":
-            raise FirmError(outcome["reason"])
-        return parse_choice(outcome["text"])
+            outcome = self.runtime.summary_service.run_isolated(
+                prompt,
+                kind="staffing",
+                instructions=level_instructions(),
+                reserve=self.runtime.accounts.reserve_staffing,
+                max_input_bytes=MAX_STAFFING_PROMPT_BYTES,
+            )
+            if outcome.get("reason") == "input_limit":
+                raise SummaryInputTooLarge(
+                    "staffing prompt exceeds the isolated runner's input limit"
+                )
+            if outcome["status"] != "completed":
+                raise FirmError(outcome["reason"])
+            text = outcome["text"]
+        match = _OBJECT.search(text)
+        if match is None:
+            raise ValueError("chooser reply contains no JSON object")
+        value = json.loads(match.group(0))
+        if not isinstance(value, dict):
+            raise ValueError("chooser reply must be a JSON object")
+        return value
 
-    def _apply(self, employee_id, model_class, effort, reason) -> None:
+    def _apply(self, employee_id, model_class, effort, reason, *, request) -> None:
         now = self.store.clock()
         with self.store.transaction() as db:
             record = self.record(db, employee_id)
-            if record is None or record["state"] != "pending":
+            if (
+                record is None
+                or record["state"] != "pending"
+                or self.store.role(db, employee_id)["employment"] != "active"
+                or record["attempts"] != request["attempts"]
+            ):
                 return
             # The owner may have edited the configuration while the chooser ran.
             config = self.runtime.accounts.config(db)
@@ -417,15 +561,22 @@ class Levels:
                 model_class=model_class,
                 effort=effort,
                 profile=profile,
-                reason=reason,
+                reason=_clip(reason, 500),
                 attempts=record["attempts"] + 1,
             )
 
-    def _failed(self, employee_id: str, reason: str, *, retry: bool = True) -> None:
+    def _failed(
+        self, employee_id: str, reason: str, *, request, retry=True, notice=True
+    ) -> dict | None:
         now = self.store.clock()
         with self.store.transaction() as db:
             record = self.record(db, employee_id)
-            if record is None or record["state"] != "pending":
+            if (
+                record is None
+                or record["state"] != "pending"
+                or self.store.role(db, employee_id)["employment"] != "active"
+                or record["attempts"] != request["attempts"]
+            ):
                 return
             attempts = record["attempts"] + 1
             if retry and attempts < MAX_ATTEMPTS:
@@ -450,20 +601,20 @@ class Levels:
                 model_class=model_class,
                 effort=effort,
                 profile=role["execution_profile"],
-                reason=reason,
+                reason=_clip(reason, 500),
                 attempts=attempts,
             )
-            self.runtime.messaging.notice(
-                db,
-                [OWNER],
-                render(
-                    "notices",
-                    "level_default",
-                    attempts=attempts,
-                    address=role["address"],
-                    reason=reason,
-                    model_class=model_class,
-                    effort=effort,
-                ),
-                subject=render("notices", "level_default_subject"),
-            )
+            result = {
+                "model_class": model_class,
+                "effort": effort,
+                "reason": reason,
+                "attempts": attempts,
+            }
+            if notice:
+                self.runtime.messaging.notice(
+                    db,
+                    [OWNER],
+                    render("notices", "level_default", address=role["address"], **result),
+                    subject=render("notices", "level_default_subject"),
+                )
+            return result

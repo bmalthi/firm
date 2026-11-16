@@ -94,6 +94,25 @@ def test_store_refuses_incompatible_firm_before_any_database_write(tmp_path, mon
     assert not database.with_name(database.name + "-shm").exists()
 
 
+def test_store_refuses_pre_guidance_generation_before_touching_existing_state(tmp_path):
+    record = initialize_firm(tmp_path)
+    record["compatibility_generation"] = 1
+    (tmp_path / FIRM_RECORD).write_text(json.dumps(record), encoding="utf-8")
+    database = tmp_path / "durable" / "firm.sqlite3"
+    database.parent.mkdir()
+    with sqlite3.connect(database) as db:
+        db.execute("CREATE TABLE roles (employee_id TEXT PRIMARY KEY)")
+        db.execute("INSERT INTO roles VALUES ('existing-role')")
+    before = database.read_bytes()
+
+    with pytest.raises(ValueError, match="requires generation"):
+        Store(database)
+
+    assert database.read_bytes() == before
+    assert not database.with_name(database.name + "-wal").exists()
+    assert not database.with_name(database.name + "-shm").exists()
+
+
 def test_store_preserves_existing_incompatible_database_and_wal(tmp_path):
     initialize_firm(tmp_path)
     database = tmp_path / "durable" / "firm.sqlite3"

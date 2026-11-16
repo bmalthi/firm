@@ -248,8 +248,17 @@ login and file-backed credentials. Claude uses `setup-token`; Firm captures the
 token without printing it and saves it in its owner-only credential store. If setup
 is interrupted, rerun `firm start` and choose the incomplete firm to resume.
 
-The first Codex firm defaults to `gpt-6-luna`; Claude defaults to Sonnet. These are
-starting choices, not a promise that every account or workspace exposes every model.
+The first Codex founder defaults to `gpt-6-luna`; Claude defaults to Sonnet. Generated
+firms enable automatic staffing: hires can use the provider's low, medium or high model
+tier rather than the founder's model. The founder is guided to delegate distinct areas
+of work. Guidance selection also consumes subscription quota at initialization, hire
+and mandate revision, with up to three attempts per assessment. See
+[hiring levels](runtime.md#hiring-levels) for the tier models and efforts. Set
+`staffing = false` in `firm.toml` before initialization to keep roles on the founder's
+profile and disable automatic function-guide selection; org-chart guidance still applies.
+For single-model accounts, also pin summary and task models as described in the
+[single-model setup](#path-a-for-coding-agents-recommended--non-interactive-cli-setup).
+These are starting choices, not a promise that every account or workspace exposes every model.
 If a model is unavailable, edit `firm.toml` and apply it with
 `firm configure DIRECTORY --config DIRECTORY/firm.toml`. Advanced credential and
 model routing options are in [runtime operations](runtime.md#provider-credentials)

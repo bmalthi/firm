@@ -89,6 +89,9 @@ def test_mcp_stdio_authentication_and_real_tool_call(tmp_path, monkeypatch):
             attachment_schema = by_name[name].inputSchema["properties"]["attachments"]
             variants = attachment_schema.get("anyOf", [attachment_schema])
             assert any(variant.get("maxItems") == 10 for variant in variants)
+        subject_schema = by_name["send"].inputSchema["properties"]["subject"]
+        variants = subject_schema.get("anyOf", [subject_schema])
+        assert any(variant.get("maxLength") == 80 for variant in variants)
         assert by_name["find_roles"].annotations.readOnlyHint is True
         assert by_name["org_tree"].annotations.readOnlyHint is True
         params = StdioServerParameters(

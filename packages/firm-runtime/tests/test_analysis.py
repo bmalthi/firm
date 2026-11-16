@@ -15,6 +15,7 @@ from firm_runtime.analysis import (
     disk_state,
 )
 from firm_runtime.analysis_history import RESOURCE_INTERVAL
+from firm_runtime.compatibility import initialize_firm
 from firm_runtime.console import build_console_app
 from firm_runtime.errors import FirmError
 from firm_runtime.provider_contract import ProviderUsage
@@ -26,7 +27,8 @@ from firm_runtime.summaries import ContextSnapshot, SummaryOutput
 @pytest.fixture
 def system(tmp_path):
     now = [1000.0]
-    runtime = Runtime(Store.scratch(tmp_path / "durable" / "firm.sqlite3", clock=lambda: now[0]))
+    initialize_firm(tmp_path)
+    runtime = Runtime(Store(tmp_path / "durable" / "firm.sqlite3", clock=lambda: now[0]))
     runtime.lifecycle.initialize(
         "analysis-test",
         "Build things",
@@ -262,7 +264,7 @@ def test_old_schema_is_not_upgraded_or_silently_treated_as_unknown(system, table
         )
         db.execute(f"ALTER TABLE {table} DROP COLUMN resolved_model")
     before = dump(runtime)
-    Runtime(Store.scratch(runtime.store.path))
+    Runtime(Store(runtime.store.path))
     assert dump(runtime) == before
     with pytest.raises(FirmError, match=r"no such column: (t\.)?resolved_model"):
         read(reader, "usage")
@@ -1739,3 +1741,93 @@ def test_disk_alert_survives_hours_in_band_and_restart_then_recovers_and_reenter
         assert analysis_history._linux_disk_alerted(db)
         index = db.execute("PRAGMA index_info(resource_samples_by_machine)").fetchall()
         assert [column["name"] for column in index] == ["machine", "observed_at"]
+
+
+def test_readiness_guidance_fields_and_scope_source(system):
+    runtime, _, reader = system
+    founder = read(reader, "readiness")["rows"][0]
+    assert founder["guidance"] == {"state": None, "scope": "firm-leader", "functions": [],
+                                   "source": "org_chart", "reason": None}
+    runtime.owner.set_guidance(OWNER, "founder", "specialist-adviser", ["legal"], "set")
+    assert read(reader, "readiness")["rows"][0]["guidance"]["source"] == "owner"
+    with runtime.store.transaction() as db:
+        config = runtime.accounts.config(db)
+        config["staffing"] = {"classes": {}}
+        db.execute("UPDATE firm SET config_json=?", (json.dumps(config),))
+        db.execute("UPDATE roles SET guidance_state='chosen',manager_id='other'")
+    assert read(reader, "readiness")["rows"][0]["guidance"]["source"] == "chooser"
+
+
+@pytest.mark.parametrize(
+    "born,staffing,selector,expected",
+    [
+        (False, True, True, True),
+        (True, True, True, False),
+        (False, False, True, False),
+        (False, True, False, False),
+    ],
+)
+@pytest.mark.parametrize("employee", ["founder", "hire"])
+def test_readiness_guidance_pending_matches_birth_wait(
+    system, born, staffing, selector, expected, employee
+):
+    from firm_runtime import guidance
+
+    runtime, now, _ = system
+    eid = (
+        "founder"
+        if employee == "founder"
+        else runtime.lifecycle.hire("founder", "worker", "Work", request_id="hire")["employee_id"]
+    )
+    with runtime.store.transaction() as db:
+        config = runtime.accounts.config(db)
+        if staffing:
+            config["staffing"] = {"classes": {}}
+        db.execute("UPDATE firm SET config_json=?", (json.dumps(config),))
+        guidance.register(db, eid)
+        db.execute("UPDATE roles SET birth_delivered=? WHERE employee_id=?", (born, eid))
+        if employee == "hire":
+            # The level decision has succeeded; only guidance still blocks birth.
+            db.execute(
+                "INSERT INTO hire_levels(employee_id,state,updated_at) VALUES(?,'chosen',?)",
+                (eid, now[0]),
+            )
+    with runtime.store.read() as db:
+        row = AnalysisReader.readiness(db, now[0], eid, can_select=selector)[0]
+    assert ("guidance_pending" in row["reasons"]) == expected
+    assert "level_pending" not in row["reasons"]
+
+
+def test_real_guidance_operations_record_readable_timeline_events(system):
+    from firm_runtime import guidance
+
+    runtime, _, reader = system
+    runtime.owner.set_guidance(OWNER, "founder", None, ["legal"], "set")
+    runtime.owner.automatic_guidance(OWNER, "founder", "automatic")
+    with runtime.store.transaction() as db:
+        guidance.register(db, "founder")
+        request = runtime.store.role(db, "founder")
+    guidance.apply(
+        runtime, "founder", request, {"scope": None, "functions": ["legal"]}, "Legal mandate"
+    )
+    with runtime.store.transaction() as db:
+        guidance.register(db, "founder")
+        request = runtime.store.role(db, "founder")
+    guidance.failed(runtime, "founder", request, "Cannot select", retry=False)
+    with runtime.store.transaction() as db:
+        db.execute("UPDATE roles SET functional_guidance='[\"removed\"]'")
+    runtime.start()
+    rows = [
+        r for r in read(reader, "timeline")["rows"] if r.get("kind", "").startswith("guidance.")
+    ]
+    assert {r["kind"] for r in rows} == {
+        "guidance.chosen",
+        "guidance.defaulted",
+        "guidance.owner_set",
+        "guidance.automatic",
+        "guidance.removed",
+    }
+    assert all(r["employee_id"] == "founder" for r in rows)
+    payloads = {r["kind"]: r for r in rows}
+    assert "Legal mandate" in json.dumps(payloads["guidance.chosen"])
+    assert "removed" in json.dumps(payloads["guidance.removed"])

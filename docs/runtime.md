@@ -92,6 +92,36 @@ its account's slot limit now says; only a hold stops it. Lowering a limit theref
 conversations elsewhere while the ones already there finish. Only context-policy keys are
 re-applied to a retained conversation, and only when provider, model and effort still match.
 
+### Role guidance
+
+Standing instructions contain workplace physics, good-worker guidance, selected scope and function guides,
+and limits last. The founder gets `firm-leader`; other roles with non-retired direct reports get
+`team-leader`. With staffing enabled, one isolated assessment chooses any pending level and guidance
+independently, using catalog descriptions rather than guide bodies. Functions and the two non-hierarchical
+scopes are selected at initialization, hire and mandate revision. A first work period waits while guidance
+is pending when a selector is available; three failures default to the previous selection and notify the
+owner. Later work periods reuse guidance without waiting for reassessment.
+If staffing is disabled or no isolated runner is available, pending guidance defaults without a chooser
+attempt or owner notice; the reason appears in guidance state and history. Reassessment then requires a
+mandate revision or `firm guidance --automatic` once a selector is available.
+
+With `staffing = false`, no chooser runs. Only org-chart scopes apply unless the owner sets guidance.
+The owner can set exactly a selection, including no guides, or restore automatic behavior:
+
+```sh
+firm guidance DIR EMPLOYEE_ID --set --scope specialist-adviser --function legal --request-id R
+firm guidance DIR EMPLOYEE_ID --set --request-id R2
+firm guidance DIR EMPLOYEE_ID --automatic --request-id R3
+```
+
+Repeat `--function` for multiple functions. An owner-set scope overrides the org chart, and persists across
+mandate revisions until `--automatic`, which clears the stored scope and functions. Only the org-chart scope
+applies until a new automatic assessment succeeds; a failed assessment cannot restore the cleared override.
+The console and `firm analyze DIR --section readiness --json` show
+state, effective scope and functions, scope source and reason. `guidance_pending` identifies a first-period
+wait. Changes do not reset the session or change its model; retained native sessions receive one short
+change notice. Prompt resource edits take effect only after restarting the host.
+
 ### Hiring levels
 
 `[staffing]` configures the [hiring-level chooser](../design/runtime.md#hiring-levels).
@@ -959,7 +989,11 @@ The same read-only reader serves authenticated GET routes at
 `/api/analysis/conversations/{conversation_id}` and `/api/analysis/roles/{employee_id}/readiness`.
 It uses
 SQLite `mode=ro` and `query_only`, never initializes schema, and excludes credentials and
-invocation contexts. A missing database is an error.
+invocation contexts. A missing database is an error. The CLI requires a valid release record with the current
+compatibility generation for both live firms and exports, and refuses incompatible state before opening
+the analysis reader. Use the original compatible runtime to analyze an older firm or export; read-only
+access does not imply support for older schemas. Export integrity verification remains independent of
+the current schema generation.
 
 `firm analyze` is the diagnostic surface for "what has the firm done" and "what is waiting"
 questions, including for an assistant answering them on your behalf. Querying

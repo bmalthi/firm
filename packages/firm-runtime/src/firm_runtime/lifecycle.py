@@ -13,7 +13,7 @@ from typing import Any
 
 from firm_sandbox import Layout
 
-from . import analysis_history
+from . import analysis_history, guidance
 from .appointments import Appointments, validate_periods
 from .discovery import identity
 from .errors import ConfigurationError, FirmError
@@ -113,6 +113,8 @@ class Lifecycle:
                 "VALUES(?,0,?,?,?,?)",
                 (FOUNDER_ID, OWNER, mandate, "Initial owner mandate", now),
             )
+            if normalized_config.get("staffing"):
+                guidance.register(db, FOUNDER_ID)
             if app is not None:
                 from . import github
 
@@ -212,6 +214,8 @@ class Lifecycle:
                     "VALUES(?,0,?,?,?,?)",
                     (employee_id, actor_id, mandate, "Initial delegated mandate", now),
                 )
+                if config.get("staffing"):
+                    guidance.register(db, employee_id)
                 if self.provision_role is not None:
                     self.provision_role(employee_id)
                 self.store.request_execution(
@@ -291,6 +295,8 @@ class Lifecycle:
                     "VALUES(?,?,?,?,?,?)",
                     (employee_id, revision, actor_id, mandate, reason, self.store.clock()),
                 )
+                if json.loads(self.store.firm(db)["config_json"]).get("staffing"):
+                    guidance.request_reassessment(db, employee_id, revision)
                 role = self.store.role(db, employee_id)
                 result = {
                     **self._role_view(db, role, include_public_text=False),

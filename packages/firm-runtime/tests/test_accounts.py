@@ -850,3 +850,21 @@ def test_transient_setup_failures_use_bounded_existing_budget_and_notice(system)
     assert role(runtime)["hold_reason"] == "attempts_exhausted"
     runtime.retry(OWNER, "founder", episode, "retry")
     assert runtime.admit() is not None
+
+
+def test_guidance_change_keeps_native_session_binding_and_execution_profile(system):
+    runtime, _ = system
+    first = runtime.admit()
+    runtime.mark_started(first.activation_id)
+    original = binding(runtime, first)
+    with runtime.store.read() as db:
+        profile = runtime.store.role(db, "founder")["execution_profile"]
+    runtime.finish(first.activation_id)
+    runtime.owner.set_guidance(OWNER, "founder", "specialist-adviser", ["legal"], "guides")
+    runtime.messaging.send(OWNER, ["founder"], "Continue", request_id="wake")
+    next_run = runtime.admit()
+    assert next_run.context["guidance_changed"] is True
+    assert next_run.session_id == first.session_id
+    assert binding(runtime, next_run) == original
+    with runtime.store.read() as db:
+        assert runtime.store.role(db, "founder")["execution_profile"] == profile

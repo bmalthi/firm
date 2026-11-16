@@ -86,7 +86,8 @@ EVENT_KINDS = frozenset(
     "readiness.observed mail.presented level.chosen level.defaulted github.token_minted "
     "github.token_refused github.repository_created github.access_granted "
     "github.request_refused mac.disk request.opened request.granted request.denied "
-    "request.withdrawn".split()
+    "request.withdrawn guidance.chosen guidance.defaulted guidance.owner_set "
+    "guidance.automatic guidance.removed".split()
 )
 EVENT_FIELDS = frozenset(
     "session_id provider model effort account_id profile fresh before after employment "
@@ -97,7 +98,7 @@ EVENT_FIELDS = frozenset(
     "expires_at error repository source messages senders lease_id station phase free_bytes "
     "total_bytes reclaimed_bytes reclaim completed timed_out refused categories category "
     "count bytes skipped skipped_bytes skipped_reasons simulators step returncode said "
-    "request_id resource purpose".split()
+    "request_id resource purpose scope functions removed state revision".split()
 )
 
 

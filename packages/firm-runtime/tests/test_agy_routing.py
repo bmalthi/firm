@@ -13,7 +13,7 @@ from firm_runtime.errors import FirmError
 from firm_runtime.providers import Providers, provider_adapter, record_task_output
 from firm_runtime.quota_observer import QuotaObserver
 from firm_runtime.runtime import Runtime
-from firm_runtime.store import Store
+from firm_runtime.store import OWNER, Store
 from firm_runtime.summaries import SummaryLaunch
 from firm_runtime.telemetry import context_policy
 
@@ -121,6 +121,7 @@ def test_xhigh_chooser_pick_routes_to_owner_selected_native_variant(tmp_path):
     from firm_runtime.agy_provider import native_model_id
 
     runtime = runtime_for(tmp_path, staffing=True)
+    runtime.owner.set_guidance(OWNER, "founder", "firm-leader", [], "founder-guidance")
     employee = runtime.lifecycle.hire("founder", "reviewer", "Synthetic review.", request_id="h")[
         "employee_id"
     ]
@@ -128,6 +129,8 @@ def test_xhigh_chooser_pick_routes_to_owner_selected_native_variant(tmp_path):
         "model_class": "low",
         "effort": "xhigh",
         "reason": "Synthetic choice.",
+        "scope_guidance": None,
+        "functional_guidance": [],
     }
     runtime.start()
     assert runtime.levels.tick(background=False) == [employee]

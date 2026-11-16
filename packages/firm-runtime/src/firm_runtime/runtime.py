@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from . import analysis_history
+from . import analysis_history, guidance
 from .accounts import Accounts
 from .discovery import Discovery, identity
 from .errors import FirmError
@@ -122,6 +122,7 @@ class Runtime:
             ).fetchone()
             if host is not None and host["infrastructure_state"] != "running":
                 raise FirmError("firm VMs are not ready")
+            guidance.reconcile(db, self)
             db.execute("UPDATE firm SET state='running'")
             analysis_history.firm_changed(db, self.store.clock(), firm["state"])
             return self.status()
@@ -274,6 +275,8 @@ class Runtime:
         """Runnable employees in admission order."""
         if now is None:
             now = self.store.clock()
+        wait_guidance = (self.accounts.config(db).get("staffing") is not False
+                         and self.levels.can_select())
         return db.execute(
             "WITH due AS (SELECT *,MAX(priority) OVER (PARTITION BY employee_id) "
             "AS top_priority FROM scheduling_opportunities WHERE ready_at<=?) "
@@ -283,10 +286,11 @@ class Runtime:
             "AND (r.retry_at IS NULL OR r.retry_at<=?) AND w.priority=w.top_priority "
             "AND NOT EXISTS(SELECT 1 FROM hire_levels h WHERE h.employee_id=r.employee_id "
             "AND h.state='pending') "
+            "AND NOT (? AND r.birth_delivered=0 AND r.guidance_state IS 'pending') "
             "AND NOT EXISTS(SELECT 1 FROM activations a WHERE a.employee_id=r.employee_id "
             "AND a.state IN ('admitted','running')) GROUP BY r.employee_id "
             "ORDER BY priority DESC,oldest,r.employee_id",
-            (now, now),
+            (now, now, wait_guidance),
         ).fetchall()
 
     def admit(self) -> Invocation | None:
@@ -329,7 +333,14 @@ class Runtime:
                 public["mandate"]["author_address"] = author["address"]
             fresh = role["session_id"] is None
             manager = self.store.resolve(db, role["manager_id"])
+            selection = guidance.encoded(
+                guidance.effective(db, role, json.loads(firm["config_json"]))
+            )
             context = {
+                "guidance": selection,
+                "guidance_changed": not fresh and guidance.encoded(
+                    json.loads(role["session_guidance"]) if role["session_guidance"] else None
+                ) != selection,
                 "employee_id": role["employee_id"],
                 "address": role["address"],
                 "identity": identity(role),
@@ -491,8 +502,8 @@ class Runtime:
             )
             db.execute(
                 "UPDATE roles SET birth_delivered=1,handoff_notes=NULL,recovery_json=NULL,"
-                "session_mandate_revision=? WHERE employee_id=?",
-                (context["mandate_revision"], row["employee_id"]),
+                "session_mandate_revision=?,session_guidance=? WHERE employee_id=?",
+                (context["mandate_revision"], context["guidance"], row["employee_id"]),
             )
 
     def _activation(self, db, activation_id: str) -> dict:

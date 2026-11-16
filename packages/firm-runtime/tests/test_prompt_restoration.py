@@ -37,7 +37,14 @@ def marked_prompts(monkeypatch):
     monkeypatch.setattr("firm_runtime.provider_support.prompt", marked)
     prompt_resources._group.cache_clear()
     try:
-        yield
+        yield (
+            "<workplace.json:identity>",
+            "<workplace.json:mandate>",
+            "<workplace.json:workplace>",
+            "<standing-physics.md>",
+            "<standing-good-worker.md>",
+            "<standing-limits.md>",
+        )
     finally:
         prompt_resources._group.cache_clear()
 
@@ -84,7 +91,10 @@ def test_standing_places_exact_role_first_without_internal_metadata(marked_promp
     assert text.startswith("<workplace.json:identity>")
     assert "Delivery Lead (founder/delivery)" in text
     assert text.count(body) == 1
-    assert text.index(body) < text.index("<workplace.json:workplace>") < text.index("<standing.md>")
+    positions = [text.index(marker) for marker in marked_prompts]
+    assert positions == sorted(positions)
+    assert all(text.count(marker) == 1 for marker in marked_prompts)
+    assert text.index(body) < text.index("<workplace.json:workplace>")
     for forbidden in ("do-not-project-this-id", "claude-heavy", "activation_id"):
         assert forbidden not in text
     assert "<workplace.json:access> /drive" in text
@@ -92,7 +102,8 @@ def test_standing_places_exact_role_first_without_internal_metadata(marked_promp
 
 @pytest.mark.parametrize("manager", [OWNER, "founder"])
 @pytest.mark.parametrize("state", ["birth", "resume", "fresh", "handoff", "recovery"])
-def test_founder_guidance_is_only_in_founder_birth(manager, state, marked_prompts):
+@pytest.mark.parametrize("temporary", [False, True])
+def test_founder_guidance_is_only_in_founder_birth(manager, state, temporary, marked_prompts):
     data = {
         "address": "founder" if manager == OWNER else "founder/design",
         "manager_address": manager,
@@ -107,9 +118,13 @@ def test_founder_guidance_is_only_in_founder_birth(manager, state, marked_prompt
         data["handoff_notes"] = "Saved progress"
     if state == "recovery":
         data["recovery"] = {"cause": "owner_stop", "context_retained": False}
+    if temporary:
+        data["temporary_appointment"] = {"remaining_periods": 2}
     instructions = standing(data)
     activation = render(**data)
-    assert instructions.count("<standing.md>") == 1
+    positions = [instructions.index(marker) for marker in marked_prompts]
+    assert positions == sorted(positions)
+    assert all(instructions.count(marker) == 1 for marker in marked_prompts)
     assert "<founder_birth.md>" not in instructions
     assert "<birth.md>" not in instructions
     assert "ASSIGNED WORK" in instructions
@@ -324,3 +339,81 @@ def test_drain_delivers_complete_handoff_once_even_without_measured_context(tmp_
         for key in ("context_pressure", "operations_control")
     )
     assert len(text.encode()) <= 16 * 1024
+
+
+@pytest.mark.parametrize("manager", [OWNER, "founder"])
+@pytest.mark.parametrize("state", ["birth", "resume", "fresh", "handoff", "recovery"])
+@pytest.mark.parametrize("temporary", [False, True])
+@pytest.mark.parametrize(
+    "selection",
+    [
+        {"scope": None, "functions": []},
+        {"scope": "firm-leader", "functions": []},
+        {"scope": "team-leader", "functions": ["software-engineering"]},
+        {"scope": "specialist-adviser", "functions": ["sales", "legal"]},
+    ],
+)
+def test_complete_guidance_assembly_order_once_in_every_memory_state(
+    manager, state, temporary, selection, marked_prompts, monkeypatch
+):
+    monkeypatch.setattr("firm_runtime.guidance.prompt", prompt_resources.prompt)
+    data = {
+        "address": "founder" if manager == OWNER else "founder/worker",
+        "manager_address": manager,
+        "mandate": mandate("WORK", manager),
+        "workspace_references": {
+            "workspace": "/work",
+            "private": "/home/private",
+            "scratch": "/scratch",
+        },
+        "birth": state == "birth",
+        "fresh_session": state in {"birth", "fresh", "handoff"},
+        "guidance": encoded(selection),
+    }
+    if temporary:
+        data["temporary_appointment"] = {"remaining_periods": 1}
+    if state == "handoff":
+        data["handoff_notes"] = "Progress"
+    if state == "recovery":
+        data["recovery"] = {"context_retained": True}
+    text = standing(data)
+    ids = ([selection["scope"]] if selection["scope"] else []) + sorted(
+        selection["functions"], key=lambda i: {"legal": 0, "sales": 1, "software-engineering": 2}[i]
+    )
+    expected = ["<standing-physics.md>", "<standing-good-worker.md>"]
+    if ids:
+        expected += ["<guidance-introduction.md>", *[f"<guidance/{i}.md>" for i in ids]]
+    else:
+        assert "<guidance-introduction.md>" not in text
+    expected += ["<standing-limits.md>"]
+    assert [text.index(marker) for marker in expected] == sorted(
+        text.index(marker) for marker in expected
+    )
+    assert all(text.count(marker) == 1 for marker in expected)
+    assert text.endswith("<standing-limits.md>\n")
+
+
+@pytest.mark.parametrize(
+    "state,retained",
+    [
+        ("resume", True),
+        ("retained-recovery", True),
+        ("birth", False),
+        ("handoff", False),
+        ("fresh", False),
+        ("lost-recovery", False),
+    ],
+)
+@pytest.mark.parametrize("changed", [False, True])
+def test_guidance_change_notice_tracks_retained_native_context(
+    state, retained, changed, marked_prompts
+):
+    data = {"fresh_session": not retained, "guidance_changed": changed}
+    if state == "birth":
+        data["birth"] = True
+    if state == "handoff":
+        data["handoff_notes"] = "Progress"
+    if "recovery" in state:
+        data["recovery"] = {"context_retained": retained}
+    text = render(**data)
+    assert ("<wake.json:guidance_changed>" in text) == (retained and changed)

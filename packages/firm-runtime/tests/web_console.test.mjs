@@ -149,7 +149,7 @@ test("status ladder: only a decision which blocks a role makes Waiting on you", 
 });
 
 test("status ladder: indefinite nondecision owner/manager holds precede timed waits", () => {
-  for (const [reason, phrase] of Object.entries({refusal: "Held · work refused", attempts_exhausted: "Held · retry attempts exhausted", temporary_exhausted: "Held · temporary work periods exhausted", owner_paused: "Paused by you", level_pending: "Waiting for role routing", profile_config_hold: "Paused · profile configuration needs repair"})) {
+  for (const [reason, phrase] of Object.entries({refusal: "Held · work refused", attempts_exhausted: "Held · retry attempts exhausted", temporary_exhausted: "Held · temporary work periods exhausted", owner_paused: "Paused by you", level_pending: "Waiting for role routing", guidance_pending: "Waiting for role guidance", profile_config_hold: "Paused · profile configuration needs repair"})) {
     const value = sample([row(reason, {actionable_by: "owner_or_manager"}), row("scheduled_wake", {employee_id: "e2", next_check_at: 5000})]);
     assert.equal(statusHeadline(value), "Held");
     assert.ok(statusSentence(value).includes(`Founder: ${phrase}.`));
@@ -258,7 +258,7 @@ test("every other readiness reason has a phrase; unrecognized reasons remain vis
     reminder_due: "Reminder due · starting soon", owner_paused: "Paused by you", idle_no_wake: "Idle · nothing scheduled",
     pending_mail_no_wake: "Mail waiting, nothing scheduled", refusal: "Held · work refused",
     attempts_exhausted: "Held · retry attempts exhausted", temporary_exhausted: "Held · temporary work periods exhausted",
-    level_pending: "Waiting for role routing", exit_pending: "Finishing current work", retired: "Retired",
+    level_pending: "Waiting for role routing", guidance_pending: "Waiting for role guidance", exit_pending: "Finishing current work", retired: "Retired",
     firm_stopped: "Firm stopped", firm_draining: "Stopping after current work", firm_stopping: "Force stopping",
     infrastructure_not_ready: "Waiting for the VM", account_config_hold: "Paused · account configuration needs repair",
     profile_config_hold: "Paused · profile configuration needs repair", account_quota_hold: "Paused · account allowance exhausted",

@@ -219,6 +219,9 @@ class SandboxDispatcher:
             )
 
     def start(self):
+        from .guidance import catalog
+
+        catalog()
         self._require_open()
         if self._launches or (self._summary_runner and self._summary_runner.pending_launches()):
             raise FirmError("finish pending launch calls before restarting the firm VMs")

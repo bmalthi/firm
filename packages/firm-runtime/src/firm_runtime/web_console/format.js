@@ -128,7 +128,8 @@ function indefiniteHold(row, snapshot) {
   // A reminder does not lift an indefinite role hold. next_check_at is not its end.
   const ownerHold = reasons.find((reason) => ownerHolds.has(reason));
   if (ownerHold) return ownerHold;
-  if (reasons.includes("level_pending") && !(row.blockers || []).some((blocker) => validTime(blocker.retry_at))) return "level_pending";
+  const selection = reasons.find((reason) => ["level_pending", "guidance_pending"].includes(reason));
+  if (selection && !(row.blockers || []).some((blocker) => validTime(blocker.retry_at))) return selection;
   const incidents = (snapshot?.accounts?.incidents || []).filter((item) =>
     (row.blockers || []).some((blocker) => blocker.incident_id === item.incident_id && !blocker.alternative_account_usable));
   // A timed outage cannot explain away a separately reported configuration hold.
@@ -192,6 +193,7 @@ const phrases = {
   attempts_exhausted: "Held · retry attempts exhausted",
   temporary_exhausted: "Held · temporary work periods exhausted",
   level_pending: "Waiting for role routing",
+  guidance_pending: "Waiting for role guidance",
   exit_pending: "Finishing current work",
   retired: "Retired",
   firm_stopped: "Firm stopped",

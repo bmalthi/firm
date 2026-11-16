@@ -6,6 +6,7 @@ import sqlite3
 import sys
 
 import pytest
+from firm_sandbox.compatibility import COMPATIBILITY_GENERATION
 
 from firm_runtime import export as exports
 from firm_runtime import fleet
@@ -121,7 +122,7 @@ def test_export_writes_database_host_records_drive_and_a_verifiable_manifest(
     assert (result["files"], manifest["homes"], manifest["refused"]) == (8, False, [])
     assert (result["created_with_release"], result["compatibility_generation"]) == (
         "0.1.0",
-        1,
+        COMPATIBILITY_GENERATION,
     )
     assert result["totals"]["drive"]["files"] == 2 and "entries" not in result
     db = sqlite3.connect(export / "firm.sqlite3")
