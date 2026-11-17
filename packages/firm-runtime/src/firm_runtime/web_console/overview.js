@@ -1,4 +1,4 @@
-import {age, time, incidentTitle, vmState, runtimeState, needsYou, readinessPhrase, statusHeadline, statusSentence} from "./format.js";
+import {age, time, authLabel, authRecovery, incidentTitle, vmState, runtimeState, needsYou, readinessPhrase, statusHeadline, statusSentence, mailTitle, mailText} from "./format.js";
 import {resultCard} from "./results.js";
 
 export const founderTemplate = "Continue the research programme from your saved notes.";
@@ -88,7 +88,6 @@ export function createOverview({$, api, post, element, button, mutationButton, r
   }
 
   function incidentCard(incident) {
-    const account = incident.scope === "account" && snapshot.accounts.accounts.find((item) => item.account_id === incident.dependency);
     const card = element("article", "incident-card decision-card");
     card.dataset.incidentId = incident.incident_id;
     card.append(element("p", "eyebrow", "Needs your decision"), element("h3", "", incidentTitle(incident)));
@@ -97,23 +96,27 @@ export function createOverview({$, api, post, element, button, mutationButton, r
     opened.append(stamp); card.append(opened);
     const blocked = (incidents.open.find((item) => item.incident_id === incident.incident_id)?.blocked_roles || []).map((role) => role.identity || role.address);
     card.append(element("p", "", blocked.length ? `Waiting on it: ${blocked.join(", ")}. Their conversations are kept.` : "Work that needs this dependency is paused."));
-    if (incident.kind === "auth") {
-      card.append(element("p", "", "Sign in again and save the new login, then resume work. Credentials stay on your computer and never pass through this page."));
-      if (account?.default_auth_file) {
-        const command = `firm save-credentials ${account.account_id} --provider ${account.provider}`;
+    const recovery = incident.kind === "auth" ? authRecovery(incident) : null;
+    if (recovery) {
+      card.append(element("p", "", recovery.guidance));
+      if (recovery.command) {
+        const command = recovery.command;
+        card.append(element("p", "", recovery.commandNote));
         const line = element("div", "command-line"); line.append(element("code", "", command), button("Copy", async () => { await navigator.clipboard.writeText(command); notice("Command copied."); })); card.append(line);
-      } else if (account?.auth_file) card.append(element("p", "message-body", `Replace the saved login in the configured auth_file: ${account.auth_file}`));
-      else card.append(element("p", "", `Check the credentials configured for ${incident.scope} ${incident.dependency}.`));
+      } else card.append(element("p", "", `Check the credentials configured for ${incident.scope} ${incident.dependency}.`));
     } else if (incident.kind === "config") {
       card.append(element("p", "", `Fix the entry for ${incident.scope} ${incident.dependency} in the firm's configuration, then resume work.`));
     } else if (["quota", "outage"].includes(incident.kind)) {
       card.append(element("p", "", "This hold has no end time. Resume work when you are ready to lift it."));
     } else card.append(element("p", "", `Resolve the ${incident.kind} hold on ${incident.dependency}, then resume work.`));
-    card.append(mutationButton(incident.kind === "auth" ? "I've saved a new login · resume work" : "Resume work", async () => {
+    card.append(mutationButton(recovery ? recovery.button : "Resume work", async () => {
       await post("/api/incidents/clear", {incident_id: incident.incident_id}, `firm-incident:${incident.incident_id}:clear`);
       await refresh(true);
     }, "primary"));
-    card.append(element("p", "role-meta", "This clears the hold. A new failure brings the card back."), technicalDetails(`Incident: ${incident.incident_id} · Kind: ${incident.kind}`));
+    card.append(element("p", "role-meta", incident.kind === "auth"
+      ? "This clears the hold. The next work period on this account shows whether the provider accepts it; a new failure brings the card back."
+      : "This clears the hold. A new failure brings the card back."),
+      technicalDetails(`Incident: ${incident.incident_id} · Kind: ${incident.kind}${incident.code ? ` · Code: ${incident.code}` : ""}`));
     return card;
   }
 
@@ -172,8 +175,8 @@ export function createOverview({$, api, post, element, button, mutationButton, r
       const meta = element("p", "role-meta", `${runtime ? "Runtime notice" : name(message.author.employee_id, message.author.address)} · `);
       const stamp = element("span", "", age(message.created_at)); stamp.dataset.observedAt = message.created_at;
       meta.append(stamp);
-      row.append(meta, element("h3", "", message.subject || "Message"));
-      const body = element("details"); body.append(element("summary", "", "Read message"), element("p", "message-body", message.body)); row.append(body);
+      row.append(meta, element("h3", "", mailTitle(message)));
+      const body = element("details"); body.append(element("summary", "", "Read message"), element("p", "message-body", mailText(message))); row.append(body);
       const controls = element("div", "owner-controls");
       if (!runtime) controls.append(mutationButton("Reply", () => reply(message)));
       controls.append(mutationButton("Mark done", async () => {
@@ -205,7 +208,7 @@ export function createOverview({$, api, post, element, button, mutationButton, r
     if (!snapshot.accounts.accounts.length) facts.push(["Accounts", "No named accounts configured", "/api/snapshot"]);
     for (const account of snapshot.accounts.accounts) {
       const hold = snapshot.accounts.incidents.find((i) => i.scope === "account" && i.dependency === account.account_id);
-      facts.push([account.account_id, `${hold ? {auth: "Can't sign in", config: "Configuration needs repair", quota: "Allowance hold", outage: "Outage hold"}[hold.kind] || "Paused" : "Available"} · ${account.active} of ${account.max_active} slots`, "/api/snapshot"]);
+      facts.push([account.account_id, `${hold ? {auth: authLabel(hold), config: "Configuration needs repair", quota: "Allowance hold", outage: "Outage hold"}[hold.kind] || "Paused" : "Available"} · ${account.active} of ${account.max_active} slots`, "/api/snapshot"]);
     }
     facts.push(["Web access", !network ? "Unavailable" : !network.live ? "Live status unavailable" : network.enabled ? `${network.allowed_hosts.length} hosts listed` : "Disabled", "/api/analysis/network"]);
     $("#facts").replaceChildren(...facts.map(([title, text, source]) => {

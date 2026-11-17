@@ -17,7 +17,12 @@ from test_task_providers import logs as worker_logs
 from firm_runtime import agy_launch
 from firm_runtime.errors import FirmError
 from firm_runtime.mcp_server import TOOL_DESCRIPTIONS
-from firm_runtime.provider_contract import ProviderSetupError, RoleLaunchRequest
+from firm_runtime.provider_contract import (
+    ProviderSetupError,
+    RoleLaunchRequest,
+    auth_repair,
+    incident_code,
+)
 from firm_runtime.provider_registry import provider_implementation
 from firm_runtime.provider_support import render_invocation, standing
 from firm_runtime.providers import Providers, provider_adapter, record_task_output
@@ -25,6 +30,36 @@ from firm_runtime.runtime import Runtime
 from firm_runtime.store import Store
 from firm_runtime.summaries import SummaryLaunch
 from firm_runtime.task_runner import WORKER_INSTRUCTIONS
+
+
+@pytest.mark.parametrize("code,kept", [
+    ("oauth_org_not_allowed", "oauth_org_not_allowed"),
+    ("OAuth_Org_Not_Allowed", "oauth_org_not_allowed"),
+    ("credential_refresh_rejected", "credential_refresh_rejected"),
+    ("Credential_Invalid", "credential_invalid"),
+    # The prefix alone proves nothing: a guest launcher event could carry such a token.
+    ("credential_private_token", None),
+    ("credential_refresh_unavailable", None),
+    ("some_unknown_code", None),
+    ("unsafe private /path", None),
+    ("../etc/passwd", None),
+    ("", None),
+    (None, None),
+    (7, None),
+])
+def test_incident_code_keeps_only_recognized_or_credential_codes(code, kept):
+    assert incident_code(code) == kept
+
+
+@pytest.mark.parametrize("code,repair", [
+    ("oauth_org_not_allowed", "organization"),
+    ("account_on_hold", "account"),
+    ("credential_refresh_rejected", "sign_in"),
+    ("invalid_api_key", "sign_in"),
+    (None, "sign_in"),
+])
+def test_auth_repair_says_whether_signing_in_can_help(code, repair):
+    assert auth_repair(code) == repair
 
 
 @pytest.fixture(params=["claude", "codex", "agy"])

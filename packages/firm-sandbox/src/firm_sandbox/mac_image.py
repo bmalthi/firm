@@ -38,11 +38,11 @@ from uuid import uuid4
 import yaml
 
 from .commands import Commands, lima_status, mac_sudo_command, parse_lima_list
-from .compatibility import image_identity
 from .guest_control import lifecycle, private_directory, save
 from .host_paths import TEMP_PARENT, _move_durably, _owned_directory, remove_directory
 from .mac_station import ASSETS, DIRTY_MARKER, station_locks
 from .mac_vm import CONTROL_USER, PYTHON
+from .release import image_identity
 
 INSTANCE = "base"
 PYTHON_VERSION = "3.12"

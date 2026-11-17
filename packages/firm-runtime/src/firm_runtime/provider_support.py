@@ -188,13 +188,13 @@ def _recovery(value: dict) -> str:
         lines.append(f"{label} {when}.")
     lines.append(render("wake", "retained" if retained else "lost"))
     lines.append(render("wake", "check_results"))
-    claims = value.get("recent_claims", [])
-    if claims:
-        lines.append(render("wake", "recent_claims"))
-        for claim in claims[:5]:
+    reads = value.get("recent_reads", [])
+    if reads:
+        lines.append(render("wake", "recent_reads"))
+        for mail in reads[:5]:
             lines.append(
-                f"- {claim['message_id']}"
-                + (f" — {claim['subject']}" if claim.get("subject") else "")
+                f"- {mail['message_id']}"
+                + f" — {mail.get('subject') or mail.get('preview', 'No subject')}"
             )
     return "\n".join(lines)
 
@@ -223,6 +223,8 @@ def render_invocation(invocation: Invocation, provider_session_id: str | None) -
         sections.append(
             render("wake", "update", reason=context.get("wake_reason", render("wake", "default")))
         )
+    if context.get("idle_inbox_review"):
+        sections.append(render("wake", "idle_review_instructions"))
     if context.get("mandate_changed") and provider_session_id is not None:
         sections.append(render("wake", "mandate_changed"))
     if context.get("guidance_changed") and provider_session_id is not None:
@@ -241,7 +243,8 @@ def render_invocation(invocation: Invocation, provider_session_id: str | None) -
     if overview.get("context_pressure", {}).get("level") in {"advisory", "handoff_required"}:
         own.pop("context", None)
     overview = {**overview, "context": {**awareness, "self": own}}
-    if inbox := render_inbox(overview):
+    inbox = render_inbox(overview)
+    if inbox != render("results", "no_unread_mail"):
         sections.append(render("wake", "inbox", inbox=inbox))
     elif not birth:
         sections.append(render("wake", "empty_inbox"))

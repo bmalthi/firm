@@ -23,11 +23,10 @@ TOOL_DESCRIPTIONS = {
     "send": render("tools", "send"),
     "reply": render("tools", "reply"),
     "peek": render("tools", "peek"),
-    "claim": render("tools", "claim"),
+    "introduce": render("tools", "introduce"),
+    "read": render("tools", "read"),
     "dismiss": render("tools", "dismiss"),
     "clear": render("tools", "clear"),
-    "messages": render("tools", "messages"),
-    "context": render("tools", "context"),
     "set_reminder": render("tools", "set_reminder"),
     "list_reminders": render("tools", "list_reminders"),
     "cancel_reminder": render("tools", "cancel_reminder"),
@@ -102,8 +101,6 @@ def register_tools(server: FastMCP, runtime: Runtime, token: str | Callable[[], 
     signature_facade = runtime.tools("")
     readonly = {
         "peek",
-        "messages",
-        "context",
         "get_role",
         "find_roles",
         "org_tree",
@@ -155,6 +152,7 @@ def register_tools(server: FastMCP, runtime: Runtime, token: str | Callable[[], 
                 },
                 idempotentHint=name
                 not in {
+                    "read",
                     "desktop_launch",
                     "desktop_action",
                     "desktop_type",
@@ -198,10 +196,10 @@ def main():
     token = os.environ.get("FIRM_ACTIVATION_TOKEN")
     if not token:
         parser.error("FIRM_ACTIVATION_TOKEN is required")
-    from .compatibility import validate_firm
+    from firm_sandbox.firm_paths import validate_firm_directories
 
     try:
-        validate_firm(Path(args.database).resolve().parent.parent)
+        validate_firm_directories(Path(args.database).absolute().parent.parent)
     except (OSError, ValueError, RuntimeError) as exc:
         parser.error(str(exc))
     runtime = Runtime(Store(args.database))

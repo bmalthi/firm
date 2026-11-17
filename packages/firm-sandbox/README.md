@@ -63,9 +63,8 @@ uv run pytest -q -m "not integration" packages/firm-sandbox/tests
 
 The Linux VM guide says when to use `firm-sandbox` and when the runtime's `firm`
 CLI; all VM lifecycle operations go through `Sandbox`.
-Runtime-managed firms already receive the same release marker from `firm init`.
-Sandbox-only `init` is for a new empty-state firm (such as image enrollment); it
-refuses to mark existing unversioned VM state as compatible.
+Sandbox-only `init` validates the configuration and owner-controlled state directory
+without creating a runtime database or starting a VM. No release marker is required.
 
 The guest recipe pins AGY CLI **1.5.3** (experimental, Linux ARM64 glibc) and
 verifies its vendor SHA-512 before extraction. `src/firm_sandbox/assets/linux-base.yaml`

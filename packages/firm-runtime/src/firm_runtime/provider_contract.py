@@ -151,9 +151,13 @@ _CATEGORIES: dict[str, FailureCategory] = {
     "quota_exceeded": "quota",
     "credit_balance_too_low": "quota",
     "out_of_credits": "quota",
+    # One model's own allowance is spent while the account's other models still run,
+    # so this pauses the profile that names the model, never the account.
+    "model_quota_reached": "quota",
     "overloaded_error": "transient",
     "capacity_exceeded": "transient",
     "server_overloaded": "transient",
+    "server_error": "transient",
     "service_unavailable": "transient",
     "transport_error": "transient",
     "connection_error": "transient",
@@ -162,6 +166,8 @@ _CATEGORIES: dict[str, FailureCategory] = {
     "request_timeout": "transient",
     "authentication_error": "auth",
     "authentication_failed": "auth",
+    "oauth_org_not_allowed": "auth",
+    "account_on_hold": "auth",
     "invalid_api_key": "auth",
     "unauthenticated": "auth",
     "unauthorized": "auth",
@@ -310,6 +316,56 @@ def token_count(mapping: Mapping[str, object] | None, key: str) -> int | None:
 
 def category_for_code(code: str | None) -> FailureCategory:
     return _CATEGORIES.get((code or "").lower(), "unknown")
+
+
+# Authentication failures that signing in again to the same account cannot repair.
+_PROVIDER_SIDE_REPAIRS = {
+    "oauth_org_not_allowed": "organization",
+    "account_on_hold": "account",
+}
+
+
+# Firm's own credential setup codes that can open an account hold. A setup code
+# missing from this list still holds the account; its cause reads "not reported".
+_CREDENTIAL_HOLD_CODES = frozenset({
+    "credential_invalid",
+    "credential_invalid_expiry",
+    "credential_lock_invalid",
+    "credential_missing_token",
+    "credential_native_cli_missing",
+    "credential_native_renewal_required",
+    "credential_ownership",
+    "credential_permissions",
+    "credential_profile_invalid",
+    "credential_profile_settings_changed",
+    "credential_profile_unreadable",
+    "credential_provider_invalid",
+    "credential_refresh_missing",
+    "credential_refresh_rejected",
+    "credential_sandbox_missing",
+    "credential_too_large",
+    "credential_unreadable",
+})
+
+
+def incident_code(code: object) -> str | None:
+    """The cause kept on a shared incident and shown to the owner.
+
+    Only a recognized provider code or one of Firm's own credential setup codes
+    qualifies. Any other token, whatever its shape, is dropped rather than repeated:
+    provider and guest output must not reach owner notices through this field.
+    """
+    if not isinstance(code, str):
+        return None
+    code = code.lower()
+    if category_for_code(code) != "unknown" or code in _CREDENTIAL_HOLD_CODES:
+        return code
+    return None
+
+
+def auth_repair(code: str | None) -> Literal["sign_in", "organization", "account"]:
+    """What repairs an authentication hold. Sign-in is the answer unless the code rules it out."""
+    return _PROVIDER_SIDE_REPAIRS.get(code or "", "sign_in")
 
 
 def retry_after_seconds(*mappings: Mapping[str, object]) -> float | int | None:

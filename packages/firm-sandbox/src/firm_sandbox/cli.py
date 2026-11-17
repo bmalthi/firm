@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import mac_enrollment, mac_image
 from .commands import CommandError
-from .compatibility import initialize_firm_record, release_identifier, validate_firm_record
+from .firm_paths import validate_firm_directories
 from .models import Config, RunSpec
 from .sandbox import NO_MAC, Sandbox
 
@@ -88,7 +88,7 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=Path("sandbox.toml"))
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser(
-        "init", help="Record this release for a new sandbox-only firm without starting VMs"
+        "init", help="Prepare a sandbox-only firm without starting VMs"
     )
     for name, description in (
         ("up", "boot the Linux VM, file server and optional Mac; disks are retained"),
@@ -115,7 +115,10 @@ def main() -> None:
         ("wait", "wait for a role's current run to exit"),
         ("remove", "remove a role's settled run record"),
     ):
-        sub.add_parser(name, help=description).add_argument("role")
+        command = sub.add_parser(name, help=description)
+        command.add_argument("role")
+        if name == "logs":
+            command.add_argument("--run-id", help="Read a specific retained run of this role")
     sub.add_parser(
         "retire", help="revoke a stopped role's access; its data is retained"
     ).add_argument("role")
@@ -223,7 +226,8 @@ def main() -> None:
     try:
         if args.action == "init":
             config = Config.load(args.config)
-            result = initialize_firm_record(config.root, release_identifier())
+            validate_firm_directories(config.root)
+            result = {"directory": str(config.root), "status": "initialized"}
             print(json.dumps(result, indent=2))
             return
         if args.action == "mac-image-build":
@@ -233,11 +237,8 @@ def main() -> None:
                 )
             print(json.dumps(result, indent=2))
             return
-        # Power-off remains available even when new code refuses the recorded state.
-        # Every other command constructs Sandbox, which may create host records or
-        # install/boot a guest, so compatibility is checked before that constructor.
         if args.action not in {"down", "force-down"}:
-            validate_firm_record(args.config.expanduser().absolute().parent)
+            validate_firm_directories(args.config.expanduser().absolute().parent)
         sandbox = Sandbox(Config.load(args.config))
         if args.action in MAC_ACTIONS and sandbox.mac is None:
             raise RuntimeError(NO_MAC)
@@ -323,7 +324,14 @@ def main() -> None:
         elif args.action == "ps":
             result = sandbox.states()
         elif args.action in {"stop", "logs", "wait", "remove"}:
-            result = getattr(sandbox, args.action)(sandbox.current(args.role))
+            if args.action == "logs" and args.run_id:
+                selected = next((run for run in sandbox.runs()
+                                 if run.role_id == args.role and run.run_id == args.run_id), None)
+                if selected is None:
+                    raise ValueError("No retained run matches that role and run ID")
+            else:
+                selected = sandbox.current(args.role)
+            result = getattr(sandbox, args.action)(selected)
         else:
             command = args.command
             if command and command[0] == "--":

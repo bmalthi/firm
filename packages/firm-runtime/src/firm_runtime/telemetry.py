@@ -334,7 +334,7 @@ class ContextTelemetry:
                 ],
             )
 
-    def gate_claim(self, activation_id: str) -> bool:
+    def gate_read(self, activation_id: str) -> bool:
         with self.store.read() as db:
             activation = self.runtime._activation(db, activation_id)
             pressure = self._pressure(db, activation)

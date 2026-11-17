@@ -167,10 +167,13 @@ def test_an_answer_decides_the_request_mails_the_role_and_wakes_it(tmp_path, clo
          "decision_note": "Too big."},
     ]
     (granted,) = mail_to(runtime, founder.employee_id)
-    assert granted["author_id"] == "runtime" and granted["subject"] == "Access granted: widget"
+    assert granted["author_id"] == "runtime" and granted["subject"] is None
+    assert granted["body"].startswith("Access granted: widget\n\n")
     assert granted["scheduling_ready_at"] is not None
     (declined,) = mail_to(runtime, scout.employee_id)
-    assert declined["subject"] == "Access declined: gadget" and "Too big." in declined["body"]
+    assert declined["subject"] is None
+    assert declined["body"].startswith("Access declined: gadget\n\n")
+    assert "Too big." in declined["body"]
     assert declined["scheduling_ready_at"] is not None
     assert [event for event in request_events(runtime) if event[0] != "request.opened"] == [
         ("request.granted", {"request_id": "q1", "kind": "thing", "resource": "widget"}),
@@ -230,11 +233,11 @@ def test_the_owner_is_nudged_about_mail_at_most_once_per_sender_per_ten_minutes(
     runtime, founder = request_firm(tmp_path, clock)
     tools = runtime.tools(founder.token)
     for index in range(2):
-        tools.send(["owner"], f"Report {index}", f"report-{index}", subject=f"Report {index}")
+        tools.send(["owner"], [], f"Report {index}", subject=f"Report {index}")
     (posted,) = runtime.posted
     assert "Report 0" in posted[2] and "Mail from founder" in posted[2]
     clock.now[0] += 601
-    tools.send(["owner"], "Report 2", "report-2", subject="Report 2")
+    tools.send(["owner"], [], "Report 2", subject="Report 2")
     assert len(runtime.posted) == 2
 
 
@@ -244,7 +247,7 @@ def test_the_owner_can_turn_notifications_off(tmp_path, clock):
         config = json.loads(runtime.store.firm(db)["config_json"])
         config["owner"] = {"notifications": False}
         db.execute("UPDATE firm SET config_json=?", (json.dumps(config),))
-    runtime.tools(founder.token).send(["owner"], "Report", "report", subject="Report")
+    runtime.tools(founder.token).send(["owner"], [], "Report", subject="Report")
     assert runtime.posted == []
 
 
@@ -269,7 +272,7 @@ def test_inbox_lists_pending_requests_beside_owner_mail(tmp_path, clock):
     runtime, founder = request_firm(tmp_path, clock)
     tools = runtime.tools(founder.token)
     tools.request_access("network_host", "pypi.org", "Install", "ask")
-    tools.send(["owner"], "Status", "status", subject="Status")
+    tools.send(["owner"], [], "Status", subject="Status")
     clock.now[0] += 90
     inbox = AnalysisReader(runtime.store.path, clock=clock).read("inbox")
     assert inbox["pending_count"] == 1 and inbox["pending_request_count"] == 1

@@ -11,7 +11,6 @@ from types import SimpleNamespace
 import pytest
 
 from firm_sandbox import Config, Layout, Organization, RunSpec, Sandbox, sandbox
-from firm_sandbox.compatibility import initialize_firm_record, release_identifier
 
 
 class FakeNetwork:
@@ -241,7 +240,6 @@ class FakeFiles:
 
 @pytest.fixture
 def box(tmp_path, monkeypatch):
-    initialize_firm_record(tmp_path, release_identifier())
     monkeypatch.setattr(sandbox, "LinuxVM", FakeLinux)
     monkeypatch.setattr(sandbox, "MacVM", FakeMac)
     box = Sandbox(Config(tmp_path, mac_image="/private/base"))
@@ -252,7 +250,6 @@ def box(tmp_path, monkeypatch):
 @pytest.fixture
 def two_stations(tmp_path, monkeypatch):
     """A firm whose one Mac holds two station accounts."""
-    initialize_firm_record(tmp_path, release_identifier())
     monkeypatch.setattr(sandbox, "LinuxVM", FakeLinux)
     monkeypatch.setattr(sandbox, "MacVM", FakeMac)
     box = Sandbox(Config(tmp_path, mac_image="/private/base"))
@@ -351,7 +348,6 @@ def test_config_uses_shared_mac_resources_and_rejects_station_count(tmp_path):
 @pytest.fixture
 def linux_only(tmp_path, monkeypatch):
     """A firm whose sandbox.toml has no [mac]: one VM and no station."""
-    initialize_firm_record(tmp_path, release_identifier())
     monkeypatch.setattr(sandbox, "LinuxVM", FakeLinux)
     box = Sandbox(Config(tmp_path))
     box.linux.network.traffic = lambda: {"live": True, "egress": True}
@@ -2085,3 +2081,13 @@ def test_storage_rpc_and_sandbox_shape_without_run_checks(box, role):
     assert box.storage(role) == {}
     payload = {"timeout": 90, **({"role_id": role} if role is not None else {})}
     assert box.linux.calls == [("storage", payload)]
+
+
+def test_sandbox_refuses_durable_symlink_before_identity_creation(tmp_path, monkeypatch):
+    external = tmp_path / "external"
+    external.mkdir()
+    (tmp_path / "durable").symlink_to(external)
+    monkeypatch.setattr(sandbox, "LinuxVM", lambda *_a, **_kw: pytest.fail("VM constructed"))
+    with pytest.raises(ValueError, match="owner-controlled"):
+        Sandbox(Config(tmp_path))
+    assert not list(external.iterdir())

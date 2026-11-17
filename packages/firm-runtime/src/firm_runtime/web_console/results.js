@@ -1,4 +1,4 @@
-import {bytes, time, filePreviewable, fileFolder, fileDeliveries, resultHref} from "./format.js";
+import {bytes, time, filePreviewable, fileFolder, fileDeliveries, resultHref, mailTitle} from "./format.js";
 
 function readLink(result, {element, rememberResult}, label = "Read") {
   const link = element("a", "button-link", label);
@@ -29,7 +29,7 @@ export function resultCard(result, context) {
   const stamp = element("span", "", time(result.created_at)); stamp.dataset.timestamp = result.created_at;
   const meta = element("p", "role-meta", `${result.author.identity || result.author.address} · `);
   meta.append(stamp);
-  title.append(element("strong", "file-name", result.name), element("p", "", result.subject), meta);
+  title.append(element("strong", "file-name", result.name), element("p", "", mailTitle(result)), meta);
   const actions = element("div", "file-actions");
   actions.append(readLink(result, context), downloadLink(result, element));
   card.append(title, actions);
@@ -102,7 +102,7 @@ export function createResults(context) {
     const sent = element("ul");
     for (const item of history) {
       const li = element("li");
-      const link = element("a", "", item.subject);
+      const link = element("a", "", mailTitle(item));
       link.href = `#inbox?message=${encodeURIComponent(item.message_id)}`;
       const meta = element("p", "role-meta", `${item.author.identity || item.author.address} · `);
       const stamp = element("span", "", time(item.created_at)); stamp.dataset.timestamp = item.created_at;

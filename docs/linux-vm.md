@@ -19,9 +19,10 @@ why, and what it does not.
 - [Development limits](#development-limits)
 
 The base image trusts the pinned Ubuntu cloud image, Ubuntu package repositories,
-Docker's installation script, Astral's uv installer, and the pinned Node/provider CLI
-downloads in `assets/linux-base.yaml`. Docker and uv installers execute as guest root
-and are not pinned by content digest.
+Docker's installation script, Astral's uv installer, nodejs.org's newest Node 24,
+PyPI's newest Playwright and the Chromium it downloads, and the pinned provider CLI
+downloads in `assets/linux-base.yaml`. The Docker, uv and Playwright installers execute
+as guest root and are not pinned by content digest.
 
 ## Create and start a firm
 
@@ -50,16 +51,32 @@ creating the Linux VM. Editing it leaves an existing firm's disk unchanged.
 New VMs clone a shared software base image cached at
 `~/Library/Caches/firm/linux-base/`. Firm builds it once per Mac on ordinary Apple
 Virtualization networking, outside the firm's network and egress proxy. The base
-contains Docker, Samba, cifs-utils, uv, Node, Claude Code, Codex and AGY, plus
-Chromium's OS libraries and fonts from Playwright 1.63.0's Ubuntu 26.04 ARM64
-dependency set. Roles can install Playwright in a project (`uv add playwright==1.63.0`)
-and download Chromium (`uv run playwright install chromium`) without sudo or
-Docker, then render HTML, screenshots and PDFs directly. Browser binaries remain
-in the role's home; the base does not preinstall Playwright or its browsers.
+contains Docker, Samba, cifs-utils, uv, the newest Node 24, the pinned Claude Code,
+Codex and AGY CLIs, a `python` command for `python3`, and tools roles cannot install
+without sudo: poppler's PDF tools, ImageMagick, `rsvg-convert`, ffmpeg, pandoc, jq,
+ripgrep, zip, and LibreOffice without a display (with metric-compatible Calibri and
+Cambria fonts).
+
+The build also installs the newest Playwright release's Chromium, with the OS libraries
+that version needs, into `/opt/firm/ms-playwright`, owned by root and read-only to roles,
+and records its minor version as `X.Y.0` in `/opt/firm/playwright-version`. Each new
+role's own Playwright cache, `~/.cache/ms-playwright`, links to those browsers.
+`PLAYWRIGHT_BROWSERS_PATH` names that cache, so tasks and AGY sessions, which have
+their own homes, find it, and `PLAYWRIGHT_SKIP_BROWSER_GC=1` stops installing another
+Playwright version from deleting the links. A role that adds the matching Playwright
+(`uv add "playwright~=$(cat /opt/firm/playwright-version)"`) launches Chromium without
+a download; any other version downloads into the role's own cache as before, and the
+role removes downloads it no longer needs. Roles never write to the shared folder. A VM
+cloned from an older base has no shared browsers, and its roles download their own.
 Native rendering of trusted local HTML uses Playwright's default
 `chromium_sandbox=False`. Ubuntu's AppArmor restriction on unprivileged user
 namespaces remains enabled, so `chromium_sandbox=True` can fail with "No usable
 sandbox"; the dependency installation does not change this security policy.
+The [browser acceptance tool](../tools/acceptance/README.md) measures SDK and
+browser setup separately, supports warm setup in the same role, and checks offline
+reuse with Linux egress disabled. Download failures, missing OS libraries and
+Chromium sandbox refusals need separate diagnoses; observe-mode downloads do not
+establish that a CDN is allowed in enforce mode.
 Each firm's boot performs only offline configuration behind its sandbox network and creates
 its own machine ID, SSH host keys, Samba SID and certificate.
 
@@ -126,6 +143,22 @@ Settlement writes `exit.json` last, including the slice's `usage`: peak memory, 
 time and OOM kills for the whole run, read just before the slice stops. The runtime
 stores them on the run and **System → Diagnostics → Resources** shows them; the peak
 counts page cache, so it is an upper bound on what the run needed.
+
+Tool-free summaries, choosers and staffing calls use four reusable `s-slot-N` accounts.
+These accounts have no subordinate IDs, Docker daemon or user manager. Their commands
+run as restricted systemd services: other homes and shared `/run` are hidden, temporary
+directories and shared memory are private, and persistent writes are confined to the
+slot's home and its call state. New namespaces and privilege escalation are disabled.
+Only IPv4/IPv6 sockets may be created. Internal socketpairs support provider event loops,
+but message syscalls that can send or receive file descriptors and `io_uring` are denied.
+Kernel keyring syscalls are also denied because per-UID keys can outlive a call.
+The controller confirms the slice is empty, removes the whole home and run state with
+a bounded descriptor-relative worker, and verifies cleanup before publishing resolved
+exit or starting another call. Cleanup failure leaves the run unresolved and its slot
+unavailable; it does not retire or silently reuse the account. Run logs remain separate
+in root-owned journals and can be selected with `logs s-slot-N --run-id RUN_ID`.
+Power-off still completes even with quarantined slots. Their reservations survive it;
+after restart, guest cleanup must succeed before those slots become available again.
 
 Keep deliverables and work colleagues need on the drive. Scratch and Docker state persist between work periods. When an activation ends, settlement runs under a 20-second deadline:
 1. **Stop the slice & verify quiescence:** Stops child tasks, captures slice usage, stops the rootless daemon and `user-<uid>.slice`, then confirms the kernel's recursive `cgroup.events` reads `populated 0` (or the slice cgroup is gone).

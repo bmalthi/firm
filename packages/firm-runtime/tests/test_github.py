@@ -559,7 +559,8 @@ def test_a_created_repository_is_private_granted_announced_and_usable_at_once(
             "SELECT author_id,recipients_json,subject,body FROM messages"
         ).fetchone()
     assert mail["author_id"] == "runtime" and OWNER in mail["recipients_json"]
-    assert mail["subject"] == "GitHub repository created"
+    assert mail["subject"] is None
+    assert mail["body"].startswith("GitHub repository created\n\n")
     assert "founder created the private GitHub repository firmery/test-app" in mail["body"]
     assert "ghs_" not in json.dumps(events(runtime))
     # The owner reads GitHub's immediate grants in the same list as requests awaiting them.
@@ -621,7 +622,7 @@ def test_a_full_cap_opens_an_owner_request_that_creates_the_repository_when_gran
             "SELECT status FROM owner_requests WHERE request_id=?", (pending["request_id"],)
         ).fetchone()[0] == "granted"
         assert "firmery/test-two" in db.execute(
-            "SELECT body FROM messages WHERE subject='Access granted: firmery/test-two'"
+            "SELECT body FROM messages WHERE body LIKE 'Access granted: firmery/test-two\n\n%'"
         ).fetchone()[0]
     assert ("github.repository_created", {"repository": "firmery/test-two"}) in events(runtime)
     # Its own call now finds the name taken.
@@ -742,7 +743,7 @@ def test_the_owner_grants_a_repository_the_firm_did_not_create(tmp_path, fake, k
             "founder", "owner"
         )
         mail = db.execute(
-            "SELECT recipients_json,body FROM messages WHERE subject LIKE 'Access granted%'"
+            "SELECT recipients_json,body FROM messages WHERE body LIKE 'Access granted%\n\n%'"
         ).fetchone()
     assert "founder" in mail["recipients_json"] and "firmery/elsewhere" in mail["body"]
     # Asking once more finds the access already there.
@@ -770,7 +771,7 @@ def test_a_revoked_repository_asks_the_owner_who_lifts_it_with_the_grant(
     with runtime.store.read() as db:
         assert db.execute("SELECT COUNT(*) FROM github_revocations").fetchone()[0] == 0
         assert db.execute(
-            "SELECT COUNT(*) FROM messages WHERE subject='Access granted: firmery/test-app'"
+            "SELECT COUNT(*) FROM messages WHERE body LIKE 'Access granted: firmery/test-app\n\n%'"
         ).fetchone()[0] == 1
 
 
@@ -783,7 +784,7 @@ def test_the_owner_denies_a_repository_and_a_second_ask_is_refused(tmp_path, fak
         runtime.github.issue(founder.token, "firmery/elsewhere")
     with runtime.store.read() as db:
         notice = db.execute(
-            "SELECT body FROM messages WHERE subject='Access declined: firmery/elsewhere'"
+            "SELECT body FROM messages WHERE body LIKE 'Access declined: firmery/elsewhere\n\n%'"
         ).fetchone()
     assert "Not ours to touch" in notice["body"]
     # Standing for this repository, whoever asks and whatever the case.

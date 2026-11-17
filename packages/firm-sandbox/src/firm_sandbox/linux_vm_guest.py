@@ -49,6 +49,8 @@ ROOT_FILESYSTEM = "/"
 SMB_CONF = Path("/etc/samba/smb.conf")
 PYTHON = "/usr/bin/python3"
 CONTROLLER = "/usr/local/libexec/firm-controller.py"
+# Playwright's browsers in the base image, read-only to roles; absent from older images.
+SHARED_BROWSERS = Path("/opt/firm/ms-playwright")
 LIMIT = 8 * 1024 * 1024
 FILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}\.[a-z0-9]{1,8}")
 MAX_LOG_BYTES = 64 * 1024 * 1024
@@ -96,11 +98,15 @@ def firm_identifier(value):
 
 def allocate_identity(seed, *, account_prefix, uid_start, uid_count, used_uids):
     """A deterministic account name and UID; callers reserve retired UIDs in used_uids."""
+    if uid_count <= 0:
+        raise ValueError("Identity UID range must contain at least one UID")
     digest = hashlib.sha256(seed.encode()).hexdigest()
     uid = uid_start + int(digest[:8], 16) % uid_count
-    while uid in used_uids:
+    for _ in range(uid_count):
+        if uid not in used_uids:
+            return account_prefix + digest[:12], uid
         uid = uid_start + (uid - uid_start + 1) % uid_count
-    return account_prefix + digest[:12], uid
+    raise RuntimeError("Identity UID range is exhausted")
 
 
 def role_account(role_id):
@@ -481,6 +487,43 @@ def role_scope(info, argv):
     ]
 
 
+def stateless_command(info, request, environment, cwd):
+    """A private mount/IPC namespace with only the slot and run state writable.
+
+    Unlike a scope, a service can apply filesystem restrictions before dropping
+    privileges. Environment values travel over systemd's private bus, never argv.
+    """
+    properties = (
+        "ProtectSystem=strict", "ProtectHome=tmpfs",
+        f"BindPaths={info['home']} {info['state']} {info['credentials']}",
+        f"ReadWritePaths={info['home']} {info['state']} {info['credentials']}",
+        "PrivateTmp=yes", "PrivateIPC=yes", "PrivateDevices=yes",
+        "TemporaryFileSystem=/run:ro /dev/shm:rw,nosuid,nodev,mode=1777",
+        "ProtectControlGroups=yes", "ProtectKernelTunables=yes",
+        "ProtectKernelModules=yes", "RestrictNamespaces=yes",
+        # PrivateIPC does not isolate abstract Unix sockets. Internal socketpairs
+        # support native event loops, but SCM_RIGHTS in either direction is denied.
+        # io_uring must not bypass these socket syscall restrictions.
+        "RestrictAddressFamilies=AF_INET AF_INET6",
+        "SystemCallArchitectures=native",
+        "SystemCallFilter=~sendmsg sendmmsg recvmsg recvmmsg "
+        "io_uring_setup io_uring_enter io_uring_register "
+        "add_key request_key keyctl",
+        "SystemCallErrorNumber=EPERM",
+        "NoNewPrivileges=yes", "RestrictSUIDSGID=yes", "CapabilityBoundingSet=",
+        "KillMode=control-group", "KillSignal=SIGKILL", "TimeoutStopSec=2s",
+        "SendSIGKILL=yes", "UMask=0077",
+    )
+    return [
+        "systemd-run", "--quiet", "--collect", "--wait", "--pipe", "--service-type=exec",
+        f"--unit=firm-stateless-{request['run_id']}", f"--slice={slice_unit(info['uid'])}",
+        f"--uid={info['uid']}", f"--gid={info['gid']}", f"--working-directory={cwd}",
+        *(f"--property={value}" for value in properties),
+        *(f"--setenv={name}" for name in sorted(environment)),
+        "--", *request["argv"],
+    ]
+
+
 def user_systemctl(info, *args):
     return ["systemctl", "--user", "--machine", f"{info['account']}@.host", *args]
 
@@ -497,6 +540,11 @@ def role_environment(info):
         "DOCKER_HOST": f"unix:///run/user/{info['uid']}/docker.sock",
         # Named so a task, whose HOME is its own, still uses the role's proxy settings.
         "DOCKER_CONFIG": f"{info['home']}/.docker",
+        # Playwright's default cache, named for the same reason.
+        "PLAYWRIGHT_BROWSERS_PATH": f"{info['home']}/.cache/ms-playwright",
+        # Installing another Playwright version would otherwise delete the links to the
+        # shared browsers, which no install of the role's recorded.
+        "PLAYWRIGHT_SKIP_BROWSER_GC": "1",
     }
 
 
@@ -559,6 +607,43 @@ def write_docker_proxies(info, proxy):
         "daemon.json",
         lambda config: config.update(dns=[CONTAINER_RESOLVER]),
     )
+
+
+def link_shared_browsers(info):
+    """Link the base image's browsers into a new role's own Playwright cache.
+
+    Playwright then launches a matching browser without downloading it, while its
+    markers and any other version it installs stay in the role's cache. Done as the
+    account, so nothing here can steer a root write.
+    """
+    try:
+        # Browser folders only: Playwright's own `.links` and `__dirlock` must stay
+        # the role's, or its installs would write into the shared folder.
+        names = sorted(
+            entry.name for entry in SHARED_BROWSERS.iterdir()
+            if entry.is_dir() and not entry.name.startswith((".", "_"))
+        )
+    except FileNotFoundError:
+        return
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with privileged.as_user(info):
+        directory = os.open(info["home"], flags)
+        try:
+            for part in (".cache", "ms-playwright"):
+                try:
+                    os.mkdir(part, 0o700, dir_fd=directory)
+                except FileExistsError:
+                    pass
+                child = os.open(part, flags, dir_fd=directory)
+                os.close(directory)
+                directory = child
+            for name in names:
+                try:
+                    os.symlink(SHARED_BROWSERS / name, name, dir_fd=directory)
+                except FileExistsError:
+                    pass
+        finally:
+            os.close(directory)
 
 
 def update_role_json(info, directories, name, update):
@@ -698,14 +783,18 @@ def reclaim_docker(info, deadline):
     return categories
 
 
-def reclaim_scratch(info, deadline):
-    """Remove only home/scratch, without following links or traversing mounts.
+def reclaim_scratch(info, deadline, *, entire_home=False):
+    """Wipe scratch, or an explicitly selected whole tree, without links or mounts.
 
     The slice is empty. Root can remove files a container wrote with subordinate IDs;
     descriptor-relative traversal keeps that authority inside the named category.
+    Stateless cleanup selects the entire home or per-role run root, then verifies
+    emptiness before reuse. The recreated directory belongs to the execution account.
     """
     counts = reclaim_counts()
     home = Path(info["home"])
+    parent = home.parent if entire_home else home
+    name = home.name if entire_home else "scratch"
 
     def check_deadline():
         if time.monotonic() >= deadline:
@@ -783,9 +872,9 @@ def reclaim_scratch(info, deadline):
     try:
         # st_dev alone misses bind mounts on the same filesystem.
         mounts = (PROC / "self/mountinfo").read_text().splitlines()
-        fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            scratch = home / "scratch"
+            scratch = parent / name
             for line in mounts:
                 check_deadline()
                 mount = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), line.split()[4])
@@ -794,11 +883,11 @@ def reclaim_scratch(info, deadline):
                     counts["skipped"]["mount"] = 1
                     return counts
             try:
-                clear(fd, "scratch", os.fstat(fd).st_dev)
+                clear(fd, name, os.fstat(fd).st_dev)
             except FileNotFoundError:
                 pass
-            os.mkdir("scratch", mode=0o700, dir_fd=fd)
-            child = os.open("scratch", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.mkdir(name, mode=0o700, dir_fd=fd)
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             try:
                 privileged.chown(child, info["uid"], info["gid"])
             finally:
@@ -813,18 +902,19 @@ def reclaim_scratch(info, deadline):
     return counts
 
 
-def scratch_worker(info, deadline):
+def scratch_worker(info, deadline, *, entire_home=False):
     worker_deadline = deadline - SCRATCH_REPORT_MARGIN
     timeout = worker_deadline - time.monotonic()
     if timeout <= 0:
         return reclaim_skipped("deadline", timed_out=True)
     try:
         if privileged.simulate:
-            return reclaim_scratch(info, worker_deadline - 0.1)
+            return reclaim_scratch(info, worker_deadline - 0.1, entire_home=entire_home)
         # An independent process also bounds a filesystem call that never returns.
         result = privileged.run(
             [PYTHON, "-I", CONTROLLER, "--reclaim-scratch"],
-            input=json.dumps({"info": info, "deadline": worker_deadline - 0.1}),
+            input=json.dumps({"info": info, "deadline": worker_deadline - 0.1,
+                              "entire_home": entire_home}),
             timeout=timeout,
         )
         return json.loads(result.stdout)
@@ -882,14 +972,15 @@ def settle(info, *, reclaim=None):
         reclaim["categories"] = reclaim_docker(info, time.monotonic() + DOCKER_PRUNE_BUDGET)
         reclaim["categories"]["scratch"] = reclaim_skipped("slice_not_empty")
     deadline = time.monotonic() + SETTLE_TIMEOUT
-    try:
-        privileged.run(
-            user_systemctl(info, "stop", "docker.service"),
-            check=False,
-            timeout=max(0.001, min(2, deadline - time.monotonic())),
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        pass  # A daemon failure never skips the slice stop or its verification.
+    if not info.get("stateless"):
+        try:
+            privileged.run(
+                user_systemctl(info, "stop", "docker.service"),
+                check=False,
+                timeout=max(0.001, min(2, deadline - time.monotonic())),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass  # A daemon failure never skips the slice stop or its verification.
     timeout = deadline - time.monotonic()
     if timeout <= 0:
         raise RuntimeError("Role slice stop deadline expired")
@@ -921,11 +1012,13 @@ def install_docker(info):
     privileged.run(["sync", "-f", info["home"]])
 
 
-def provision(role):
+def provision(role, *, stateless=False):
     identifier(role)
     data = database()
     existing = data["roles"].get(role)
     if existing is not None:
+        if bool(existing.get("stateless")) != stateless:
+            raise ValueError("A role's execution profile cannot change")
         if existing.get("retired"):
             raise ValueError("Retired role IDs cannot be reused; use a new role ID")
         if existing.get("retiring"):
@@ -934,6 +1027,8 @@ def provision(role):
     pending = data.get("pending")
     if pending is not None and pending["role_id"] != role:
         raise RuntimeError("Finish provisioning the pending role first")
+    if pending is not None and bool(pending.get("stateless")) != stateless:
+        raise ValueError("Pending role execution profile cannot change")
     if pending is None:
         used = {item.get("uid") for item in data["roles"].values()}
         account, uid = allocate_identity(
@@ -946,6 +1041,8 @@ def provision(role):
         # Persist intent first: an interrupted creation can only finish for this role,
         # and its UID and subordinate range stay reserved with the retired ones.
         pending = {"role_id": role, "account": account, "uid": uid, "index": data["next"]}
+        if stateless:
+            pending["stateless"] = True
         data["pending"] = pending
         save(STATE / "firm.json", data)
     account, uid, index = pending["account"], pending["uid"], pending["index"]
@@ -980,6 +1077,8 @@ def provision(role):
     managed_directory(home, uid, gid, 0o700)
     for name in ("work", "drive"):
         managed_directory(home / name, uid, gid, 0o700)
+    if not stateless:
+        link_shared_browsers({"home": str(home), "uid": uid, "gid": gid})
     info = {
         "role_id": role,
         "account": account,
@@ -991,11 +1090,15 @@ def provision(role):
         "drive": str(home / "drive"),
         "state": str(RUN_ROOT / role / "state"),
         "credentials": str(RUN_ROOT / role / "credentials"),
-        "subordinate": subordinate_range(account, index),
     }
+    if stateless:
+        info["stateless"] = True
+    else:
+        info["subordinate"] = subordinate_range(account, index)
     write_units(role, uid)
     privileged.run(["systemctl", "daemon-reload"])
-    install_docker(info)
+    if not stateless:
+        install_docker(info)
     data = database()
     data["roles"][role] = info
     data["next"] = index + 1
@@ -1018,6 +1121,7 @@ def request_fingerprint(request):
         "secrets": request.get("secrets", {}),
         "secret_env": request.get("secret_env", {}),
         "clean_up": request.get("clean_up", False),
+        "stateless": request.get("stateless", False),
     }
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -1056,7 +1160,7 @@ def status(run_id):
             finished.update({"status": "unresolved", "unresolved": True})
         return finished
     if record["boot"] != boot():
-        # Nothing from an earlier boot survives, and /run/firm went with it.
+        # Processes and /run/firm are gone; a stateless home still needs erasure.
         for name in ("request.json", "stdin"):
             (path / name).unlink(missing_ok=True)
         settlement = read_settlement(path)
@@ -1064,9 +1168,9 @@ def status(run_id):
             **record,
             "running": False,
             "exit_code": 125,
-            "status": "interrupted",
+            "status": "unresolved" if record.get("stateless") else "interrupted",
             "interrupted": True,
-            "unresolved": False,
+            "unresolved": bool(record.get("stateless")),
             "log_bytes": log_bytes,
             "usage": settlement.get("usage"),
         }
@@ -1197,6 +1301,19 @@ def prepare_run_state(info):
 
 def clean_run_state(info):
     role_root = RUN_ROOT / info["role_id"]
+    if info.get("stateless"):
+        if not slice_empty(info["uid"]):
+            raise RuntimeError("Stateless slot still has processes")
+        if not os.path.lexists(role_root):
+            return
+        result = scratch_worker(
+            {**info, "home": str(role_root)},
+            time.monotonic() + DISPOSE_SCRATCH_TIMEOUT, entire_home=True,
+        )
+        if not result["completed"] or result["skipped"]:
+            raise RuntimeError("Stateless slot run-state cleanup could not be confirmed")
+        os.rmdir(role_root)  # Fails closed if the bounded worker left anything behind.
+        return
     if role_root.is_symlink():
         raise RuntimeError("Run state root must not be a symlink")
     if role_root.is_dir():
@@ -1206,6 +1323,61 @@ def clean_run_state(info):
         record = json.loads((path / "record.json").read_text())
         if record.get("role_id") == info["role_id"]:
             shutil.rmtree(STATE / "task-homes" / path.name, ignore_errors=True)
+
+
+def clean_stateless_home(info):
+    """An empty slice plus successful whole-home wipe is the reuse barrier.
+
+    The stateless service's private tmp/shm namespaces vanish with its processes;
+    no persistent location outside this home and run state is writable.
+    """
+    if not info.get("stateless"):
+        return
+    if not slice_empty(info["uid"]):
+        raise RuntimeError("Stateless slot still has processes")
+    result = scratch_worker(
+        info, time.monotonic() + DISPOSE_SCRATCH_TIMEOUT, entire_home=True,
+    )
+    if not result["completed"] or result["skipped"]:
+        raise RuntimeError("Stateless slot home cleanup could not be confirmed")
+    home = os.open(info["home"], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if os.listdir(home) or privileged.owner(home) != info["uid"]:
+            raise RuntimeError("Stateless slot home is not empty and owned by its account")
+    finally:
+        os.close(home)
+
+
+def publish_run(directory, record, request):
+    """Publish complete private launch intent atomically, before any supervisor starts."""
+    directory.parent.mkdir(mode=0o700, exist_ok=True)
+    # main() serializes controller requests. Keep unpublished journals outside
+    # runs(), including after SIGKILL when Python cleanup cannot execute.
+    staging = STATE / "launch-staging"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(mode=0o700)
+    (staging / "lock").touch(mode=0o600)
+    try:
+        save(staging / "record.json", record)
+        save(staging / "request.json", request)
+        descriptor = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        # Publish only after both journal files are durable. A crash before this
+        # rename leaves private staging that can be swept without an incomplete
+        # run visible to retry logic.
+        os.rename(staging, directory)
+        descriptor = os.open(directory.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 
 def start(request):
@@ -1227,6 +1399,11 @@ def start(request):
     ):
         raise ValueError("Invalid environment")
     validate_secrets(request)
+    stateless = request.get("stateless", False)
+    if type(stateless) is not bool:
+        raise ValueError("stateless must be a boolean")
+    if stateless and (request.get("organization") is not None or request.get("drive") is not None):
+        raise ValueError("Stateless runs cannot receive organization or drive authority")
     if validate_drive(request) is not None and request.get("organization") is None:
         raise ValueError("A drive requires an organization address")
     try:
@@ -1245,27 +1422,12 @@ def start(request):
         if record.get("fingerprint") != fingerprint or record.get("role_id") != role:
             raise ValueError(f"Run ID {run_id} already exists for a different request")
         return status(run_id)
-    info = provision(role)
+    info = provision(role, stateless=stateless)
     for existing in runs():
         if existing["role_id"] != role:
             continue
         if existing.get("running") or existing.get("unresolved"):
             raise ValueError(f"Role already has an active or unresolved run: {existing['run_id']}")
-    cleanup = dispose_account(info) if request.get("clean_up") else None
-    if cleanup is None:
-        settle(info)
-    elif any(not c["completed"] or c["skipped"] for c in cleanup["categories"].values()):
-        print(f"Incomplete launch cleanup for {role}: {json.dumps(cleanup)}", file=sys.stderr)
-    heal_scratch(info)
-    prepare_run_state(info)
-    directory.parent.mkdir(mode=0o700, exist_ok=True)
-    # main() serializes controller requests. Keep unpublished journals outside
-    # runs(), including after SIGKILL when Python cleanup cannot execute.
-    staging = STATE / "launch-staging"
-    if staging.exists():
-        shutil.rmtree(staging)
-    staging.mkdir(mode=0o700)
-    (staging / "lock").touch(mode=0o600)
     record = {
         "role_id": role,
         "run_id": run_id,
@@ -1276,28 +1438,38 @@ def start(request):
         "fingerprint": fingerprint,
         "phase": "launching",
     }
-    if cleanup is not None:
-        record["cleanup"] = cleanup
+    if stateless:
+        # Even a pre-launch cleanup failure must retain a visible reservation.
+        # Replay returns this run; only stop/reconciliation may resolve it.
+        record["stateless"] = True
+        publish_run(directory, record, request)
     try:
-        save(staging / "record.json", record)
-        save(staging / "request.json", request)
-        descriptor = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        # Publish only after both journal files are durable. A crash before this
-        # rename leaves private staging that can be swept without an incomplete
-        # run visible to retry logic.
-        os.rename(staging, directory)
-        descriptor = os.open(directory.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
+        cleanup = dispose_account(info) if request.get("clean_up") and not stateless else None
+        if cleanup is None:
+            settle(info)
+        elif any(not c["completed"] or c["skipped"] for c in cleanup["categories"].values()):
+            print(f"Incomplete launch cleanup for {role}: {json.dumps(cleanup)}", file=sys.stderr)
+        clean_stateless_home(info)
+        if stateless:
+            for name in ("work", "drive", ".runtime"):
+                managed_directory(Path(info["home"]) / name, info["uid"], info["gid"], 0o700)
+        heal_scratch(info)
+        prepare_run_state(info)
+    except Exception as exc:
+        if stateless:
+            for name in ("request.json", "stdin"):
+                (directory / name).unlink(missing_ok=True)
+            save(directory / "exit.json", {
+                "exit_code": 125, "ended": time.time(), "status": "unresolved",
+                "unresolved": True, "error": type(exc).__name__,
+                "cleanup_error": "Stateless slot preparation did not complete",
+            })
         raise
+    if not stateless:
+        record["started"] = time.time()
+        if cleanup is not None:
+            record["cleanup"] = cleanup
+        publish_run(directory, record, request)
     try:
         # The supervisor uses the same lock before it publishes its PID.  The
         # parent therefore cannot overwrite its phase/PID journal update.
@@ -1314,8 +1486,10 @@ def start(request):
     except Exception as exc:
         record.update({"phase": "launch_failed", "error": type(exc).__name__})
         save(directory / "record.json", record)
+        for name in ("request.json", "stdin"):
+            (directory / name).unlink(missing_ok=True)
         clean_run_state(info)
-        (directory / "request.json").unlink(missing_ok=True)
+        clean_stateless_home(info)
         save(
             directory / "exit.json",
             {
@@ -1423,6 +1597,10 @@ def supervise(run_id):
         "FIRM_RUN_ID": run_id,
         "FIRM_STATE_DIR": info["state"],
     }
+    if info.get("stateless"):
+        for name in ("DBUS_SESSION_BUS_ADDRESS", "DOCKER_HOST", "DOCKER_CONFIG"):
+            environment.pop(name, None)
+        environment["XDG_RUNTIME_DIR"] = info["home"] + "/.runtime"
     # An organizational run works in its workspace on the drive; anything else
     # stays in its private work directory.
     cwd = f"{info['home']}/work"
@@ -1443,7 +1621,8 @@ def supervise(run_id):
                 try:
                     if request.get("drive") is not None:
                         mount_drive(info, request["drive"])
-                    start_services(info, environment)
+                    if not info.get("stateless"):
+                        start_services(info, environment)
                 except LaunchError:
                     launch_failed = True
                     raise
@@ -1470,7 +1649,8 @@ def supervise(run_id):
                     # the working directory is entered by this root supervisor, which
                     # only changes directory there and opens nothing.
                     process = privileged.spawn(
-                        role_scope(info, request["argv"]),
+                        (stateless_command(info, request, environment, cwd)
+                         if info.get("stateless") else role_scope(info, request["argv"])),
                         env=environment,
                         cwd=cwd,
                         stdin=source,
@@ -1505,6 +1685,7 @@ def supervise(run_id):
                     settle_run(info, directory)
                     unmount_drive(info)
                     clean_run_state(info)
+                    clean_stateless_home(info)
                 except Exception as exc:
                     cleanup_error = str(exc)
                 settlement = read_settlement(directory)
@@ -1627,6 +1808,8 @@ def start_child(request):
             raise ValueError("Child deadline has passed")
         execution = json.loads((run_path(parent_id) / "execution.json").read_text())
         info = execution["info"]
+        if info.get("stateless"):
+            raise ValueError("Stateless runs cannot launch task children")
         record = {
             "run_id": child_id,
             "parent_run_id": parent_id,
@@ -1968,11 +2151,17 @@ def stop_run(run_id):
     with run_lock(run_id):
         record = status(run_id)
         if record.get("running") or record.get("unresolved"):
+            if record.get("unresolved"):
+                # An orphaned pre-launch journal must not retain credential-bearing
+                # input while a failed filesystem cleanup keeps the slot quarantined.
+                for name in ("request.json", "stdin"):
+                    (directory / name).unlink(missing_ok=True)
             info = role_record(record["role_id"])
             settlement = settle_run(info, directory)
             if record.get("unresolved"):
                 unmount_drive(info)
                 clean_run_state(info)
+                clean_stateless_home(info)
                 for name in ("request.json", "stdin"):
                     (directory / name).unlink(missing_ok=True)
                 save(
@@ -2042,6 +2231,11 @@ def retire_role(role_id):
 def dispose_account(info):
     """Explicit disposal under the controller global lock."""
     receipt = {}
+    if info is not None and info.get("stateless"):
+        settle(info)
+        clean_run_state(info)
+        clean_stateless_home(info)
+        return {"categories": {}}
     if info is not None and "uid" in info:
         try:
             deadline = time.monotonic() + DISPOSE_DAEMON_TIMEOUT
@@ -2557,7 +2751,9 @@ def main():
         return
     if sys.argv[1:] == ["--reclaim-scratch"]:
         request = json.load(sys.stdin)
-        print(json.dumps(reclaim_scratch(request["info"], request["deadline"])))
+        print(json.dumps(reclaim_scratch(
+            request["info"], request["deadline"], entire_home=request.get("entire_home", False)
+        )))
         return
     streaming = False
     try:

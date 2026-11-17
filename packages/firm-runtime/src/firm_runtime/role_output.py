@@ -45,7 +45,10 @@ _INTERNAL = {
     "mandate_revision",
     "access_on_activation",
     "related_actions",
-    "seen_sequence",
+    "observed_sequence",
+    "conversation_id",
+    "continues",
+    "offered_message_ids",
 }
 
 
@@ -143,41 +146,44 @@ def _awareness(context: dict) -> list[str]:
     return lines
 
 
+def _with(participants, omitted=0):
+    names = ", ".join(person(p) for p in participants) or render("results", "inbox_with_yourself")
+    return names + (f" and {omitted} more" if omitted else "")
+
+
+def _count(count: int, noun: str) -> str:
+    return f"{count} {noun}" + ("" if count == 1 else "s")
+
+
 def render_inbox(result: dict) -> str:
-    """Render real mail and consequential controls; an empty overview is empty text."""
     lines = []
-    pending = result.get("pending_count", 0)
-    if pending:
-        lines.append(f"Inbox: {pending} pending message{'s' if pending != 1 else ''}.")
-    for conversation in result.get("conversations", []):
-        others = [person(p) for p in conversation.get("participants", [])]
-        with_whom = ", ".join(others) if others else render("results", "inbox_with_yourself")
-        if conversation.get("participants_omitted"):
-            with_whom += f" and {conversation['participants_omitted']} more"
-        lines.append(
-            f"- {conversation['conversation_id']} · with {with_whom}"
-            f" · {conversation['pending_count']} waiting"
-        )
-        for header in conversation.get("waiting", []):
-            lines.append(
-                f"  {header['message_id']} · {person(header['sender'])}: {header['subject']}"
-            )
-        if conversation.get("waiting_omitted"):
-            lines.append(
-                "  "
-                + render(
-                    "results",
-                    "inbox_more_waiting",
-                    count=conversation["waiting_omitted"],
-                    conversation_id=conversation["conversation_id"],
-                )
-            )
-    if result.get("omitted_rows"):
-        lines.append(f"{result['omitted_rows']} conversations omitted.")
-    if result.get("next_cursor") is not None:
-        lines.append(render("results", "inbox_continue", cursor=repr(result["next_cursor"])))
+    if result.get("newly_offered"):
+        lines.append("Newly offered mail for idle review (filtered snapshot).")
+    unread = result.get("unread_count", 0)
+    if unread:
+        newest = (f" · newest {result['newest_message_id']}"
+                  if not result.get("newly_offered") and result.get("newest_message_id") else "")
+        lines.append(f"Inbox: {_count(result['thread_count'], 'thread')}"
+                     f" · {_count(unread, 'unread message')}{newest}.")
+    else:
+        lines.append(render("results", "no_unread_mail"))
+    for thread in result.get("threads", []):
+        title = thread["subject"] or "No subject"
+        flag = "Action" if thread["action_required"] else "FYI"
+        lines.extend(["", f"{thread['message_id']} · {title} · {flag}"
+                      f" · {thread['unread_count']} unread",
+                      "      With: " + _with(thread["participants"],
+                                               thread.get("participants_omitted", 0))])
+        last = person(thread["last_author"])
+        if thread.get("preview"):
+            last += ": " + thread["preview"]
+        lines.append("      Last message: " + last)
+    if result.get("omitted_threads"):
+        key = "inbox_omitted_one" if result["omitted_threads"] == 1 else "inbox_omitted"
+        lines.append(render("results", key, count=result["omitted_threads"]))
     lines.extend(_awareness(result.get("context", {})))
     lines.extend(_controls(result))
+    lines.extend(_mail_waiting(result))
     return "\n".join(lines)
 
 
@@ -219,60 +225,73 @@ def _details(value, *, key: str = "") -> list[str]:
     return [str(value)]
 
 
-def _messages(messages: list[dict]) -> list[str]:
+def _messages(messages: list[dict], reader_id: str) -> list[str]:
     lines = []
     for message in messages:
-        lines.append(
-            f"{message['message_id']} · Conversation {message['conversation_id']}"
-            f" · From {person(message['author'])}"
-            f" · {_time(message['created_at'])}\nSubject: {message['subject']}"
-        )
-        lines.append("To: " + ", ".join(person(p) for p in message.get("recipients", [])))
-        if message.get("reply_to"):
-            lines.append(f"In reply to {message['reply_to']}")
-        lines.append(message["body"])
-        attachments = message.get("attachments", [])
-        if attachments:
-            lines.append("Attachments (relative to your drive; prepend its path to open):")
-            lines.extend(f"- {item['path']}/{item['name']}" for item in attachments)
+        recipients = message.get("recipients", [])
+        action = any(p.get("employee_id") == reader_id and p.get("action_required")
+                     for p in recipients)
+        flag = ("" if message["author"]["employee_id"] == reader_id
+                else f" · {'Action' if action else 'FYI'}")
+        lines.extend(["", f"{message['message_id']} · {person(message['author'])}"
+                      f"{flag} · {_time(message['created_at'])}"])
+        asked = [p for p in recipients if p.get("action_required")]
+        if any(p.get("employee_id") != reader_id for p in asked):
+            lines.append("Asked to act: " + ", ".join(
+                "you" if p.get("employee_id") == reader_id else person(p) for p in asked
+            ))
         if message.get("summary"):
             lines.append(render("results", "summary_label") + "\n" + message["summary"])
+            lines.append("End of generated context. The sender's introduction follows.")
+        lines.append(message["body"])
+        if message.get("attachments"):
+            lines.append("Attachments (relative to your drive; prepend its path to open):")
+            lines.extend(f"- {item['path']}/{item['name']}" for item in message["attachments"])
     return lines
 
 
-def _disposition(name: str, result: dict) -> list[str]:
-    """Claim, dismiss and clear: what was read or set aside, and why nothing was."""
-    status = result.get("status")
-    if status == "claimed":
-        lines = [render("results", "claim_reading"), *_messages(result["messages"])]
-        if result.get("remaining"):
-            lines.append(
-                render(
-                    "results",
-                    "claim_remaining",
-                    count=result["remaining"],
-                    conversation_id=result["conversation_id"],
-                )
-            )
-        return lines
-    if status == "dismissed":
-        return [render("results", "dismissed", count=len(result["message_ids"]))]
-    if status == "cleared":
-        cleared = "; ".join(
-            f"{item['conversation_id']} ({', '.join(item['message_ids'])})"
-            for item in result["conversations"]
-        )
-        return [render("results", "cleared", count=result["count"], conversations=cleared)]
-    if result.get("reason") == "no_peek":
-        return [render("results", "disposition_needs_peek", operation=name)]
-    if result.get("reason") == "nothing_waiting":
-        return [render("results", "nothing_waiting", operation=name)]
-    return _details(result)
+def _reading(result: dict) -> list[str]:
+    boundary = result["message_id"]
+    lines = [result["subject"] or "No subject", "With: " + _with(result["participants"])]
+    if result["status"] == "dismissed":
+        count = len(result["message_ids"])
+        lines.append(f"Dismissed {_count(count, 'unread message')} through {boundary}."
+                     if count else f"No unread mail through {boundary}.")
+    else:
+        reread = result.get("reread")
+        summary = result.get("summary")
+        if summary is not None:
+            count = len(result["covered_ids"])
+            lines.extend([f"Generated summary · "
+                          f"{_count(count, 'message' if reread else 'unread message')}"
+                          f" through {boundary}",
+                          "", summary])
+        elif reread:
+            lines.append("Sent by you." if result.get("sent_by_you") else "Already read.")
+        else:
+            lines.append(f"Reading unread messages through {boundary}.")
+        if summary is None:
+            lines.extend(_messages(result["messages"], result["reader_id"]))
+        marked = result["marked_read"]
+        if marked:
+            label = (f"{_count(len(marked), 'message')} covered by this summary "
+                     f"({', '.join(marked)})"
+                     if summary is not None else ", ".join(marked))
+            lines.extend(["", "Marked read: " + label])
+        elif summary is not None and result.get("covered_ids"):
+            lines.extend(["", "Covered by this summary: " + ", ".join(result["covered_ids"])])
+    lines.append(f"Unread remaining through {boundary}: {result['remaining']}")
+    if result["remaining"]:
+        suffix = ", summarize=True" if result.get("summary") is not None else ""
+        lines.append(f'Continue: read(message_id="{boundary}"{suffix})')
+    return lines
 
 
 def _delivery(result: dict) -> list[str]:
     """One queued line, one line per failed recipient, and a lookup hint on any failure."""
     message_id = result["message_id"]
+    if result.get("replayed"):
+        return [render("results", "mail_replayed", message_id=message_id)]
     queued = [_recipient(item) for item in result.get("queued", [])]
     if queued:
         names = queued[0] if len(queued) == 1 else ", ".join(queued[:-1]) + " and " + queued[-1]
@@ -291,27 +310,19 @@ def _delivery(result: dict) -> list[str]:
         )
     if failed:
         lines.append(render("results", "mail_find_recipient"))
-    if result.get("continues"):
-        lines.append(
-            render(
-                "results",
-                "conversation_continues",
-                conversation_id=result["conversation_id"],
-                continues=result["continues"],
-            )
-        )
     summary = result.get("summary")
-    if isinstance(summary, dict):
-        if summary.get("status") == "attached":
-            lines.append(render("results", "summary_attached"))
-        else:
-            lines.append(render("results", "summary_unavailable", reason=summary.get("reason")))
+    if isinstance(summary, dict) and summary.get("status") == "attached":
+        lines.append(render("results", "summary_attached"))
     return ["\n".join(lines)]
 
 
 def _recipient(value: dict) -> str:
     """The address as the sender wrote it, or the role's address when the audience named it."""
-    return person(value.get("reference") or value.get("address") or value["employee_id"])
+    label = person(value.get("reference") or value.get("address") or value["employee_id"])
+    if "action_required" in value:
+        label += (" [Action requested]" if value["action_required"]
+                  else " [FYI; no new work period requested]")
+    return label
 
 
 def _workspace(workspace: dict) -> list[str]:
@@ -327,7 +338,7 @@ def _workspace(workspace: dict) -> list[str]:
 
 def render_tool_result(name: str, result: dict) -> str:
     if name == "peek":
-        return render_inbox(result) or render("results", "no_pending_mail")
+        return render_inbox(result) or render("results", "no_unread_mail")
     if name == "handoff" and result.get("next") in {"continue", "wait"}:
         saved = render("controls", "saved")
         lines = _controls(
@@ -354,12 +365,17 @@ def render_tool_result(name: str, result: dict) -> str:
     elif name == "task":
         lines = [result["answer"] if result["status"] == "completed"
                  else "unavailable: " + result["reason"]]
-    elif name in {"send", "reply"} and result.get("status") == "sent":
+    elif name in {"send", "reply", "introduce"} and result.get("status") == "sent":
         lines = _delivery(result)
-    elif name == "messages" and "messages" in result:
-        lines = _messages(result["messages"])
-    elif name in {"claim", "dismiss", "clear"} and result.get("status") != "blocked":
-        lines = _disposition(name, result)
+    elif name in {"read", "dismiss"} and result.get("status") != "blocked":
+        lines = _reading(result)
+    elif name == "clear":
+        boundary = result["message_id"]
+        count = result["cleared_count"]
+        lines = ([f"Cleared {_count(count, 'unread message')} in "
+                  f"{_count(result['thread_count'], 'thread')} through {boundary}.",
+                  f"Unread remaining: {result['remaining']}"]
+                 if count else [f"Nothing unread through {boundary}."])
     elif name == "revise_mandate":
         lines = [
             render(
@@ -438,4 +454,5 @@ def render_tool_result(name: str, result: dict) -> str:
     if not (name == "handoff" and result.get("next") in {"continue", "wait"}):
         lines.extend(_controls(result))
         lines.extend(_mail_waiting(result))
-    return "\n\n".join(lines) or render("results", "done")
+    separator = "\n" if name in {"read", "dismiss", "clear"} else "\n\n"
+    return separator.join(lines) or render("results", "done")

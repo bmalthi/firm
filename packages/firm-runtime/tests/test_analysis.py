@@ -15,7 +15,6 @@ from firm_runtime.analysis import (
     disk_state,
 )
 from firm_runtime.analysis_history import RESOURCE_INTERVAL
-from firm_runtime.compatibility import initialize_firm
 from firm_runtime.console import build_console_app
 from firm_runtime.errors import FirmError
 from firm_runtime.provider_contract import ProviderUsage
@@ -27,7 +26,6 @@ from firm_runtime.summaries import ContextSnapshot, SummaryOutput
 @pytest.fixture
 def system(tmp_path):
     now = [1000.0]
-    initialize_firm(tmp_path)
     runtime = Runtime(Store(tmp_path / "durable" / "firm.sqlite3", clock=lambda: now[0]))
     runtime.lifecycle.initialize(
         "analysis-test",
@@ -97,7 +95,7 @@ def test_read_only_export_missing_storage_and_secret_allowlist(system, monkeypat
     with runtime.store.transaction() as db:
         db.execute(
             "INSERT INTO execution_incidents "
-            "VALUES('expired','account','a','quota',900,800,NULL,NULL)"
+            "VALUES('expired','account','a','quota',900,800,NULL,NULL,NULL)"
         )
         analysis_history.record(db, 1001, "role.held", "founder", secret="must-not-export")
     before = dump(runtime)
@@ -176,7 +174,7 @@ def test_usage_resumed_session_partial_counters_and_identity(system):
     runtime.record_usage(first.activation_id, usage)
     now[0] = 1010
     runtime.finish(first.activation_id)
-    runtime.messaging.send(OWNER, ["founder"], "More", request_id="more")
+    runtime.owner.send_mail(OWNER, ["founder"], "More", request_id="more")
     now[0] = 1100
     second = runtime.admit()
     runtime.mark_started(second.activation_id)
@@ -220,7 +218,7 @@ def test_usage_resolved_models_follow_execution_evidence_and_window(system):
     for index, model in enumerate(("claude-opus-4-1", "claude-opus-4-6", None)):
         if index:
             runtime.finish(current.activation_id)
-            runtime.messaging.send(OWNER, ["founder"], "More", request_id=f"more-{index}")
+            runtime.owner.send_mail(OWNER, ["founder"], "More", request_id=f"more-{index}")
             now[0] += 100
             current = runtime.admit()
             runtime.mark_started(current.activation_id)
@@ -229,7 +227,7 @@ def test_usage_resolved_models_follow_execution_evidence_and_window(system):
         runtime.record_usage(current.activation_id, parse_usage(json.dumps(event)))
     # An execution without any usage evidence is also unknown.
     runtime.finish(current.activation_id)
-    runtime.messaging.send(OWNER, ["founder"], "More", request_id="unmeasured")
+    runtime.owner.send_mail(OWNER, ["founder"], "More", request_id="unmeasured")
     now[0] += 100
     current = runtime.admit()
     runtime.mark_started(current.activation_id)
@@ -344,17 +342,17 @@ def test_deliveries_claim_latency_old_backlog_and_bounded_detail(system):
         ]
         for i in range(2)
     ]
-    old = runtime.messaging.send(OWNER, [children[0]], "old", request_id="old")
+    old = runtime.owner.send_mail(OWNER, [children[0]], "old", request_id="old")
     now[0] = 1100
-    message = runtime.messaging.send(
-        OWNER, ["founder", *children], "<script>literal</script>", request_id="multi"
+    message = runtime.owner.send_mail(
+        OWNER, ["founder", *children], "<script>literal</script>", request_id="multi",
     )
     now[0] = 1120
-    runtime.tools(first.token).claim("claim", [message["message_id"]])
+    runtime.tools(first.token).read(message["message_id"])
     data = reader.read("conversations", from_at=1050, until=1200)
     assert data["message_count"] == 1 and data["delivery_count"] == 3
-    assert data["claim_delay"]["median_seconds"] == 20
-    assert data["claim_delay"]["samples"] == 1
+    assert data["read_delay"]["median_seconds"] == 20
+    assert data["read_delay"]["samples"] == 1
     assert data["pending_deliveries_from_before_window"] == 1
     assert any(r.get("message_id") == old["message_id"] for r in data["rows"])
     waiting = {r["employee_id"]: r["pending_mail"] for r in read(reader, "readiness")["rows"]}
@@ -371,14 +369,14 @@ def test_deliveries_claim_latency_old_backlog_and_bounded_detail(system):
 def test_claims_split_by_whether_the_work_period_had_already_started(system):
     runtime, now, reader = system
     now[0] = 900
-    waiting = runtime.messaging.send(OWNER, ["founder"], "before", request_id="before")
+    runtime.owner.send_mail(OWNER, ["founder"], "before", request_id="before")
     now[0] = 1000
     invocation = start(runtime)
     now[0] = 1100
-    during = runtime.messaging.send(OWNER, ["founder"], "during", request_id="during")
+    during = runtime.owner.send_mail(OWNER, ["founder"], "during", request_id="during")
     now[0] = 1150
-    runtime.tools(invocation.token).claim("claim", [waiting["message_id"], during["message_id"]])
-    split = read(reader, "conversations")["claims_by_arrival"]
+    runtime.tools(invocation.token).read(during["message_id"])
+    split = read(reader, "conversations")["reads_by_arrival"]
     assert split["while_running"]["samples"] == 1
     assert split["while_running"]["median_seconds"] == 50
     assert split["before_work_period"]["samples"] == 1
@@ -391,16 +389,16 @@ def test_waiting_mail_notice_is_recorded_and_timed_against_the_claim(system):
     invocation = start(runtime)
     tools = runtime.tools(invocation.token)
     now[0] = 1100
-    message = runtime.messaging.send(OWNER, ["founder"], "during", request_id="during")
+    message = runtime.owner.send_mail(OWNER, ["founder"], "during", request_id="during")
     now[0] = 1120
     announced = tools.list_reminders()
     assert announced["mail_waiting"]["senders"][0][1] == 1
     now[0] = 1160
-    tools.claim("claim", [message["message_id"]])
-    split = read(reader, "conversations")["claims_by_arrival"]
+    tools.read(message["message_id"])
+    split = read(reader, "conversations")["reads_by_arrival"]
     assert split["after_notice"]["samples"] == 1
     assert split["after_notice"]["median_seconds"] == 40
-    assert split["claimed_without_notice"] == 0
+    assert split["read_without_notice"] == 0
     assert split["while_running"]["median_seconds"] == 60
     assert any(r.get("kind") == "mail.presented" for r in read(reader, "timeline")["rows"])
 
@@ -417,12 +415,13 @@ def test_owner_inbox_lists_pending_mail_with_bodies_and_author_labels(system):
             ("# Profile\n\n**Public name:** Wren Calloway\n", analyst),
         )
     waiting = runtime.messaging.send(
-        analyst, ["owner"], "Need a decision on the drive", subject="Decision", request_id="ask"
+        analyst, ["owner"], [], "Need a decision on the drive", subject="Decision",
+        request_id="ask",
     )
-    claimed = runtime.messaging.send(analyst, ["owner"], "Already read", request_id="read")
-    dismissed = runtime.messaging.send(analyst, ["owner"], "Not interesting", request_id="skip")
-    runtime.messaging.claim(OWNER, [claimed["message_id"]], request_id="claim")
-    runtime.messaging.dismiss(OWNER, [dismissed["message_id"]], request_id="dismiss")
+    claimed = runtime.messaging.send(analyst, ["owner"], [], "Already read", request_id="read")
+    dismissed = runtime.messaging.send(analyst, ["owner"], [], "Not interesting", request_id="skip")
+    runtime.messaging.read(OWNER, claimed["message_id"])
+    runtime.messaging.dismiss_exact(OWNER, [dismissed["message_id"]], request_id="dismiss")
     now[0] = 1300
     data = read(reader, "inbox")
     assert [row["message_id"] for row in data["rows"]] == [waiting["message_id"]]
@@ -447,7 +446,9 @@ def test_owner_inbox_pages_like_other_sections(system):
     runtime, _, reader = system
     start(runtime)
     sent = [
-        runtime.messaging.send("founder", ["owner"], f"Item {index}", request_id=f"mail{index}")[
+        runtime.messaging.send(
+            "founder", ["owner"], [], f"Item {index}", request_id=f"mail{index}",
+        )[
             "message_id"
         ]
         for index in range(3)
@@ -470,7 +471,7 @@ def test_reminders_and_expired_incidents_are_observed_without_release(system):
     with runtime.store.transaction() as db:
         db.execute(
             "INSERT INTO execution_incidents "
-            "VALUES('expired','account','a','quota',1100,1000,NULL,NULL)"
+            "VALUES('expired','account','a','quota',1100,1000,NULL,NULL,NULL)"
         )
     before = dump(runtime)
     row = read(reader, "readiness")["rows"][0]
@@ -1354,6 +1355,23 @@ def test_readiness_fallback_summary_occupancy_and_low_quota(system):
     assert runtime.admit() is not None
 
 
+@pytest.mark.parametrize(
+    "scope,dependency,reason",
+    [("profile", "main", "profile_quota_hold"), ("account", "a", "account_quota_hold")],
+)
+def test_quota_incident_reason_names_the_scope_that_is_paused(system, scope, dependency, reason):
+    runtime, now, reader = system
+    runtime.start()
+    runtime.accounts.pause(OWNER, scope, dependency, "quota", until=now[0] + 600)
+    row = read(reader, "readiness")["rows"][0]
+    assert reason in row["reasons"]
+    assert all(
+        other not in row["reasons"]
+        for other in {"profile_quota_hold", "account_quota_hold"} - {reason}
+    )
+    assert row["account_options"][0]["blockers"] == [reason]
+
+
 def test_overview_names_low_machines_without_blocking_any_role(system):
     runtime, now, reader = system
     before = read(reader, "readiness")["rows"][0]
@@ -1433,7 +1451,7 @@ def test_representative_analysis_volume(system):
             [(f"s{i}-{j}", f"scale{j}") for i in range(200) for j in range(5)],
         )
         db.executemany(
-            "INSERT INTO conversations VALUES(?,?,?,'[]',NULL,1000)",
+            "INSERT INTO conversations VALUES(?,?,?,NULL,'[]',NULL,1000)",
             [(f"x{i}", i + 1, f'["x{i}"]') for i in range(2000)],
         )
         db.executemany(
@@ -1555,16 +1573,15 @@ def test_conversations_report_undeliverable_mail_without_bodies(system):
     other = runtime.lifecycle.hire("founder", "other", "Work", "main", request_id="hire2")[
         "employee_id"
     ]
-    opening = runtime.messaging.send(
-        OWNER, ["founder", analyst], "Plan", subject="Plan", request_id="opening"
+    opening = runtime.owner.send_mail(
+        OWNER, ["founder", analyst], "Plan", subject="Plan", request_id="opening",
     )
+    runtime.messaging.introduce(analyst, opening["message_id"], [other], [], False,
+                                "Adding a reader.", request_id="widen")
     runtime.messaging.reply(
-        analyst, opening["message_id"], "Adding a reader.", add=[other], request_id="widen"
+        "founder", opening["message_id"], [], "confidential draft", request_id="draft",
     )
-    runtime.messaging.reply(
-        "founder", opening["message_id"], "confidential draft", request_id="draft"
-    )
-    stranded = runtime.messaging.send(OWNER, [other], "For you", request_id="stranded")
+    stranded = runtime.owner.send_mail(OWNER, [other], "For you", request_id="stranded")
     runtime.lifecycle.fire("founder", other, reason="done", request_id="fire")
     now[0] = 1200
     data = read(reader, "conversations")
@@ -1590,8 +1607,8 @@ def test_new_evidence_never_carries_bodies_notes_or_tool_arguments(system):
     analyst = runtime.lifecycle.hire(
         "founder", "analyst", "Keep this mandate", "main", request_id="hire"
     )["employee_id"]
-    runtime.messaging.send(
-        OWNER, ["founder", analyst], "message body", subject="Plan", request_id="note"
+    runtime.owner.send_mail(
+        OWNER, ["founder", analyst], "message body", subject="Plan", request_id="note",
     )
     runtime.tools(invocation.token).handoff("secret notes", "wait", "handoff")
     tally(runtime, invocation.activation_id, {"Bash": 3, "mcp__firm__send": 1})
@@ -1616,7 +1633,7 @@ def test_new_evidence_never_carries_bodies_notes_or_tool_arguments(system):
 def disk_mails(runtime):
     with runtime.store.read() as db:
         return [dict(row) for row in db.execute(
-            "SELECT * FROM messages WHERE subject LIKE 'Linux disk %' ORDER BY sequence")]
+            "SELECT * FROM messages WHERE body LIKE 'Linux disk %\n\n%' ORDER BY sequence")]
 
 
 def record_linux_disk(runtime, now, used, *, config=None):
@@ -1637,13 +1654,16 @@ def test_linux_owner_disk_mail_hysteresis_and_reentry(system):
         (81, ["low", "recovered"]), (85, ["low", "recovered", "low"]),
     ]:
         record_linux_disk(runtime, now[0], used, config="/firm/sandbox.toml")
-        assert [m["subject"] for m in disk_mails(runtime)] == [
+        assert [m["body"].splitlines()[0] for m in disk_mails(runtime)] == [
             "Linux disk " + subject for subject in subjects]
         now[0] += 600
     low, recovery, _ = disk_mails(runtime)
     assert [r["employee_id"] for r in json.loads(low["recipients_json"])] == ["owner"]
     assert low["author_id"] == OPERATIONS
+    assert low["subject"] is recovery["subject"] is None
+    assert low["conversation_id"] == recovery["conversation_id"]
     assert low["body"] == (
+        "Linux disk low\n\n"
         "The firm's Linux disk is 85% used (15.0 GiB free). Roles have been told and asked "
         "to delete what they no longer need; give them a work period or two before acting "
         "yourself. To see each role's usage with its sandbox role ID (r- followed by the "
@@ -1654,6 +1674,7 @@ def test_linux_owner_disk_mail_hysteresis_and_reentry(system):
         "is gone."
     )
     assert recovery["body"] == (
+        "Linux disk recovered\n\n"
         "The firm's Linux disk is back to 79% used (21.0 GiB free). No action is needed.")
 
 
@@ -1672,7 +1693,7 @@ def test_linux_owner_disk_mail_ignores_unknown_and_other_machines(system):
     # Persisted alert state survives a gap in sampling.
     now[0] += 181
     record_linux_disk(runtime, now[0], 90)
-    assert [m["subject"] for m in disk_mails(runtime)] == ["Linux disk low"]
+    assert [m["body"].splitlines()[0] for m in disk_mails(runtime)] == ["Linux disk low"]
 
 
 def test_linux_owner_disk_notice_and_sample_commit_together(system):
@@ -1684,7 +1705,7 @@ def test_linux_owner_disk_notice_and_sample_commit_together(system):
                 notice=runtime.messaging.notice)
             assert db.execute("SELECT COUNT(*) FROM resource_samples").fetchone()[0] == 1
             assert db.execute(
-                "SELECT COUNT(*) FROM messages WHERE subject='Linux disk low'"
+                "SELECT COUNT(*) FROM messages WHERE body LIKE 'Linux disk low\n\n%'"
             ).fetchone()[0] == 1
             raise RuntimeError("rollback")
     assert disk_mails(runtime) == []
@@ -1722,7 +1743,7 @@ def test_disk_alert_survives_hours_in_band_and_restart_then_recovers_and_reenter
     for index in range(180):
         now[0] += 60
         record_linux_disk(runtime, now[0], 80 + index % 5)
-    assert [m["subject"] for m in disk_mails(runtime)] == ["Linux disk low"]
+    assert [m["body"].splitlines()[0] for m in disk_mails(runtime)] == ["Linux disk low"]
     now[0] += 86400
     sample = {"linux": {"disk_used_bytes": 90 * 1024**3, "disk_total_bytes": 100 * 1024**3}}
     analysis_history.AnalysisObserver(
@@ -1731,11 +1752,12 @@ def test_disk_alert_survives_hours_in_band_and_restart_then_recovers_and_reenter
     now[0] += 600
     record_linux_disk(runtime, now[0], 79.6)
     assert disk_mails(runtime)[-1]["body"] == (
+        "Linux disk recovered\n\n"
         "The firm's Linux disk is back to 79% used (20.4 GiB free). No action is needed.")
     now[0] += 600
     record_linux_disk(runtime, now[0], 90)
     record_linux_disk(runtime, now[0], None)
-    assert [m["subject"] for m in disk_mails(runtime)] == [
+    assert [m["body"].splitlines()[0] for m in disk_mails(runtime)] == [
         "Linux disk low", "Linux disk recovered", "Linux disk low"]
     with runtime.store.read() as db:
         assert analysis_history._linux_disk_alerted(db)
@@ -1831,3 +1853,29 @@ def test_real_guidance_operations_record_readable_timeline_events(system):
     payloads = {r["kind"]: r for r in rows}
     assert "Legal mandate" in json.dumps(payloads["guidance.chosen"])
     assert "removed" in json.dumps(payloads["guidance.removed"])
+
+
+def test_readiness_distinguishes_conditional_review_from_offered_pending_mail(system):
+    runtime, _, reader = system
+    first = start(runtime)
+    runtime.finish(first.activation_id)
+    result = runtime.owner.send_mail(
+        OWNER, ["founder"], "FYI", action_recipients=[], request_id="idle-fyi",
+    )
+    rows = read(reader, "readiness")["rows"]
+    founder = next(row for row in rows if row["employee_id"] == "founder")
+    assert "idle_inbox_review_available" in founder["reasons"]
+    assert founder["activity"] == "idle"
+    review = runtime.admit()
+    runtime.mark_started(review.activation_id)
+    runtime.finish(review.activation_id)
+    founder = next(row for row in read(reader, "readiness")["rows"]
+                   if row["employee_id"] == "founder")
+    assert "pending_mail_no_wake" in founder["reasons"]
+    assert "idle_inbox_review_available" not in founder["reasons"]
+    period = next(row for row in read(reader, "timeline")["rows"]
+                  if row.get("activation_id") == review.activation_id)
+    assert period["wake_reasons"][0]["reason"] == "idle_inbox_review"
+    assert runtime.messaging.peek("founder")["threads"][0]["message_id"] == (
+        result["message_id"]
+    )

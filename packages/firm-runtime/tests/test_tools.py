@@ -26,14 +26,15 @@ def test_retirement_revokes_all_live_role_tools_and_preserves_old_identity(tmp_p
     facade = runtime.tools(invocation.token)
     assert facade.get_role(role=founder)["role"]["employee_id"] == founder
     context_message = runtime.messaging.send(
-        analyst["employee_id"], [founder], "Context lookup", request_id="context-mail"
+        analyst["employee_id"], [founder], [], "Context lookup", request_id="context-mail",
     )
-    assert facade.context(context_message["conversation_id"])["status"] == "unavailable"
+    with pytest.raises(FirmError, match="summary unavailable"):
+        facade.read(context_message["message_id"], summarize=True)
     runtime.lifecycle.fire(founder, analyst["employee_id"], reason="Reorganize", request_id="fire")
     with pytest.raises(FirmError, match="expired"):
         facade.peek()
     with pytest.raises(FirmError, match="expired"):
-        facade.send([founder], "forged after retirement", "stale")
+        facade.send([founder], [], "forged after retirement")
     replacement = runtime.lifecycle.hire(founder, "analyst", "Rework", "default", request_id="new")
     assert replacement["employee_id"] != analyst["employee_id"]
     with pytest.raises(FirmError, match="expired"):

@@ -544,9 +544,9 @@ def launch_local_host(
 ) -> dict:
     """Start one detached host or reconnect to its still-live local console."""
     directory = Path(directory).resolve()
-    from .compatibility import validate_firm
+    from firm_sandbox.firm_paths import validate_firm_directories
 
-    validate_firm(directory)
+    validate_firm_directories(directory)
     durable = directory / "durable"
     durable.mkdir(mode=0o700, parents=True, exist_ok=True)
     record = durable / HOST_RECORD

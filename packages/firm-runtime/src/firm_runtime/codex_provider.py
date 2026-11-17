@@ -305,7 +305,8 @@ class CodexProvider:
             "-",
         ]
         return RunSpec(
-            role_id=summary_role_id(request.run_id),
+            role_id=summary_role_id(request.run_id, request.stateless_slot),
+            stateless=not task,
             run_id=request.run_id,
             argv=(layout.python, layout.credential("codex-launcher")),
             env={

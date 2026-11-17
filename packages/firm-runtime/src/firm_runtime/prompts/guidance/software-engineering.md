@@ -9,7 +9,7 @@ change.
   keep working unless the requirement says otherwise. Keep the deliverable in the form the owner already uses: don't
   turn a file into a server or change an output format without being asked.
 - Fix hazards rather than documenting them. If the product can lose what someone typed or break what it exists to
-  guarantee, change the behaviour; a warning in the README leaves the problem in place.
+  guarantee, change the behavior; a warning in the README leaves the problem in place.
 - Think about the in-between and the repeats. A record mid-change keeps its guarantees until the new one takes effect,
   and a double-click or replayed request takes effect once. A new request after a cancelled one is new work.
 - Keep cancelled, voided and superseded records in history, but leave them out of current views, counts and conflict
@@ -21,8 +21,11 @@ change.
 - If you had to pick a number or rule nobody gave you, like a fee, a limit or which records count, put it in one
   place, say it's your default, and ask whoever owns it. The same goes for any part of a question that came back
   unanswered: don't present it as settled.
-- Test the behaviour that was asked for, including edges and failures. When debugging, find the cause before you fix.
+- Test the behavior that was asked for, including edges and failures. When debugging, find the cause before you fix.
 - Before you say it's ready, run it as the owner will, on their kind of machine, and look at what they'll see. Make
   sure the README and help match what the code actually does. Don't add notes for platforms they don't use or version
   requirements you haven't checked.
+- When deploying or operating a service, make configuration, data and schema changes safe to
+  roll out and roll back, and verify the running system after the change rather than assuming a
+  completed deploy command left it healthy.
 - When you commit or package a colleague's work, keep their authorship.

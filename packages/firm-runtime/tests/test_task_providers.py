@@ -138,19 +138,31 @@ def test_real_task_builders_and_parsers_retain_usage(worker, outcome):
     assert stored["resolved_model"] == "reported-worker"
 
 
-def test_task_builder_configuration_failure_holds_bound_account(worker):
+def task_setup_notices(runtime, provider):
+    with runtime.store.read() as db:
+        return [row[0] for row in db.execute(
+            "SELECT body FROM messages WHERE body LIKE ?",
+            (f"Task workers cannot run on {provider}\n\n%",),
+        )]
+
+
+def test_task_builder_configuration_failure_refuses_the_task_and_holds_nothing(worker):
     runtime, caller, _, _, _, box, provider = worker
     with runtime.store.transaction() as db:
         config = runtime.accounts.config(db)
         config["task"][provider]["effort"] = "invalid-effort"
         db.execute("UPDATE firm SET config_json=?", (json.dumps(config),))
-    assert runtime.task_service.call(caller.token, "Inspect", "bad-setup") == {
-        "status": "unavailable", "reason": "configuration",
-    }
+    for request_id in ("bad-setup", "bad-setup-again"):
+        assert runtime.task_service.call(caller.token, "Inspect", request_id) == {
+            "status": "unavailable", "reason": "configuration",
+        }
     assert not box.calls
-    with runtime.store.read() as db:
-        hold = runtime.accounts._incident(db, "account", "a")
-    assert hold["kind"] == "config" and hold["resolved_at"] is None
+    # The task's own settings are wrong, not the account: roles on it keep running,
+    # and the owner is told once, not once per refused call.
+    assert runtime.accounts.status()["incidents"] == []
+    (body,) = task_setup_notices(runtime, provider)
+    assert "model worker-model" in body and f"[task.{provider}]" in body
+    assert "Nothing is paused" in body and "code not reported" not in body
 
 
 def test_task_workers_do_not_receive_the_roles_gemini_settings(worker, tmp_path):
@@ -175,6 +187,37 @@ def test_task_workers_do_not_receive_the_roles_gemini_settings(worker, tmp_path)
     assert result.result(3) == {"status": "completed", "answer": "Done"}
 
 
+def test_task_setup_and_task_output_report_the_same_rejection_once(worker, monkeypatch):
+    runtime, caller, runner, pool, _, box, provider = worker
+    refused = {"status": "unavailable", "reason": "configuration"}
+    # The provider rejects the task model in a run that exited by itself.
+    event = {"type": "error", "code": "model_not_found"}
+    box.output = logs(provider, partial=True) + b"\n" + json.dumps(event).encode()
+    result = pool.submit(runtime.task_service.call, caller.token, "Inspect", "rejected-run")
+    assert box.started.wait(2)
+    box.complete(task_rows(runtime)[0]["run_id"], code=1, reason="exited")
+    assert result.result(3) == refused
+
+    # The same model and code, refused before any launch.
+    def rejected(*_):
+        raise ProviderSetupError(category="config", code="model_not_found", message="rejected")
+
+    monkeypatch.setattr(runner, "build_spec", rejected)
+    assert runtime.task_service.call(caller.token, "Inspect", "rejected-setup") == refused
+    # Nothing shared is held at any scope, and the owner alone hears of it, once,
+    # at ordinary priority.
+    assert runtime.accounts.status()["incidents"] == []
+    with runtime.store.read() as db:
+        deliveries = [tuple(row) for row in db.execute(
+            "SELECT d.employee_id,d.scheduling_priority FROM messages m "
+            "JOIN message_deliveries d USING(message_id) WHERE m.body LIKE ?",
+            (f"Task workers cannot run on {provider}\n\n%",),
+        )]
+    assert deliveries == [("owner", 0)]
+    (body,) = task_setup_notices(runtime, provider)
+    assert "model worker-model" in body and "code model_not_found" in body
+
+
 @pytest.mark.parametrize("category", ["auth", "config", "quota"])
 @pytest.mark.parametrize("reason", ["exited", "timeout", "cancelled", "log_overflow",
                                    "interrupted", "launch_failed"])
@@ -189,15 +232,24 @@ def test_task_provider_failure_retains_usage_but_holds_only_on_exit(worker, cate
     result = pool.submit(runtime.task_service.call, caller.token, "Inspect", "provider-error")
     assert box.started.wait(2)
     box.complete(task_rows(runtime)[0]["run_id"], code=1, reason=reason)
-    expected = reason if reason in {"timeout", "cancelled", "log_overflow"} else "provider_failure"
+    # A worker that could not be set up is the task's own failure: it is refused as
+    # configuration, reported once, and holds nothing. Login and allowance failures
+    # are the account's, and pause it.
+    rejected_setup = (category, reason) == ("config", "exited")
+    expected = (
+        reason if reason in {"timeout", "cancelled", "log_overflow"}
+        else "configuration" if rejected_setup else "provider_failure"
+    )
     assert result.result(3) == {"status": "unavailable", "reason": expected}
     with runtime.store.read() as db:
         hold = runtime.accounts._incident(db, "account", "a")
-    if reason == "exited":
+    if reason == "exited" and category != "config":
         assert hold["kind"] == category
+        assert hold["code"] == event["code"]
         assert hold["until_at"] == (max(now[0] + 30, 5000) if category == "quota" else None)
     else:
         assert hold is None
+    assert len(task_setup_notices(runtime, provider)) == int(rejected_setup)
     assert task_rows(runtime)[0]["input_tokens"] == 23
 
 
@@ -206,7 +258,9 @@ def test_task_setup_error_holds_only_repairable_account_failures(worker, monkeyp
     runtime, caller, runner, _, _, box, _ = worker
 
     def unavailable(*_):
-        raise ProviderSetupError(category=category, code="credential_unavailable", message="failed")
+        raise ProviderSetupError(
+            category=category, code="credential_refresh_rejected", message="failed"
+        )
 
     monkeypatch.setattr(runner, "build_spec", unavailable)
     assert runtime.task_service.call(caller.token, "Inspect", "setup-error") == {
@@ -216,6 +270,7 @@ def test_task_setup_error_holds_only_repairable_account_failures(worker, monkeyp
     with runtime.store.read() as db:
         hold = runtime.accounts._incident(db, "account", "a")
     assert (hold["kind"] if hold else None) == ("auth" if category == "auth" else None)
+    assert (hold["code"] if hold else None) == ("credential_refresh_rejected" if hold else None)
 
 
 @pytest.mark.parametrize("parent_state", ["live", "ended", "stopping", "expired"])

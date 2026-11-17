@@ -348,29 +348,17 @@ def test_employee_birth_and_fresh_transition_inputs_are_attributed(tmp_path):
                 "private": "/home/agent", "scratch": "/home/agent/scratch", "workspace": "/work"
             },
             "handoff_notes": "Reconcile invoice 42 next.",
-            "recovery": {"cause": "host_restart", "recent_claims": []},
+            "recovery": {"cause": "host_restart", "recent_reads": []},
             "orientation": {
                 "direct_reports": [],
                 "top_level_roles": [{"address": "founder/sales"}],
                 "top_level_included": True,
             },
-            "inbox": {
-                "pending_count": 1,
-                "conversations": [
-                    {
-                        "conversation_id": "c1",
-                        "pending_count": 1,
-                        "participants": [{"address": "owner"}],
-                        "waiting": [
-                            {
-                                "message_id": "m1",
-                                "subject": "Month close",
-                                "sender": {"address": "owner"},
-                            }
-                        ],
-                    }
-                ],
-            },
+            "inbox": {"unread_count": 1, "thread_count": 1, "newest_message_id": "m1", "threads": [
+                {"message_id": "m1", "subject": "Month close", "unread_count": 1,
+                 "action_required": True, "participants": [{"address": "owner"}],
+                 "last_author": {"address": "owner"}},
+            ]},
         }
     )
     spec = provider(tmp_path).build_spec(

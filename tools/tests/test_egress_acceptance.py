@@ -243,10 +243,15 @@ def test_guest_parsers_read_rendered_tool_results():
     assert namespace["result_fields"]("Status: pending\n\nRequest id: q1") == {
         "status": "pending", "request_id": "q1",
     }
-    inbox = ("Inbox: 1 pending message.\n- c7 · with Operations · 1 waiting\n"
-             "  m12 · Operations: Access granted: example.com")
-    assert namespace["waiting_mail"](inbox) == [
-        {"message_id": "m12", "sender": "Operations", "subject": "Access granted: example.com"},
+    mail = ("No subject\nWith: Operations\nReading unread messages through m13.\n\n"
+            "m12 · Operations · Action · 2026-11-16T14:00:00+00:00\n"
+            "Access granted: example.com\n\nPrivate notice text.\n\n"
+            "m13 · Operations · FYI · 2026-11-16T14:00:01+00:00\n"
+            "Access declined: example.org\n\nOther notice text.\n\n"
+            "Marked read: m12, m13\nUnread remaining through m13: 0")
+    assert namespace["notice_titles"](mail) == [
+        {"message_id": "m12", "sender": "Operations", "title": "Access granted: example.com"},
+        {"message_id": "m13", "sender": "Operations", "title": "Access declined: example.org"},
     ]
 
 
@@ -262,9 +267,9 @@ def test_request_report_helpers():
         "exit": 56, "http": None, "connect": 403,
     }
     assert requests.curl_result(None) == {"exit": None, "http": None, "connect": None}
-    mail = [{"message_id": "m1", "sender": "Operations", "subject": "Access granted: example.com"}]
-    assert requests.has_subject(mail, "Access granted: example.com")
-    assert not requests.has_subject(mail, "Access declined: example.com")
+    mail = [{"message_id": "m1", "sender": "Operations", "title": "Access granted: example.com"}]
+    assert requests.has_title(mail, "Access granted: example.com")
+    assert not requests.has_title(mail, "Access declined: example.com")
     assert requests.refused_with_note({"status": "refused", "reason": "access_denied",
                                        "owner_note": requests.REASON})
     assert not requests.refused_with_note({"status": "pending", "request_id": "q3"})

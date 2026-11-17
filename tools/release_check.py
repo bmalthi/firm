@@ -525,9 +525,6 @@ def main(argv: list[str] | None = None) -> int:
             run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=ROOT).strip()
         ),
         "release": versions["firm-runtime"],
-        "compatibility_generation": __import__(
-            "firm_sandbox.compatibility", fromlist=["COMPATIBILITY_GENERATION"]
-        ).COMPATIBILITY_GENERATION,
         "artifact_sha256": dict(sorted(artifact_hashes.items())),
         "checks": checks,
         "tag": args.tag,

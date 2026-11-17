@@ -1,10 +1,13 @@
 """Role operations bind the caller to one live activation, inside each transaction."""
 
 import asyncio
+import hashlib
 import threading
 from typing import Annotated, Literal, TypedDict
 
 from pydantic import ConfigDict, Field
+
+from .store import encoded
 
 # Modifier keys the helper holds down while it posts an event.
 MODIFIERS = Annotated[
@@ -51,17 +54,11 @@ class RoleTools:
         *args,
         with_activation=False,
         with_token=False,
-        gate_claim=False,
         discovery=False,
         observes_inbox=False,
         **kwargs,
     ):
         with self.runtime.authorized(self.token) as actor:
-            if gate_claim and self.runtime.context.gate_claim(actor["activation_id"]):
-                return self.runtime.present_controls(
-                    actor["activation_id"],
-                    {"status": "blocked", "reason": "context_handoff_required"},
-                )
             if with_activation:
                 kwargs["activation_id"] = actor["activation_id"]
             if discovery:
@@ -76,97 +73,67 @@ class RoleTools:
                 actor["activation_id"], result, observed_inbox=observes_inbox
             )
 
+    def _mail(self, operation, arguments):
+        with self.runtime.authorized(self.token) as actor:
+            request_id = hashlib.sha256(encoded(
+                [actor["activation_id"], operation, arguments]
+            ).encode("utf-8")).hexdigest()
+            with self.runtime.store.read() as db:
+                prior = self.runtime.store.operation_result(db, actor["employee_id"], request_id)
+            kwargs = dict(arguments, request_id=request_id)
+            if operation != "introduce":
+                result = getattr(self.runtime.messaging, operation)(actor["employee_id"], **kwargs)
+            else:
+                kwargs.update(session_id=actor["session_id"], activation_id=actor["activation_id"])
+        if operation == "introduce":
+            result = self.runtime.messaging.introduce(actor["employee_id"], **kwargs)
+        if prior is not None:
+            result = {**result, "replayed": True}
+        return self.runtime.present_controls(actor["activation_id"], result)
+
     def send(
-        self, recipients: list[str], body: str, request_id: str,
+        self, to_action: list[str], to_fyi: list[str], body: str,
         subject: Annotated[str, Field(min_length=1, max_length=80)] | None = None,
         attachments: Annotated[list[str], Field(max_length=10)] | None = None,
     ) -> dict:
-        return self._call(
-            self.runtime.messaging.send, recipients, body, subject=subject,
-            attachments=attachments, request_id=request_id
-        )
+        return self._mail("send", dict(to_action=to_action, to_fyi=to_fyi, body=body,
+                                       subject=subject, attachments=attachments))
 
     def reply(
-        self,
-        message_id: str,
-        body: str,
-        request_id: str,
-        add: list[str] | None = None,
-        summarize: bool = False,
+        self, message_id: str, action: list[str], body: str,
         attachments: Annotated[list[str], Field(max_length=10)] | None = None,
     ) -> dict:
-        """Reply without holding authorization open: a summary may call a provider."""
+        return self._mail("reply", dict(message_id=message_id, action=action, body=body,
+                                        attachments=attachments))
+
+    def introduce(
+        self, message_id: str, add: list[str], action: list[str], body: str,
+        summarize: bool = False,
+    ) -> dict:
+        return self._mail("introduce", dict(message_id=message_id, add=add, action=action,
+                                            summarize=summarize, body=body))
+
+    def peek(self) -> dict:
+        return self._call(self.runtime.messaging.peek, with_activation=True, observes_inbox=True)
+
+    def read(self, message_id: str, summarize: bool = False) -> dict:
         with self.runtime.authorized(self.token) as actor:
-            pass
-        result = self.runtime.messaging.reply(
-            actor["employee_id"],
-            message_id,
-            body,
-            add=add,
-            summarize=summarize,
-            attachments=attachments,
-            request_id=request_id,
-            session_id=actor["session_id"],
-            activation_id=actor["activation_id"],
+            if self.runtime.context.gate_read(actor["activation_id"]):
+                return self.runtime.present_controls(
+                    actor["activation_id"],
+                    {"status": "blocked", "reason": "context_handoff_required"},
+                )
+        result = self.runtime.messaging.read(
+            actor["employee_id"], message_id, summarize,
+            activation_id=actor["activation_id"], session_id=actor["session_id"],
         )
         return self.runtime.present_controls(actor["activation_id"], result)
 
-    def peek(self, cursor: str | None = None, limit: int = 100) -> dict:
-        return self._call(
-            self.runtime.messaging.peek,
-            cursor=cursor,
-            limit=limit,
-            with_activation=True,
-            observes_inbox=True,
-        )
+    def dismiss(self, message_id: str) -> dict:
+        return self._call(self.runtime.messaging.dismiss, message_id, with_activation=True)
 
-    def claim(
-        self,
-        request_id: str,
-        message_ids: list[str] | None = None,
-        conversation: str | None = None,
-    ) -> dict:
-        return self._call(
-            self.runtime.messaging.claim,
-            message_ids,
-            conversation=conversation,
-            request_id=request_id,
-            with_activation=True,
-            gate_claim=True,
-        )
-
-    def dismiss(
-        self,
-        request_id: str,
-        message_ids: list[str] | None = None,
-        conversation: str | None = None,
-    ) -> dict:
-        return self._call(
-            self.runtime.messaging.dismiss,
-            message_ids,
-            conversation=conversation,
-            request_id=request_id,
-            with_activation=True,
-        )
-
-    def clear(self, request_id: str) -> dict:
-        return self._call(
-            self.runtime.messaging.clear, request_id=request_id, with_activation=True
-        )
-
-    def messages(self, message_ids: list[str]) -> dict:
-        return self._call(self.runtime.messaging.messages, message_ids, with_activation=True)
-
-    def context(self, conversation: str) -> dict:
-        """Request derived correspondence context without holding authorization open."""
-        with self.runtime.authorized(self.token) as actor:
-            # Record the incoming call, then release the transaction before
-            # summary work that may involve a provider.
-            pass
-        result = self.runtime.messaging.context(
-            actor["employee_id"], conversation, session_id=actor["session_id"]
-        )
-        return self.runtime.present_controls(actor["activation_id"], result)
+    def clear(self, message_id: str) -> dict:
+        return self._call(self.runtime.messaging.clear, message_id, with_activation=True)
 
     def set_reminder(self, due_at: float, note: str, request_id: str) -> dict:
         return self._call(self.runtime.reminders.set, due_at, note, request_id)

@@ -23,7 +23,6 @@ import uvicorn
 from firm_sandbox import Config, Layout, Organization
 from firm_sandbox.file_server import FileServer, local_runner
 
-from firm_runtime.compatibility import initialize_firm
 from firm_runtime.console import build_console_app
 from firm_runtime.runtime import Runtime
 from firm_runtime.store import OWNER, Store
@@ -136,7 +135,6 @@ def _start_trap(port: int):
 def _synthetic_firm(root: Path, allowed_host: str, exfil_url: str):
     durable = root / "durable"
     durable.mkdir(parents=True)
-    initialize_firm(root)
     runtime = Runtime(Store(durable / "firm.sqlite3"))
     founder = runtime.lifecycle.initialize(
         "browser-acceptance",
@@ -186,6 +184,7 @@ def _synthetic_firm(root: Path, allowed_host: str, exfil_url: str):
     runtime.messaging.send(
         analyst,
         [OWNER],
+        [],
         "Read this synthetic owner mail.",
         subject="A question for the owner",
         request_id="browser-owner-mail",
@@ -193,6 +192,7 @@ def _synthetic_firm(root: Path, allowed_host: str, exfil_url: str):
     runtime.messaging.send(
         analyst,
         [OWNER],
+        [],
         "This synthetic update can be marked done.",
         subject="An update for the owner",
         request_id="browser-owner-update",
@@ -286,13 +286,10 @@ Public evidence has not been checked against private data.
     control = SyntheticControl(runtime)
     app = build_console_app(runtime, allowed_host=allowed_host, sandbox=box, control=control)
     runtime.messaging.send(
-        analyst, [OWNER], "The shortlist is ready to read. Limitations are in the report.",
-        subject="Opportunity shortlist report delivered",
-        attachments=[
+        analyst, [OWNER], [], "The shortlist is ready to read. Limitations are in the report.",
+        subject="Opportunity shortlist report delivered", attachments=[
             f"{Layout.for_role(sandbox_role_id(analyst)).drive}/{work}/opportunity-shortlist.md"
-        ],
-        request_id="browser-report",
-    )
+        ], request_id="browser-report")
     return runtime, analyst, app, control
 
 
@@ -643,12 +640,20 @@ def main(argv: list[str] | None = None) -> None:
                 }
 
                 runtime.messaging.send(
-                    analyst, [OWNER], "An Inbox update to dismiss.",
-                    subject="Inbox dismissal probe", request_id="browser-inbox-dismiss",
+                    analyst,
+                    [OWNER],
+                    [],
+                    "An Inbox update to dismiss.",
+                    subject="Inbox dismissal probe",
+                    request_id="browser-inbox-dismiss",
                 )
                 runtime.messaging.send(
-                    analyst, [OWNER], "An Inbox question for an inline reply.",
-                    subject="Inbox reply probe", request_id="browser-inbox-reply",
+                    analyst,
+                    [OWNER],
+                    [],
+                    "An Inbox question for an inline reply.",
+                    subject="Inbox reply probe",
+                    request_id="browser-inbox-reply",
                 )
                 page.locator('#inbox-views button[data-view="new"]').click()
                 inbox_update = page.locator(".message-card").filter(
@@ -702,7 +707,10 @@ def main(argv: list[str] | None = None) -> None:
                 reply_button.focus()
                 # Also reorder the feed while preserving the focused card and refreshing metadata.
                 runtime.messaging.send(
-                    analyst, [OWNER], "A new message while Reply is focused",
+                    analyst,
+                    [OWNER],
+                    [],
+                    "A new message while Reply is focused",
                     request_id="browser-focus-refresh",
                 )
                 with page.expect_response(lambda r: "/api/messages?" in r.url):
@@ -967,14 +975,11 @@ def main(argv: list[str] | None = None) -> None:
                 read_handle = read_link.element_handle()
                 frame_handle = page.locator("#reader-frame").element_handle()
                 runtime.messaging.send(
-                    analyst, [OWNER], "Sharing this report again for reference.",
-                    subject="Report shared again",
-                    attachments=[
+                    analyst, [OWNER], [], "Sharing this report again for reference.",
+                    subject="Report shared again", attachments=[
                         f"{Layout.for_role(sandbox_role_id(analyst)).drive}/"
                         "org/founder/analyst/work/opportunity-shortlist.md"
-                    ],
-                    request_id="browser-report-again",
-                )
+                    ], request_id="browser-report-again")
                 expect(page.locator("#reader-about")).to_contain_text("Report shared again")
                 expect(page.locator("#result-list .result-card").first).to_contain_text(
                     "Report shared again"
@@ -1019,12 +1024,12 @@ def main(argv: list[str] | None = None) -> None:
                     page.locator("#send-form button[type=submit]").click()
                 assert followup.value.status == 200, followup.value.text()
                 sent_id = followup.value.json()["message_id"]
-                sent = runtime.messaging.messages(analyst, [sent_id])["messages"][0]
+                sent = runtime.messaging.read(analyst, sent_id)["messages"][0]
                 assert sent["body"] == "Expand the customs brokerage evidence."
                 assert sent["attachments"] == [{
                     "path": "org/founder/analyst/work", "name": "opportunity-shortlist.md",
                 }]
-                source = runtime.messaging.messages(analyst, [sent["reply_to"]])["messages"][0]
+                source = runtime.messaging.read(analyst, sent["reply_to"])["messages"][0]
                 assert sent["conversation_id"] == source["conversation_id"]
                 assert source["subject"] == "Opportunity shortlist report delivered"
                 evidence["checks"]["markdown_reader_and_attached_followup"] = {"passed": True}
@@ -1217,7 +1222,7 @@ def main(argv: list[str] | None = None) -> None:
                         f"Request now: {status.capitalize()}"
                     )
                     expect(request_notice.locator(".message-body")).to_have_text(
-                        "Immutable access notice."
+                        "Old access status probe\n\nImmutable access notice."
                     )
                 recent = page.request.get(base + "/api/requests").json()["recent"]
                 assert len(recent) == 50
@@ -1382,24 +1387,36 @@ def main(argv: list[str] | None = None) -> None:
                 )
                 for index in range(60):
                     runtime.messaging.send(
-                        analyst, [founder], f"Mixed-source role mail {index}",
-                        subject=f"Mixed-source role mail {index}", request_id=f"mixed-role-{index}",
+                        analyst,
+                        [founder],
+                        [],
+                        f"Mixed-source role mail {index}",
+                        subject=f"Mixed-source role mail {index}",
+                        request_id=f"mixed-role-{index}",
                     )
                 dismissed_ids = [
                     runtime.messaging.send(
-                        analyst, [OWNER], f"Excluded owner mail {index}",
-                        subject=f"Excluded owner mail {index}", request_id=f"mixed-owner-{index}",
+                        analyst,
+                        [OWNER],
+                        [],
+                        f"Excluded owner mail {index}",
+                        subject=f"Excluded owner mail {index}",
+                        request_id=f"mixed-owner-{index}",
                     )["message_id"]
                     for index in range(210)
                 ]
                 for offset in range(0, len(dismissed_ids), 100):
-                    runtime.messaging.dismiss(
+                    runtime.messaging.dismiss_exact(
                         OWNER, dismissed_ids[offset:offset + 100],
                         request_id=f"mixed-dismiss-{offset}",
                     )
                 runtime.messaging.send(
-                    analyst, [OWNER], "Mixed-source pending owner mail",
-                    subject="Mixed-source pending owner mail", request_id="mixed-pending",
+                    analyst,
+                    [OWNER],
+                    [],
+                    "Mixed-source pending owner mail",
+                    subject="Mixed-source pending owner mail",
+                    request_id="mixed-pending",
                 )
                 mixed = browser.new_page(viewport={"width": 1440, "height": 1000})
                 mixed.goto(f"{base}/unlock/{app.state.console_key}", wait_until="networkidle")

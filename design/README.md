@@ -8,7 +8,7 @@ While [docs/](../docs/) covers day-to-day setup and CLI flags, the four document
 | :--- | :--- |
 | **[Runtime (`runtime.md`)](runtime.md)** | Roles, hiring & automatic model tiering (`low`/`medium`/`high`), mandate authority, SQLite scheduling & priority queues, OAuth token renewal, failure recovery, search/discovery, owner requests, and the web console. |
 | **[Sandbox (`sandbox.md`)](sandbox.md)** | The persistent Linux VM, per-role `systemd` slices & rootless Docker, kernel `cgroup.events` settlement, the internal SMB file server (`smbd`) with reporting-line POSIX ACLs, the host packet filter & allowlist proxy, and leased Mac stations (`firmstation1..8`). |
-| **[Messaging (`messaging.md`)](messaging.md)** | Participant-set conversations (`c1`, `c2`), non-destructive peeks, atomic claims, sequence-watermarked `clear`, mid-turn mail hints, and isolated correspondence summaries. |
+| **[Messaging (`messaging.md`)](messaging.md)** | No-subject and named threads addressed by message ID, per-message action or FYI, non-destructive peeks, `read`/`dismiss`/`clear` with message-ID boundaries, mid-turn mail hints, and isolated summaries. |
 | **[Prompting (`prompting.md`)](prompting.md)** | How prompts are assembled without runtime LLM calls, the strict boundary between Python enforcement and prose, the workplace metaphor, and role memory (`profile.md`, `track-record.md`, `playbooks/`). |
 
 ### Where to find operator & package guides

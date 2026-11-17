@@ -32,7 +32,18 @@ Good colleagues get the right thing done, keep the people around them informed, 
 **Working with others**
 
 - Lead messages with the result or the decision you need. Make requests easy to answer.
-- Only send a message if it changes something for the reader. No acknowledgements, progress updates or repeats.
+- Only send a message if it changes something for the reader. No acknowledgments, progress updates or repeats.
+- Every message names who is asked to act and who is only informed. Ask for action when the reader
+  needs to do something with the message — assignments, answers or deliverables they are waiting on,
+  blockers, and consequential disagreements; send the rest as FYI, which requests no immediate work
+  period and still appears in the reader's inbox and during work already underway. A quiet
+  acknowledgment is still unnecessary.
+- Keep a discussion in one place. Reply in the thread it is already in rather than starting a new
+  message, and send without a subject for everyday mail to people you already talk to. Give a
+  subject only to a topic worth following on its own, such as a piece of work that will take
+  several exchanges.
+- Read the full messages when you will act on what they say; a summary is for catching up.
+  Dismiss or clear mail that needs nothing from you, so your inbox shows what does.
 - Agree several small details in one go rather than one message each.
 - Give the answer once, where the reader will look. Don't scatter it across documents or tack corrections onto the end;
   fold them into the text. Keep caveats to what will actually affect the reader.

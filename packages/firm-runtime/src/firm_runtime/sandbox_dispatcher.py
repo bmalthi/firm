@@ -18,7 +18,7 @@ from . import google_cloud
 from .errors import FirmError
 from .execution_activity import DEFAULT_IDLE_TIMEOUT, record_activity
 from .prompt_records import record_inputs, role_tool_catalog
-from .provider_contract import ExecutionProvider, RoleLaunchRequest
+from .provider_contract import ExecutionProvider, ProviderSetupError, RoleLaunchRequest
 from .provider_definitions import incompatible_service
 from .provider_support import activation_url
 from .public_profiles import ingest_public_profiles
@@ -354,7 +354,7 @@ class SandboxDispatcher:
             entry = inventory.get(row["run_id"])
             if entry is not None:
                 run, info = entry
-                if (run.role_id == summary_role_id(row["run_id"])
+                if (run.role_id == summary_role_id(row["run_id"], row["stateless_slot"])
                         and not info.get("running")):
                     self._record_settlement(run, info)
         summary_protected |= {row["run_id"] for row in summary_records} - summary_candidates
@@ -433,8 +433,8 @@ class SandboxDispatcher:
                 "JOIN activations a USING(activation_id) "
                 "WHERE a.state NOT IN ('admitted','running') AND a.finished_at<?", (cutoff,),
             )}
-            summaries = {row[0] for row in db.execute(
-                "SELECT run_id FROM summary_runs WHERE kind!='task' "
+            summaries = {row[0]: row[1] for row in db.execute(
+                "SELECT run_id,stateless_slot FROM summary_runs WHERE kind!='task' "
                 "AND state!='running' AND finished_at<?",
                 (cutoff,),
             )}
@@ -450,7 +450,7 @@ class SandboxDispatcher:
             row = roles.get(run_id)
             if row is None and run_id not in summaries:
                 continue  # Operator journals and unknown execution are never ours to discard.
-            if row is None and run.role_id != summary_role_id(run_id):
+            if row is None and run.role_id != summary_role_id(run_id, summaries[run_id]):
                 continue
             if row is not None and (row["role_id"], row["vm_generation"]) != (
                 run.role_id, run.vm_generation,
@@ -665,7 +665,12 @@ class SandboxDispatcher:
         elif parsed is not None and getattr(parsed, "interrupted", False):
             self.runtime.finish(row["activation_id"], "interrupted", category="transient")
         elif row["state"] == "running" and parsed.success:
-            self.runtime.finish(row["activation_id"])
+            # AGY can report SUCCESS after silently dropping its MCP server.
+            # Check the current activation's receipt atomically with settlement;
+            # missing MCP consumes the failure budget rather than a refunded yield.
+            self.runtime.finish(
+                row["activation_id"], require_mcp_catalog=self._provider(row).name == "agy"
+            )
         else:
             kind = parsed.error.kind if parsed.error else "invalid_output"
             category = getattr(parsed.error, "category", "unknown") if parsed.error else "unknown"
@@ -686,6 +691,7 @@ class SandboxDispatcher:
                 row["activation_id"],
                 "failed",
                 failure=failure,
+                failure_code=getattr(parsed.error, "code", None),
                 category=category,
                 retry_after=retry_at,
             )
@@ -1136,7 +1142,15 @@ class SandboxDispatcher:
                     category = getattr(exc, "category", "config")
                     if category not in {"auth", "config", "transient"}:
                         category = "config"
-                    self.runtime.finish(invocation.activation_id, "interrupted", category=category)
+                    # A setup error's code is Firm's own bounded token, never provider text.
+                    code = exc.code if isinstance(exc, ProviderSetupError) else None
+                    self.runtime.finish(
+                        invocation.activation_id,
+                        "interrupted",
+                        category=category,
+                        failure=f"setup: {code}" if code else None,
+                        failure_code=code,
+                    )
                     continue
                 # Owner/configuration repair is required. Close admission before
                 # returning the unlaunched reservation to its durable wake state.

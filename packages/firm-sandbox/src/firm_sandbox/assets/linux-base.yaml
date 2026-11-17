@@ -27,7 +27,9 @@ provision:
       set -euo pipefail
       set -x
       export DEBIAN_FRONTEND=noninteractive
-      NODE_VERSION=24.21.0
+      # Node takes the newest release of this line; the provider CLIs below stay pinned
+      # because Firm parses their output.
+      NODE_MAJOR=24
       CLAUDE_CODE_VERSION=2.1.281
       CODEX_VERSION=0.165.0
       AGY_URL=https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.3-6604829099950080/linux-arm/cli_linux_arm64.tar.gz
@@ -36,21 +38,18 @@ provision:
       AGY_SHA512=c2fac818b3c1bb224079df03a714ccba99728b6a3a41d86d247ab2feb8582a43840c5032f1c2b75e72667623d5503e7ffda2712c4f37b6ee19f99c3fcfb25bae
       CURL="curl --retry 10 --retry-all-errors --retry-max-time 600 -fsSL"
       PACKAGES="cifs-utils acl samba samba-vfs-modules uidmap dbus-user-session
-        curl xz-utils git gh build-essential ssl-cert"
-      # Playwright 1.63.0: complete tools + chromium sets for ubuntu26.04-arm64.
-      # https://github.com/microsoft/playwright/blob/v1.63.0/packages/playwright-core/src/server/registry/nativeDeps.ts
-      # Install OS libraries here; unprivileged roles download their own browsers.
-      CHROMIUM_PACKAGES="xvfb fonts-noto-color-emoji fonts-unifont libfontconfig1
-        libfreetype6 xfonts-cyrillic xfonts-scalable fonts-liberation
-        fonts-ipafont-gothic fonts-wqy-zenhei fonts-tlwg-loma-otf fonts-freefont-ttf
-        libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64
-        libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0t64
-        libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1
-        libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2"
+        curl xz-utils git gh build-essential ssl-cert
+        poppler-utils imagemagick librsvg2-bin ffmpeg pandoc jq ripgrep zip unzip"
+      # Office conversion without a display; recommends would add a desktop. Carlito and
+      # Caladea keep documents set in Calibri and Cambria laid out as authored.
+      OFFICE_PACKAGES="libreoffice-core libreoffice-writer libreoffice-impress
+        libreoffice-calc fonts-crosextra-carlito fonts-crosextra-caladea"
       printf 'Acquire::Retries "3";\n' > /etc/apt/apt.conf.d/80firm-retries
       apt-get update
       apt-get -y dist-upgrade
-      apt-get install -y $PACKAGES $CHROMIUM_PACKAGES
+      apt-get install -y $PACKAGES
+      apt-get install -y --no-install-recommends $OFFICE_PACKAGES
+      ln -sf /usr/bin/python3 /usr/local/bin/python
       $CURL https://get.docker.com | sh
       # Roles run rootless daemons; the privileged system units stay off.
       systemctl disable --now docker.service docker.socket containerd.service
@@ -58,13 +57,41 @@ provision:
       systemctl disable --now nmbd
       $CURL https://astral.sh/uv/install.sh \
         | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
-      node_archive=$(mktemp)
-      $CURL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-arm64.tar.xz" \
-        -o "$node_archive"
-      tar -xJf "$node_archive" -C /usr/local --strip-components=1 --no-same-owner
-      rm -f "$node_archive"
+      # Name the release once, then fetch it and its checksums from its own directory,
+      # so a release published in between cannot mismatch them.
+      node_file=$($CURL "https://nodejs.org/dist/latest-v${NODE_MAJOR}.x/SHASUMS256.txt" \
+        | awk '$2 ~ /^node-v[0-9.]+-linux-arm64\.tar\.xz$/ {print $2}')
+      node_release=${node_file#node-}
+      node_release=${node_release%-linux-arm64.tar.xz}
+      node_stage=$(mktemp -d)
+      $CURL "https://nodejs.org/dist/${node_release}/SHASUMS256.txt" -o "$node_stage/SHASUMS256.txt"
+      $CURL "https://nodejs.org/dist/${node_release}/${node_file}" -o "$node_stage/$node_file"
+      awk -v file="$node_file" -v path="$node_stage/$node_file" \
+        '$2 == file {print $1 "  " path}' "$node_stage/SHASUMS256.txt" | sha256sum --check --strict
+      tar -xJf "$node_stage/$node_file" -C /usr/local --strip-components=1 --no-same-owner
+      rm -rf "$node_stage"
       npm install -g --prefix /usr/local \
         "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@openai/codex@${CODEX_VERSION}"
+      # Playwright's newest Chromium, with the OS libraries that version needs, shared
+      # read-only by every role. The version is PyPI's, since roles add Playwright with
+      # uv; Playwright changes browsers only in minor releases, so X.Y.0 is recorded.
+      playwright_release=$($CURL https://pypi.org/pypi/playwright/json \
+        | python3 -c 'import json, sys; print(json.load(sys.stdin)["info"]["version"])')
+      playwright_stage=$(mktemp -d)
+      playwright() {
+        env HOME="$playwright_stage" UV_CACHE_DIR="$playwright_stage/cache" \
+          PLAYWRIGHT_BROWSERS_PATH=/opt/firm/ms-playwright \
+          uvx --python /usr/bin/python3 --from "playwright==${playwright_release}" playwright "$@"
+      }
+      install -d -o root -g root -m 0755 /opt/firm /opt/firm/ms-playwright
+      playwright install --with-deps chromium
+      # A browser that cannot start fails the build rather than a role.
+      playwright pdf about:blank "$playwright_stage/check.pdf"
+      test -s "$playwright_stage/check.pdf"
+      printf '%s.0\n' "${playwright_release%.*}" > /opt/firm/playwright-version
+      chown -R root:root /opt/firm
+      chmod -R u+rwX,go+rX,go-w,ug-s /opt/firm
+      rm -rf "$playwright_stage"
       agy_stage=$(mktemp -d)
       trap 'rm -rf "$agy_stage"' EXIT
       $CURL "$AGY_URL" -o "$agy_stage/agy.tar.gz"
@@ -97,6 +124,9 @@ provision:
       chmod 0755 /usr/local/bin/gh
       chown -R root:root /usr/local/lib/node_modules /usr/local/bin
       for command in mount.cifs setfacl smbpasswd smbd newuidmap newgidmap dbus-run-session \
-        docker uv node npm claude codex agy gh git curl xz gcc g++ make modprobe; do
+        docker uv node npm claude codex agy gh git curl xz gcc g++ make modprobe python \
+        pdftotext pdftoppm rsvg-convert ffmpeg pandoc jq rg zip unzip soffice; do
         command -v "$command" >/dev/null
       done
+      command -v magick >/dev/null || command -v convert >/dev/null
+      test -s /opt/firm/playwright-version

@@ -88,49 +88,32 @@ UNCLEAN = "Mac release is not confirmed; VM remains running; force stop is avail
 
 # Role-facing failures. Sandbox and helper wording is written for the owner; it goes
 # to the runtime log, and the role sees one of these reasons and its message.
-WAIT = (
-    "Mac availability does not itself wake you. If you still need the Mac and no reply "
-    "or other wake is expected, set a reminder for a useful retry. Take up other available "
-    "work, or finish normally to pause with working memory intact. Hand off only when "
-    "you need a fresh start or Operations requires it. A blocked work period that "
-    "produces nothing is fine."
-)
+WAIT = render("results", "mac_wait")
 # What a pending answer means: only the owner can lift these, and has been asked.
 ASKED = (
-    "The owner has been asked; the answer arrives as mail. Take up work you already have, "
-    "or finish normally to pause with working memory intact. Set a reminder when a future "
-    "check is useful; hand off only when you need a fresh start or Operations requires it. "
+    f"{render('results', 'access_pending')} "
     "A blocked work period that produces nothing is fine."
 )
 ROLE_MESSAGES = {
-    "mac_busy": "No desktop can be leased now; at least one is held or the owner is using the Mac. "
-    f"{WAIT}",
-    "mac_needs_recovery": "A desktop on the Mac is waiting for cleanup to be verified "
-    f"after an earlier lease, and no other is free. {ASKED}",
-    "mac_not_enrolled": f"The firm's Mac is not set up yet. {ASKED}",
-    "mac_session_not_ready": "No desktop account on the firm's Mac is ready for a lease. "
-    f"{ASKED}",
-    "mac_disk_full": "The Mac is too low on free disk space to admit a new lease, even "
-    f"after reclaiming. {WAIT}",
-    "mac_unavailable": f"No Mac could be leased. {WAIT}",
-    "mac_release_failed": "Your work is still running on the Mac; "
-    "end it and call mac_release again.",
-    "mac_release_unverified": "The Mac could not confirm that your work stopped; the "
-    "desktop is waiting for the owner to verify it.",
-    "desktop_not_ready": "The desktop on the Mac is not ready for the desktop tools this "
-    "work period; use SSH, or release the Mac and try again later.",
-    "desktop_lease_unavailable": "Your applications were closed, but the desktop on the "
-    "Mac could not be rebound to your lease; retry the desktop tools or release the Mac.",
-    "helper_disconnected": "The desktop tools lost their connection to the Mac, so the "
-    "outcome is unknown; check the application before retrying.",
-    "invalid_request": "The desktop request was invalid or too large.",
-    "input_limit": "Desktop text input is limited to 4096 UTF-8 bytes.",
-    "desktop_apps_open": "Some applications could not be closed. Close them yourself, or "
-    "call mac_release, which reports what is still running.",
-    "desktop_failed": "The desktop tools could not complete the request on the Mac; "
-    "check the application before retrying.",
-    "capture_not_saved": "The image is returned here but was not saved on your drive; "
-    "there is no drive_path. Capture again if you still need a saved image.",
+    name: render("results", name, wait=WAIT, asked=ASKED)
+    for name in (
+        "mac_busy",
+        "mac_needs_recovery",
+        "mac_not_enrolled",
+        "mac_session_not_ready",
+        "mac_disk_full",
+        "mac_unavailable",
+        "mac_release_failed",
+        "mac_release_unverified",
+        "desktop_not_ready",
+        "desktop_lease_unavailable",
+        "helper_disconnected",
+        "invalid_request",
+        "input_limit",
+        "desktop_apps_open",
+        "desktop_failed",
+        "capture_not_saved",
+    )
 }
 # Helper rejections whose message describes the role's own request.
 REQUEST_REJECTIONS = {"invalid_request", "operation_failed"}

@@ -28,9 +28,30 @@ export function time(timestamp, now = Date.now() / 1000) {
     ? clockTime(timestamp) : `${date.toLocaleDateString()} ${clockTime(timestamp)}`;
 }
 
+// Why an authentication hold is open. Signing in again repairs only the last of these.
+export function authCause(incident) {
+  return {organization: "is blocked by its organization", account: "is on hold at the provider"}[incident?.repair] || "can't sign in";
+}
+
+export function authLabel(incident) {
+  return {organization: "Blocked by its organization", account: "On hold at the provider"}[incident?.repair] || "Can't sign in";
+}
+
+// What an authentication hold's card tells the owner. Signing in again is the repair
+// unless the recorded cause rules it out; the command is then only the way to switch accounts.
+export function authRecovery(incident) {
+  const signIn = (incident?.repair || "sign_in") === "sign_in";
+  return {
+    guidance: incident?.guidance || "Sign in again, then resume work.",
+    command: incident?.login_command || null,
+    commandNote: `${signIn ? "Sign in with this command, then resume work." : "This command signs in to the account."} Credentials stay on your computer and never pass through this page.`,
+    button: signIn ? "I've signed in again · resume work" : "Resume work",
+  };
+}
+
 export function incidentTitle(incident) {
   const subject = `${incident.scope === "profile" ? "Profile" : "Account"} ${incident.dependency}`;
-  const cause = {auth: "can't sign in", config: "has a configuration problem", quota: "has an allowance hold", outage: "has an outage hold"}[incident.kind] || "has an execution hold";
+  const cause = {auth: authCause(incident), config: "has a configuration problem", quota: "has an allowance hold", outage: "has an outage hold"}[incident.kind] || "has an execution hold";
   return `${subject} ${cause}`;
 }
 
@@ -148,6 +169,8 @@ export function statusHeadline(snapshot, connected = true) {
   if (rows.some((row) => reasonsOf(row).some((reason) => ["ready", "firm_capacity", "reminder_due"].includes(reason)))) return "Starting work";
   if (rows.some((row) => blockingDecisions(row, snapshot).length)) return "Waiting on you";
   if (rows.some((row) => indefiniteHold(row, snapshot))) return "Held";
+  if (rows.some((row) => reasonsOf(row).includes("idle_inbox_review_available")
+    && reasonsOf(row).every((reason) => ["idle_inbox_review_available", "scheduled_wake", "pending_mail_no_wake"].includes(reason)))) return "Mail awaiting idle review";
   const deadlines = rows.map((row) => row.next_check_at).filter(validTime);
   if (deadlines.length) return `Waiting until ${clockTime(Math.min(...deadlines))}`;
   if (rows.length && rows.every((row) => reasonsOf(row).every((reason) => ["idle_no_wake", "pending_mail_no_wake"].includes(reason)))) return "Idle, nothing scheduled";
@@ -188,7 +211,8 @@ const phrases = {
   reminder_due: "Reminder due · starting soon",
   owner_paused: "Paused by you",
   idle_no_wake: "Idle · nothing scheduled",
-  pending_mail_no_wake: "Mail waiting, nothing scheduled",
+  pending_mail_no_wake: "Mail waiting, already offered",
+  idle_inbox_review_available: "Mail waiting for idle review",
   refusal: "Held · work refused",
   attempts_exhausted: "Held · retry attempts exhausted",
   temporary_exhausted: "Held · temporary work periods exhausted",
@@ -203,6 +227,7 @@ const phrases = {
   account_config_hold: "Paused · account configuration needs repair",
   profile_config_hold: "Paused · profile configuration needs repair",
   account_quota_hold: "Paused · account allowance exhausted",
+  profile_quota_hold: "Paused · model allowance exhausted",
   account_hold: "Paused · account hold",
   profile_hold: "Paused · profile hold",
   pinned_dependency: "Paused · execution dependency held",
@@ -225,11 +250,11 @@ export function readinessPhrase(row, snapshot, now = Date.now() / 1000) {
     (row.blockers || []).some((blocker) => blocker.incident_id === item.incident_id && !blocker.alternative_account_usable));
   if (incident && reasons.some((reason) => reason.includes("hold") || reason === "pinned_dependency")) {
     const cause = validTime(incident.until_at) ? `until ${clockTime(incident.until_at)}`
-      : {auth: "can't sign in", config: "configuration needs repair", quota: "allowance exhausted", outage: "outage hold"}[incident.kind] || incident.kind;
+      : {auth: authCause(incident), config: "configuration needs repair", quota: "allowance exhausted", outage: "outage hold"}[incident.kind] || incident.kind;
     return `Paused · ${incident.dependency} ${cause}`;
   }
   // Readiness can list idle mail before the account hold that prevents its next work.
-  const reason = reasons.find((code) => !["idle_no_wake", "pending_mail_no_wake", "scheduled_wake"].includes(code)) || reasons[0];
+  const reason = reasons.find((code) => !["idle_no_wake", "pending_mail_no_wake", "scheduled_wake", "idle_inbox_review_available"].includes(code)) || reasons[0];
   if (reason === "scheduled_wake") return `Idle · next check ${clockTime(row.next_check_at)}`;
   if (reason === "retry_wait") return `Retrying at ${clockTime((row.blockers || []).find((blocker) => validTime(blocker.retry_at))?.retry_at ?? row.next_check_at)}`;
   if (reason === "owner_request_pending") return "Waiting on you · request pending";
@@ -247,6 +272,7 @@ export function statusSentence(snapshot, connected = true) {
   if (headline === "Stopped") return `The firm is not accepting work. ${vm}`;
   if (headline === "Stopping after current work") return `${count} The VMs shut down when current work exits. ${vm}`;
   if (headline === "Force stopping") return `${count} Active work is being interrupted. ${vm}`;
+  if (headline === "Mail awaiting idle review") return "Previously unoffered mail can receive a review when no ordinary work is runnable and no role is working.";
   if (headline === "Idle, nothing scheduled") return "No role is working and none has a wake scheduled. Nothing happens until someone sends work. This does not mean the mandate is finished.";
   if (headline === "Not working") return rows.length
     ? rows.map((row) => `${roleName(row)}: ${reasonsOf(row).join(", ")}`).join(". ") + "."
@@ -278,4 +304,32 @@ export function subscriptionQuotaDetail(quota, formatTime = time, formatAge = ag
     return `Stale quota reading · observed ${formatTime(quota.observed_at)}${quota.checked_at != null ? ` · checked ${formatTime(quota.checked_at)}` : ""}${quota.error ? " · latest refresh unavailable" : ""}`;
   }
   return "";
+}
+
+// Derive each reply's complete audience and independent action defaults.
+export function replyActionSelection(audience, selected = null) {
+  const recipients = [...new Map(audience.filter((person) => person.employee_id !== "owner")
+    .map((person) => [person.employee_id || person.reference, person])).values()];
+  return {recipients, selected: selected ?? (recipients.length === 1
+    ? [recipients[0].employee_id || recipients[0].reference] : [])};
+}
+export function recipientDesignation(person) {
+  return person.action_required === true ? "Action" : person.action_required === false ? "FYI" : "";
+}
+
+// Mail without a subject is titled by its first line, which for an Operations notice is its title.
+export function mailTitle(message) {
+  const firstLine = (message.body || "").split("\n").map((line) => line.trim()).find(Boolean) || "";
+  return message.subject || message.preview || firstLine.slice(0, 80) || "No subject";
+}
+export function mailText(message) {
+  const label = "Context summary generated by Operations at the sender’s request; not an Operations instruction or the sender’s words:";
+  return (message.summary ? label + "\n" + message.summary + "\nEnd of generated context. The sender's introduction follows.\n\n" : "") + message.body;
+}
+
+export function ownerMailState(message) {
+  if (message.owner_delivery) {
+    return {pending: "New", read: "Read", dismissed: "Done"}[message.owner_delivery.disposition] || message.owner_delivery.disposition;
+  }
+  return message.author.employee_id === "owner" ? "Sent" : "Between roles";
 }

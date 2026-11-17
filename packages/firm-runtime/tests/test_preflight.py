@@ -62,6 +62,9 @@ def test_bad_credentials_held_before_any_activation_good_account_still_eligible(
     assert report["failures"] == [
         {"scope": "account", "dependency": "broken", "code": "credential_unreadable"}
     ]
+    (incident,) = runtime.accounts.status()["incidents"]
+    assert (incident["dependency"], incident["code"]) == ("broken", "credential_unreadable")
+    assert incident["repair"] == "sign_in" and "firm login broken" in incident["login_command"]
     with runtime.store.read() as db:
         assert db.execute("SELECT COUNT(*) FROM activations").fetchone()[0] == 0
         assert runtime.store.role(db, "founder")["attempt_count"] == 0

@@ -7,7 +7,7 @@ from firm_runtime.errors import FirmError
 from firm_runtime.role_output import person, render_tool_result
 from firm_runtime.runtime import Runtime
 from firm_runtime.simulation import ControlledExecutor, SimulationDispatcher
-from firm_runtime.store import OWNER, Store
+from firm_runtime.store import OWNER, Store, encoded
 
 
 @pytest.fixture
@@ -62,6 +62,22 @@ def test_admission_uses_one_time_for_candidates_and_wake_snapshot(system, monkey
         assert json.loads(row["wake_snapshot"])
 
 
+def test_wake_snapshot_shows_last_authors_and_newest_unread(system):
+    runtime, founder, _ = system
+    runtime.owner.send_mail(OWNER, [founder], "Everyday mail", request_id="everyday")
+    newest = runtime.owner.send_mail(
+        OWNER, [founder], "Named body", subject="Topic", request_id="named",
+    )
+    runtime.start()
+    invocation = run(runtime)
+    snapshot = invocation.context["inbox"]
+    assert snapshot["newest_message_id"] == newest["message_id"]
+    text = render_tool_result("peek", snapshot)
+    assert f"Inbox: 2 threads · 2 unread messages · newest {newest['message_id']}." in text
+    assert "Last message: Owner: Everyday mail" in text
+    assert text.endswith("Last message: Owner")
+
+
 def test_handoff_notes_can_exceed_context_reserve_and_survive_fresh_start(system):
     runtime, _, _ = system
     runtime.start()
@@ -83,10 +99,10 @@ def test_full_hire_mail_handoff_drain_restart(system):
         tools = runtime.tools(first.token)
         child = tools.hire("finance", "Own invoices and receivables.", "hire")
         employee = child["employee_id"]
-        sent = tools.send([employee], "Please prepare the invoice.", "invoice")
+        sent = tools.send([employee], [], "Please prepare the invoice.")
         (analyst,) = dispatcher.tick()
         analyst_tools = runtime.tools(analyst.token)
-        analyst_tools.claim("open", [sent["message_id"]])
+        analyst_tools.read(sent["message_id"])
         analyst_tools.handoff("Invoice draft saved; next review it.", "continue", "handoff")
         assert analyst.activation_id in executor.running
         assert dispatcher.stop()["state"] == "draining"
@@ -97,7 +113,7 @@ def test_full_hire_mail_handoff_drain_restart(system):
         assert dispatcher.tick() == []
         assert runtime.status()["state"] == "stopped"
         with pytest.raises(FirmError, match="expired"):
-            analyst_tools.send([founder], "stale", "stale")
+            analyst_tools.send([founder], [], "stale")
         runtime.start()
         resumed_runs = dispatcher.tick()
         resumed = next(item for item in resumed_runs if item.employee_id == employee)
@@ -110,7 +126,7 @@ def test_full_hire_mail_handoff_drain_restart(system):
         assert dispatcher.tick() == []
 
 
-@pytest.mark.parametrize("disposition", [None, "peek", "claim", "dismiss"])
+@pytest.mark.parametrize("disposition", [None, "peek", "read", "dismiss"])
 def test_admission_race_and_arrival_not_lost(system, disposition):
     runtime, founder, _ = system
     runtime.start()
@@ -118,13 +134,13 @@ def test_admission_race_and_arrival_not_lost(system, disposition):
         results = list(pool.map(lambda _: runtime.admit(), range(2)))
     (first,) = [result for result in results if result]
     runtime.mark_started(first.activation_id)
-    sent = runtime.messaging.send(OWNER, [founder], "New work during execution", request_id="new")
+    sent = runtime.owner.send_mail(OWNER, [founder], "New work during execution", request_id="new")
     if disposition == "peek":
         runtime.messaging.peek(founder)
     elif disposition:
-        getattr(runtime.messaging, disposition)(founder, [sent["message_id"]], request_id="open")
+        getattr(runtime.messaging, disposition)(founder, sent["message_id"])
     runtime.finish(first.activation_id)
-    if disposition in {"claim", "dismiss"}:
+    if disposition in {"read", "dismiss"}:
         assert runtime.admit() is None
         return
     second = run(runtime)
@@ -137,7 +153,7 @@ def test_admission_race_and_arrival_not_lost(system, disposition):
 
 def test_pending_backlog_does_not_repeat_wake(system):
     runtime, founder, _ = system
-    runtime.messaging.send(OWNER, [founder], "Can wait", request_id="mail")
+    runtime.owner.send_mail(OWNER, [founder], "Can wait", request_id="mail")
     runtime.start()
     first = run(runtime)
     runtime.finish(first.activation_id)
@@ -147,11 +163,11 @@ def test_pending_backlog_does_not_repeat_wake(system):
 
 def test_hard_stop_revokes_token_preserves_claim_and_recovery(system):
     runtime, founder, _ = system
-    mail = runtime.messaging.send(OWNER, [founder], "Do a thing", request_id="mail")
+    mail = runtime.owner.send_mail(OWNER, [founder], "Do a thing", request_id="mail")
     with SimulationDispatcher(runtime, ControlledExecutor()) as dispatcher:
         runtime.start()
         (first,) = dispatcher.tick()
-        runtime.tools(first.token).claim("claim", [mail["message_id"]])
+        runtime.tools(first.token).read(mail["message_id"])
         assert dispatcher.stop(force=True)["state"] == "stopped"
         assert dispatcher.executor.running == {}
         with pytest.raises(FirmError):
@@ -160,7 +176,7 @@ def test_hard_stop_revokes_token_preserves_claim_and_recovery(system):
         (second,) = dispatcher.tick()
         assert second.session_id == first.session_id
         assert second.context["recovery"]["cause"] == "owner_stop"
-        assert [c["message_id"] for c in second.context["recovery"]["recent_claims"]] == [
+        assert [c["message_id"] for c in second.context["recovery"]["recent_reads"]] == [
             mail["message_id"]
         ]
         with runtime.store.read() as db:
@@ -178,7 +194,7 @@ def test_retry_delay_and_budget_survive_restart_and_mail(system):
         with runtime.store.read() as db:
             assert runtime.store.role(db, founder)["attempt_count"] == attempt
         runtime = Runtime(Store.scratch(runtime.store.path, clock=lambda: now[0]))
-        runtime.messaging.send(OWNER, [founder], "Additional work", request_id=f"mail-{attempt}")
+        runtime.owner.send_mail(OWNER, [founder], "Additional work", request_id=f"mail-{attempt}")
         now[0] += delay - 1
         assert runtime.admit() is None
         now[0] += 1
@@ -313,7 +329,7 @@ def test_multiple_wake_reasons_combine_into_one_activation(system):
     runtime.start()
     first = run(runtime)
     runtime.finish(first.activation_id)
-    runtime.messaging.send(OWNER, [founder], "Owner note", request_id="owner-mail")
+    runtime.owner.send_mail(OWNER, [founder], "Owner note", request_id="owner-mail")
     with runtime.store.transaction() as db:
         runtime.store.request_execution(db, founder, "interrupted_work")
     invocation = runtime.admit()
@@ -339,7 +355,7 @@ def test_auth_and_mutation_rollback_share_transaction(system):
     invocation = run(runtime)
     before = count(runtime, "messages")
     with pytest.raises(RuntimeError), runtime.authorized(invocation.token):
-        runtime.messaging.send(founder, [founder], "Rolled back", request_id="rollback")
+        runtime.messaging.send(founder, [founder], [], "Rolled back", request_id="rollback")
         raise RuntimeError("after nested service write")
     assert count(runtime, "messages") == before
     assert count(runtime, "requests") == 0
@@ -355,28 +371,25 @@ def test_only_one_dispatcher(system):
             pass
 
 
-def test_recovery_claims_latest_five_across_activations_without_bodies(system):
+def test_recovery_reads_latest_five_across_activations_without_bodies(system):
     runtime, founder, _ = system
     runtime.start()
     first = run(runtime)
     ids = []
     for index in range(7):
-        mail = runtime.messaging.send(
-            OWNER,
-            [founder],
-            f"Secret body {index}",
-            request_id=f"send-{index}",
+        mail = runtime.owner.send_mail(
+            OWNER, [founder], f"Secret body {index}", request_id=f"send-{index}",
             subject=f"Message subject number {index}",
         )
         ids.append(mail["message_id"])
-        runtime.tools(first.token).claim(f"claim-{index}", [ids[-1]])
+        runtime.tools(first.token).read(ids[-1])
     runtime.finish(first.activation_id)
-    runtime.messaging.send(OWNER, [founder], "New opportunity", request_id="next")
+    runtime.owner.send_mail(OWNER, [founder], "New opportunity", request_id="next")
     second = run(runtime)
     runtime.finish(second.activation_id, "interrupted", category="owner_stop")
     third = run(runtime)
     recovery = third.context["recovery"]
-    assert [c["message_id"] for c in recovery["recent_claims"]] == list(reversed(ids[-5:]))
+    assert [c["message_id"] for c in recovery["recent_reads"]] == list(reversed(ids[-5:]))
     assert "Secret body" not in json.dumps(recovery)
 
 
@@ -408,9 +421,11 @@ def test_wake_priority_is_outstanding_opportunity_not_old_mail(system):
     for _ in range(4):
         born = run(runtime)
         runtime.finish(born.activation_id)
-    runtime.messaging.send(founder, [employees[0]], "Old ordinary mail", request_id="ordinary-mail")
+    runtime.messaging.send(
+        founder, [employees[0]], [], "Old ordinary mail", request_id="ordinary-mail",
+    )
     now[0] += 1
-    runtime.messaging.send(OWNER, [employees[1]], "Owner work", request_id="owner")
+    runtime.owner.send_mail(OWNER, [employees[1]], "Owner work", request_id="owner")
     now[0] += 1
     with runtime.store.transaction() as db:
         runtime.messaging.notice(
@@ -427,9 +442,9 @@ def test_wake_priority_is_outstanding_opportunity_not_old_mail(system):
         runtime.finish(invocation.activation_id)
     assert ordered == list(reversed(employees))
     assert runtime.admit() is None
-    runtime.messaging.send(founder, [employees[0]], "Earlier opportunity", request_id="earlier")
+    runtime.messaging.send(founder, [employees[0]], [], "Earlier opportunity", request_id="earlier")
     now[0] += 1
-    runtime.messaging.send(founder, [employees[2]], "Later opportunity", request_id="later")
+    runtime.messaging.send(founder, [employees[2]], [], "Later opportunity", request_id="later")
     assert run(runtime).employee_id == employees[0]
 
 
@@ -528,7 +543,7 @@ def test_drain_is_scoped_to_activation_and_shown_on_next_tool_response(system):
     runtime.start()
     second = run(runtime)
     assert "operations_control" not in runtime.tools(second.token).peek()
-    assert second.context["inbox"]["pending_count"] == 0
+    assert second.context["inbox"]["unread_count"] == 0
 
 
 def test_host_crash_during_drain_is_not_an_owner_hard_stop(system):
@@ -555,8 +570,8 @@ def test_claimed_arrival_does_not_replace_recovery_or_continuation(system, outco
     runtime, founder, _ = system
     runtime.start()
     first = run(runtime)
-    sent = runtime.messaging.send(OWNER, [founder], "New work", request_id="new")
-    runtime.tools(first.token).claim("claim", [sent["message_id"]])
+    sent = runtime.owner.send_mail(OWNER, [founder], "New work", request_id="new")
+    runtime.tools(first.token).read(sent["message_id"])
     assert count(runtime, "scheduling_opportunities") == 0
     if outcome == "continue":
         runtime.tools(first.token).handoff("Continue saved work", "continue", "handoff")
@@ -572,7 +587,7 @@ def test_claimed_arrival_does_not_replace_recovery_or_continuation(system, outco
         assert (second.session_id == first.session_id) == (outcome == "interrupted")
         if outcome == "interrupted":
             assert (
-                second.context["recovery"]["recent_claims"][0]["message_id"] == sent["message_id"]
+                second.context["recovery"]["recent_reads"][0]["message_id"] == sent["message_id"]
             )
         else:
             assert second.context["handoff_notes"] == "Continue saved work"
@@ -587,15 +602,15 @@ def test_message_priority_is_projected_and_drops_after_claim(system):
     for _ in range(2):
         born = run(runtime)
         runtime.finish(born.activation_id)
-    runtime.messaging.send(child, [founder], "Older ordinary work", request_id="older")
+    runtime.messaging.send(child, [founder], [], "Older ordinary work", request_id="older")
     now[0] += 1
-    runtime.messaging.send(OWNER, [child], "Owner work", request_id="child-owner")
+    runtime.owner.send_mail(OWNER, [child], "Owner work", request_id="child-owner")
     with runtime.store.transaction() as db:
         urgent = runtime.messaging.notice(
             db, [founder], "Control work", subject="Control work for founder", priority=2
         )
     assert runtime.status()["waiting"] == 2
-    runtime.messaging.claim(founder, [urgent["message_id"]], request_id="claim-control")
+    runtime.messaging.read(founder, urgent["message_id"])
     with runtime.store.read() as db:
         assert db.execute("SELECT COUNT(*) FROM execution_requests").fetchone()[0] == 0
         assert (
@@ -644,13 +659,17 @@ def labelled(result):
     return [(person(sender), count) for sender, count in result["mail_waiting"]["senders"]]
 
 
-def test_mail_arriving_during_work_is_shown_once_and_leaves_it_pending(system):
+@pytest.mark.parametrize("wake", [True, False])
+def test_mail_arriving_during_work_is_shown_once_and_leaves_it_pending(system, wake):
     runtime, founder, _ = system
     runtime.start()
     first = run(runtime)
     tools = runtime.tools(first.token)
     assert "mail_waiting" not in tools.get_role(role=founder)
-    runtime.messaging.send(OWNER, [founder], "Quick question", request_id="q1")
+    runtime.owner.send_mail(
+        OWNER, [founder], "Quick question", action_recipients=None if wake else [],
+        request_id="q1",
+    )
     shown = tools.get_role(role=founder)
     assert labelled(shown) == [("Owner", 1)]
     rendered = render_tool_result("get_role", shown)
@@ -659,12 +678,42 @@ def test_mail_arriving_during_work_is_shown_once_and_leaves_it_pending(system):
     assert pending(runtime, founder) == 1
 
 
+@pytest.mark.parametrize("held", [False, True])
+def test_quiet_mail_receives_one_idle_review_after_hold_clears(system, held):
+    runtime, founder, _ = system
+    runtime.start()
+    first = run(runtime)
+    runtime.finish(first.activation_id)
+    if held:
+        with runtime.store.transaction() as db:
+            db.execute(
+                "UPDATE roles SET hold_reason='attempts_exhausted' WHERE employee_id=?", (founder,)
+            )
+    quiet = runtime.owner.send_mail(
+        OWNER, [founder], "Reference for later", action_recipients=[], request_id="later",
+    )
+    if held:
+        assert runtime.admit() is None
+        with runtime.store.transaction() as db:
+            db.execute("UPDATE roles SET hold_reason=NULL WHERE employee_id=?", (founder,))
+    second = run(runtime)
+    assert second.context["idle_inbox_review"]
+    assert second.context["inbox"]["threads"][0]["message_id"] == quiet["message_id"]
+    runtime.finish(second.activation_id)
+    assert runtime.admit() is None
+    assert pending(runtime, founder) == 1
+    runtime.owner.send_mail(OWNER, [founder], "New assignment", request_id="assignment")
+    third = run(runtime)
+    claimed = runtime.tools(third.token).read(quiet["message_id"])
+    assert claimed["messages"][0]["body"] == "Reference for later"
+
+
 def test_peek_is_the_observation_and_renders_no_notice(system):
     runtime, founder, _ = system
     runtime.start()
     first = run(runtime)
     tools = runtime.tools(first.token)
-    runtime.messaging.send(OWNER, [founder], "Quick question", request_id="q1")
+    runtime.owner.send_mail(OWNER, [founder], "Quick question", request_id="q1")
     peeked = tools.peek()
     assert "mail_waiting" not in peeked
     assert "New mail" not in render_tool_result("peek", peeked)
@@ -672,146 +721,6 @@ def test_peek_is_the_observation_and_renders_no_notice(system):
     assert pending(runtime, founder) == 1
 
 
-def test_paginated_peek_preserves_late_mail_through_runtime_clear(system):
-    runtime, founder, _ = system
-    original_owner = runtime.messaging.send(
-        OWNER, [founder], "Original owner request", request_id="original-owner"
-    )
-    with runtime.store.transaction() as db:
-        operations = runtime.messaging.notice(
-            db, [founder], "Original operations notice", subject="Operations"
-        )
-    runtime.start()
-    invocation = run(runtime)
-    tools = runtime.tools(invocation.token)
-
-    first = tools.peek(limit=1)
-    assert first["seen_sequence"] is None
-    assert first["next_cursor"]
-    assert first["conversations"][0]["conversation_id"] == operations["conversation_id"]
-    assert "mail_waiting" not in first
-    tools.claim("claim-operations", [operations["message_id"]])
-    with runtime.store.read() as db:
-        watermark = db.execute(
-            "SELECT COALESCE(MAX(sequence),0) FROM message_sequence"
-        ).fetchone()[0]
-
-    late = runtime.messaging.send(
-        OWNER, [founder], "Arrived after the peek snapshot", request_id="late-owner"
-    )
-    continued = tools.peek(cursor=first["next_cursor"], limit=1)
-    assert continued["seen_sequence"] == watermark
-    assert labelled(continued) == [("Owner", 1)]
-    assert continued["conversations"][0]["conversation_id"] == original_owner["conversation_id"]
-
-    cleared = tools.clear("clear-snapshot")
-    assert cleared["count"] == 1
-    assert cleared["conversations"][0]["message_ids"] == [original_owner["message_id"]]
-    assert pending(runtime, founder) == 1
-    with runtime.store.read() as db:
-        state = db.execute(
-            "SELECT disposition FROM message_deliveries WHERE employee_id=? AND message_id=?",
-            (founder, late["message_id"]),
-        ).fetchone()[0]
-    assert state == "pending"
-
-
-def test_wake_byte_pagination_needs_complete_traversal_before_clear(system, monkeypatch):
-    import firm_runtime.messaging as messaging_module
-
-    runtime, founder, _ = system
-    workers = [
-        runtime.lifecycle.hire(
-            founder, f"inbox-{index}", "Prepare a status report.", "default",
-            request_id=f"inbox-hire-{index}",
-        )["employee_id"]
-        for index in range(5)
-    ]
-    subject = "📦" * 80
-    original = [
-        runtime.messaging.send(
-            OWNER, [founder], "Owner request", subject=subject, request_id="wake-owner"
-        )
-    ]
-    with runtime.store.transaction() as db:
-        original.append(
-            runtime.messaging.notice(
-                db, [founder], "Operations request", subject=subject
-            )
-        )
-    for index, worker in enumerate(workers):
-        original.append(
-            runtime.messaging.send(
-                worker, [founder], "Status update", subject=subject,
-                request_id=f"wake-worker-{index}",
-            )
-        )
-    with runtime.store.transaction() as db:
-        db.execute("DELETE FROM execution_requests WHERE employee_id!=?", (founder,))
-
-    # Force the wake overview through the same response byte bound used by tool peeks.
-    monkeypatch.setattr(messaging_module, "MAX_PEEK_BYTES", 1_800)
-    runtime.start()
-    invocation = run(runtime)
-    assert invocation.employee_id == founder
-    with runtime.store.read() as db:
-        wake_coverage = db.execute(
-            "SELECT inbox_seen_sequence FROM activations WHERE activation_id=?",
-            (invocation.activation_id,),
-        ).fetchone()[0]
-    assert wake_coverage is None
-    assert invocation.context["inbox"]["next_cursor"]
-
-    tools = runtime.tools(invocation.token)
-    too_soon = tools.clear("clear-before-traversal")
-    assert too_soon == {"status": "nothing_cleared", "reason": "no_peek"}
-    assert pending(runtime, founder) == len(original)
-
-    first = tools.peek()
-    assert first["next_cursor"]
-    assert first["conversations"][0]["conversation_id"] == original[1]["conversation_id"]
-    tools.claim("claim-before-continuation", [original[1]["message_id"]])
-    with runtime.store.read() as db:
-        watermark = db.execute(
-            "SELECT COALESCE(MAX(sequence),0) FROM message_sequence"
-        ).fetchone()[0]
-    late = runtime.messaging.send(
-        OWNER, [founder], "Arrived after the wake snapshot", request_id="wake-late-owner"
-    )
-    with runtime.store.read() as db:
-        late_sequence = db.execute(
-            "SELECT sequence FROM messages WHERE message_id=?", (late["message_id"],)
-        ).fetchone()[0]
-        presented_sequence = db.execute(
-            "SELECT mail_presented_sequence FROM activations WHERE activation_id=?",
-            (invocation.activation_id,),
-        ).fetchone()[0]
-    assert late_sequence > watermark >= presented_sequence
-
-    seen = []
-    notices = []
-    cursor = first["next_cursor"]
-    while cursor is not None:
-        page = tools.peek(cursor=cursor)
-        seen.extend(row["conversation_id"] for row in page["conversations"])
-        if page.get("mail_waiting"):
-            notices.extend(labelled(page))
-        cursor = page["next_cursor"]
-        if cursor is None:
-            assert page["seen_sequence"] is not None
-    assert notices == [("Owner", 1)]
-    assert set(seen) | {original[1]["conversation_id"]} == {
-        item["conversation_id"] for item in original
-    }
-
-    cleared = tools.clear("clear-after-wake-traversal")
-    cleared_ids = {
-        message_id for row in cleared["conversations"] for message_id in row["message_ids"]
-    }
-    assert cleared["count"] == len(original) - 1
-    assert original[1]["message_id"] not in cleared_ids
-    assert late["message_id"] not in cleared_ids
-    assert pending(runtime, founder) == 1
 
 
 def test_mail_notice_orders_owner_operations_manager_then_oldest(system):
@@ -825,16 +734,16 @@ def test_mail_notice_orders_owner_operations_manager_then_oldest(system):
     ]
     runtime.start()
     drain_births(runtime)
-    runtime.messaging.send(founder, [child], "Kickoff", request_id="kickoff")
+    runtime.messaging.send(founder, [child], [], "Kickoff", request_id="kickoff")
     activation = run(runtime)
     assert activation.employee_id == child
-    runtime.messaging.send(peers[0], [child], "Peer note", request_id="peer-early")
-    runtime.messaging.send(peers[1], [child], "Peer note", request_id="peer-late")
-    runtime.messaging.send(founder, [child], "Manager note", request_id="manager")
+    runtime.messaging.send(peers[0], [child], [], "Peer note", request_id="peer-early")
+    runtime.messaging.send(peers[1], [child], [], "Peer note", request_id="peer-late")
+    runtime.messaging.send(founder, [child], [], "Manager note", request_id="manager")
     with runtime.store.transaction() as db:
         runtime.messaging.notice(db, [child], "Operations note", subject="Operations")
-    runtime.messaging.send(OWNER, [child], "Owner note", request_id="owner")
-    runtime.messaging.send(OWNER, [child], "Owner again", request_id="owner-again")
+    runtime.owner.send_mail(OWNER, [child], "Owner note", request_id="owner")
+    runtime.owner.send_mail(OWNER, [child], "Owner again", request_id="owner-again")
     before = pending(runtime, child)
     shown = runtime.tools(activation.token).get_role(role=child)
     # The kickoff mail came with the wake update, so it is not a new arrival.
@@ -850,7 +759,6 @@ def test_mail_notice_orders_owner_operations_manager_then_oldest(system):
         f"1 from founder/early ({peers[0]}), 1 from founder/late ({peers[1]})."
     )
     assert pending(runtime, child) == before
-
 
 
 def test_handoff_cleanup_intent_replays_only_the_applied_request(system):
@@ -883,7 +791,6 @@ def test_handoff_cleanup_requires_a_boolean(system, value):
     actor = run(runtime)
     with pytest.raises(FirmError, match="clean_up must be a boolean"):
         runtime.tools(actor.token).handoff("Done", "wait", "bad", clean_up=value)
-
 
 
 def test_handoff_default_cleanup_is_saved_and_cannot_be_replaced(system):
@@ -1013,7 +920,7 @@ def test_ordinary_events_reuse_guidance_without_an_assessment(tmp_path, event):
     assert current.employee_id == employee
     before = guidance_role(runtime, employee)
     if event == "mail":
-        runtime.messaging.send(OWNER, [employee], "Work", request_id="mail")
+        runtime.owner.send_mail(OWNER, [employee], "Work", request_id="mail")
         runtime.finish(current.activation_id)
     elif event == "handoff":
         runtime.handoff(current.token, "Progress", "continue", "handoff")
@@ -1070,3 +977,404 @@ def test_hire_birth_waits_for_guidance_after_its_level_succeeds(tmp_path):
         assert runtime.levels.record(db, employee)["state"] == "chosen"
         db.execute("UPDATE roles SET guidance_state='defaulted' WHERE employee_id=?", (employee,))
     assert runtime.admit().employee_id == employee
+
+
+def snapshot_ids(runtime, result):
+    with runtime.store.read() as db:
+        return runtime.messaging.offered_ids(db, "founder", result)
+
+
+def frontier(runtime, employee):
+    with runtime.store.read() as db:
+        return runtime.store.role(db, employee)["last_offered_message_sequence"]
+
+
+def test_idle_review_waits_for_global_idle_and_does_not_repeat_pending_mail(system):
+    runtime, founder, _ = system
+    runtime.start()
+    first = run(runtime)
+    quiet = runtime.owner.send_mail(
+        OWNER, [founder], "Useful FYI", action_recipients=[], request_id="quiet",
+    )
+    assert runtime.admit() is None
+    assert "mail_waiting" in runtime.tools(first.token).get_role(role=founder)
+    assert frontier(runtime, founder) == 0
+    runtime.finish(first.activation_id)
+    review = run(runtime)
+    assert review.context["idle_inbox_review"]
+    assert snapshot_ids(runtime, review.context["inbox"]) == [quiet["message_id"]]
+    assert frontier(runtime, founder) > 0
+    assert "mail_waiting" not in runtime.tools(review.token).get_role(role=founder)
+    runtime.owner.send_mail(
+        OWNER, [founder], "During review", action_recipients=[], request_id="during-review",
+    )
+    assert labelled(runtime.tools(review.token).get_role(role=founder)) == [("Owner", 1)]
+    runtime.tools(review.token).peek()
+    runtime.finish(review.activation_id)
+    assert runtime.admit() is None
+    runtime.owner.send_mail(OWNER, [founder], "New FYI", action_recipients=[], request_id="new")
+    following = run(runtime)
+    assert following.context["idle_inbox_review"]
+    assert snapshot_ids(runtime, following.context["inbox"]) != [quiet["message_id"]]
+
+
+def test_idle_review_prefix_exhausts_unchanged_backlog_and_future_hole(system):
+    runtime, founder, now = system
+    runtime.start()
+    first = run(runtime)
+    runtime.finish(first.activation_id)
+    sent = [
+        runtime.owner.send_mail(
+            OWNER, [founder], f"FYI {i}", action_recipients=[], request_id=f"quiet-{i}",
+        )["message_id"]
+        for i in range(13)
+    ]
+    offers = []
+    while review := runtime.admit():
+        runtime.mark_started(review.activation_id)
+        offers.extend(snapshot_ids(runtime, review.context["inbox"]))
+        runtime.finish(review.activation_id)
+    assert offers == sent
+    assert pending(runtime, founder) == 13
+    with runtime.store.transaction() as db:
+        future = runtime.messaging.notice(
+            db, [founder], "Future", subject="Future", ready_at=now[0] + 20
+        )
+    later = runtime.owner.send_mail(
+        OWNER, [founder], "Behind future", action_recipients=[], request_id="behind",
+    )
+    assert runtime.admit() is None
+    now[0] += 20
+    normal = run(runtime)
+    assert not normal.context.get("idle_inbox_review")
+    # A bounded ordinary page leaves a hole, then prefix reviews reach both newer messages.
+    runtime.finish(normal.activation_id)
+    offered = snapshot_ids(runtime, normal.context["inbox"])
+    while review := runtime.admit():
+        runtime.mark_started(review.activation_id)
+        offered.extend(snapshot_ids(runtime, review.context["inbox"]))
+        runtime.finish(review.activation_id)
+    assert future["message_id"] in offered and later["message_id"] in offered
+
+
+
+def test_idle_frontier_rollback_and_prestart_restore(system, monkeypatch):
+    runtime, founder, _ = system
+    runtime.start()
+    first = run(runtime)
+    runtime.finish(first.activation_id)
+    runtime.owner.send_mail(OWNER, [founder], "FYI", action_recipients=[], request_id="quiet")
+    original = runtime.messaging.advance_offered
+
+    def fail_after_offer(*args):
+        original(*args)
+        raise RuntimeError("rollback")
+
+    monkeypatch.setattr(runtime.messaging, "advance_offered", fail_after_offer)
+    with pytest.raises(RuntimeError, match="rollback"):
+        runtime.admit()
+    assert frontier(runtime, founder) == 0
+    monkeypatch.setattr(runtime.messaging, "advance_offered", original)
+    admitted = runtime.admit()
+    assert frontier(runtime, founder) > 0
+    runtime.finish(admitted.activation_id, "interrupted", category="owner_stop")
+    assert frontier(runtime, founder) == 0
+    # Existing recovery may be ordinary work; either way its committed offer is restored
+    # only until mark_started confirms the work period began.
+    retry = run(runtime)
+    offered = frontier(runtime, founder)
+    assert offered > 0
+    runtime.finish(retry.activation_id, "interrupted", category="owner_stop")
+    assert frontier(runtime, founder) == offered
+
+
+def test_two_idle_admits_serialize_and_normal_work_can_run_during_review(system):
+    runtime, founder, _ = system
+    peer = runtime.lifecycle.hire(founder, "peer", "Own peer work.", "default", request_id="peer")[
+        "employee_id"
+    ]
+    runtime.start()
+    while invocation := runtime.admit():
+        runtime.mark_started(invocation.activation_id)
+        runtime.finish(invocation.activation_id)
+    runtime.owner.send_mail(OWNER, [founder], "FYI", action_recipients=[], request_id="quiet")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: runtime.admit(), range(2)))
+    (review,) = [item for item in results if item is not None]
+    assert review.context["idle_inbox_review"]
+    runtime.owner.send_mail(OWNER, [peer], "Act now", request_id="ordinary")
+    normal = runtime.admit()
+    assert normal.employee_id == peer
+    assert not normal.context.get("idle_inbox_review")
+
+
+def test_explicit_future_read_removes_due_wake(system):
+    runtime, founder, now = system
+    runtime.start()
+    first = run(runtime)
+    with runtime.store.transaction() as db:
+        future = runtime.messaging.notice(
+            db, [founder], "Future", subject="Future", ready_at=now[0] + 20
+        )
+    runtime.tools(first.token).read(future["message_id"])
+    runtime.finish(first.activation_id)
+    assert runtime.admit() is None
+    now[0] += 20
+    assert runtime.admit() is None
+
+
+@pytest.mark.parametrize("budget", [1000, 1])
+def test_idle_first_header_budget_progress_or_atomic_refusal(system, monkeypatch, budget):
+    from firm_runtime import messaging
+
+    runtime, founder, _ = system
+    runtime.start()
+    first = run(runtime)
+    runtime.finish(first.activation_id)
+    with runtime.store.transaction() as db:
+        db.execute("UPDATE roles SET identity=? WHERE employee_id=?", ("界" * 250, founder))
+    runtime.messaging.send(founder, [], [founder], "界" * 80, request_id="unicode")
+    monkeypatch.setattr(messaging, "MAX_PEEK_BYTES", budget)
+    if budget == 1:
+        with pytest.raises(FirmError, match="exceeds"):
+            runtime.admit()
+        assert frontier(runtime, founder) == 0
+    else:
+        review = runtime.admit()
+        assert review is not None
+        assert snapshot_ids(runtime, review.context["inbox"])
+        assert len(json.dumps(review.context["inbox"], ensure_ascii=False).encode()) <= budget
+        assert frontier(runtime, founder) > 0
+
+
+def test_sequence_allocation_and_offers_share_serialized_write_transaction(system):
+    from threading import Event
+
+    runtime, founder, _ = system
+    runtime.start()
+    first = run(runtime)
+    started, committed = Event(), Event()
+    other = Runtime(Store.scratch(runtime.store.path, clock=runtime.store.clock))
+
+    def competing_lookup():
+        started.set()
+        result = other.messaging.peek(founder, activation_id=first.activation_id)
+        committed.set()
+        return result
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with runtime.store.transaction() as db:
+            pending_mail = runtime.messaging.notice(db, [founder], "Uncommitted", subject="Serial",
+                                                   wake=False)
+            future = pool.submit(competing_lookup)
+            assert started.wait(2)
+            assert not committed.wait(0.05)
+            assert runtime.store.role(db, founder)["last_offered_message_sequence"] == 0
+        result = future.result(timeout=5)
+    assert pending_mail["message_id"] in snapshot_ids(runtime, result)
+    assert frontier(runtime, founder) > 0
+
+
+def test_idle_review_normal_gate_reuse_and_blocked_work_does_not_starve_peer(system):
+    runtime, founder, now = system
+    peer = runtime.lifecycle.hire(founder, "peer", "Own peer work.", "default",
+                                  request_id="peer")["employee_id"]
+    runtime.start()
+    while invocation := runtime.admit():
+        runtime.mark_started(invocation.activation_id)
+        runtime.finish(invocation.activation_id)
+    runtime.owner.send_mail(OWNER, [founder], "Ordinary but held", request_id="ordinary")
+    runtime.owner.send_mail(OWNER, [peer], "Review later", action_recipients=[], request_id="quiet")
+    with runtime.store.transaction() as db:
+        db.execute("UPDATE roles SET hold_reason='attempts_exhausted' WHERE employee_id=?",
+                   (founder,))
+        db.execute("UPDATE roles SET retry_at=? WHERE employee_id=?", (now[0] + 20, peer))
+    assert runtime.admit() is None
+    now[0] += 20
+    review = run(runtime)
+    assert review.employee_id == peer and review.context["idle_inbox_review"]
+
+
+def test_failed_idle_account_candidate_can_create_normal_work_for_another_role(system, monkeypatch):
+    runtime, founder, _ = system
+    peer = runtime.lifecycle.hire(founder, "peer", "Own peer work.", "default",
+                                  request_id="peer")["employee_id"]
+    runtime.start()
+    while invocation := runtime.admit():
+        runtime.mark_started(invocation.activation_id)
+        runtime.finish(invocation.activation_id)
+    runtime.owner.send_mail(OWNER, [peer], "FYI", action_recipients=[], request_id="quiet")
+    monkeypatch.setattr(runtime.accounts, "enabled", lambda db: True)
+    selected = object()
+
+    def select_account(db, role):
+        if role["employee_id"] == peer:
+            runtime.messaging.notice(db, [founder], "Repair peer", subject="Repair")
+            return None
+        return selected
+
+    monkeypatch.setattr(runtime.accounts, "select", select_account)
+    monkeypatch.setattr(runtime.accounts, "bind", lambda *args: None)
+    admitted = runtime.admit()
+    assert admitted.employee_id == founder
+    assert not admitted.context.get("idle_inbox_review")
+
+
+def test_chained_account_notices_take_normal_priority_before_idle_commit(system, monkeypatch):
+    runtime, founder, _ = system
+    manager = runtime.lifecycle.hire(founder, "manager", "Manage.", "default",
+                                     request_id="manager")["employee_id"]
+    leaf = runtime.lifecycle.hire(manager, "leaf", "Work.", "default",
+                                  request_id="leaf")["employee_id"]
+    quiet = runtime.lifecycle.hire(founder, "quiet", "Work.", "default",
+                                   request_id="quiet")["employee_id"]
+    runtime.start()
+    while invocation := runtime.admit():
+        runtime.mark_started(invocation.activation_id)
+        runtime.finish(invocation.activation_id)
+    for employee in (leaf, quiet):
+        runtime.owner.send_mail(OWNER, [employee], "FYI", action_recipients=[], request_id=employee)
+    monkeypatch.setattr(runtime.accounts, "enabled", lambda db: True)
+    notified = set()
+
+    def select(db, role):
+        employee = role["employee_id"]
+        if employee in {leaf, manager}:
+            if employee not in notified:
+                notified.add(employee)
+                runtime.messaging.notice(db, [role["manager_id"]], "Repair", subject="Repair")
+            return None
+        return object()
+
+    monkeypatch.setattr(runtime.accounts, "select", select)
+    monkeypatch.setattr(runtime.accounts, "bind", lambda *args: None)
+    invocation = runtime.admit()
+    assert invocation.employee_id == founder
+    assert not invocation.context.get("idle_inbox_review")
+
+
+@pytest.mark.parametrize("operation", ["send", "reply", "introduce"])
+def test_role_mail_retry_key_is_exact_and_scoped_to_work_period(system, operation, monkeypatch):
+    runtime, founder, _ = system
+    peer = runtime.lifecycle.hire(founder, "peer", "Help", "default",
+                                  request_id="peer")["employee_id"]
+    source = runtime.owner.send_mail(OWNER, [founder], "Source", subject="Topic",
+                                     request_id="source")
+    runtime.start()
+    first = run(runtime)
+    if first.employee_id != founder:
+        runtime.finish(first.activation_id)
+        first = run(runtime)
+    assert first.employee_id == founder
+    summaries = []
+
+    def summarize(snapshot, session_id):
+        summaries.append(snapshot.source_message_ids)
+        return {"status": "summarized", "summary": "Derived context."}
+
+    monkeypatch.setattr(runtime.messaging, "_summarize", summarize)
+
+    def call(tools, body):
+        if operation == "send":
+            return tools.send([], [OWNER], body, subject="Topic")
+        if operation == "reply":
+            return tools.reply(source["message_id"], [], body)
+        return tools.introduce(source["message_id"], [peer], [], body, summarize=True)
+
+    tools = runtime.tools(first.token)
+    sent = call(tools, "Body")
+    replay = call(tools, "Body")
+    assert replay["message_id"] == sent["message_id"]
+    assert replay["replayed"]
+    assert render_tool_result(operation, replay).startswith(
+        f"Already sent as {sent['message_id']} in this work period; not sent again."
+    )
+    changed = call(tools, "Changed body")
+    assert changed["message_id"] != sent["message_id"]
+    if operation == "introduce":
+        assert len(summaries) == 2
+    runtime.finish(first.activation_id)
+    runtime.owner.send_mail(OWNER, [founder], "Continue", request_id="continue")
+    following = run(runtime)
+    assert following.employee_id == founder
+    again = call(runtime.tools(following.token), "Body")
+    assert again["message_id"] not in {sent["message_id"], changed["message_id"]}
+    if operation == "introduce":
+        assert len(summaries) == 3
+
+
+def test_peek_offered_frontier_stops_at_an_omitted_older_thread(system, monkeypatch):
+    from firm_runtime import messaging
+
+    runtime, founder, _ = system
+    peer = runtime.lifecycle.hire(founder, "peer", "Help", "default",
+                                  request_id="peer")["employee_id"]
+    runtime.start()
+    drain_births(runtime)
+    older = runtime.messaging.send(peer, [], [founder], "Older", subject="Ordinary",
+                                   request_id="older")
+    newer = runtime.owner.send_mail(OWNER, [founder], "Newer", subject="Owner",
+                                    action_recipients=[], request_id="newer")
+    with runtime.store.read() as db:
+        rows = runtime.messaging._pending_rows(db, founder)
+        full = runtime.messaging._overview(rows, founder)
+    monkeypatch.setattr(messaging, "MAX_PEEK_BYTES", len(json.dumps(full).encode()) + 200)
+    result = runtime.messaging.peek(founder)
+    assert [t["message_id"] for t in result["threads"]] == [newer["message_id"]]
+    assert frontier(runtime, founder) == 0
+    runtime.messaging.dismiss(founder, older["message_id"])
+    runtime.messaging.peek(founder)
+    assert frontier(runtime, founder) > 0
+
+
+@pytest.mark.parametrize("operation", ["read", "introduce"])
+def test_summary_cannot_write_after_its_work_period_ends(system, monkeypatch, operation):
+    runtime, founder, _ = system
+    source = runtime.owner.send_mail(OWNER, [founder], "Source", request_id="source")
+    runtime.start()
+    first = run(runtime)
+    peer = runtime.lifecycle.hire(founder, "peer", "Help", "default",
+                                  request_id="peer")["employee_id"]
+    before = count(runtime, "messages")
+
+    def summarize(snapshot, session_id):
+        runtime.finish(first.activation_id)
+        return {"status": "summarized", "summary": "Derived summary."}
+
+    monkeypatch.setattr(runtime.messaging, "_summarize", summarize)
+    tools = runtime.tools(first.token)
+    with pytest.raises(FirmError, match="does not authorize"):
+        if operation == "introduce":
+            tools.introduce(source["message_id"], [peer], [], "Join", summarize=True)
+        else:
+            tools.read(source["message_id"], summarize=True)
+    assert count(runtime, "messages") == before
+    with runtime.store.read() as db:
+        assert db.execute("SELECT disposition FROM message_deliveries WHERE message_id=?",
+                          (source["message_id"],)).fetchone()[0] == "pending"
+
+
+def test_small_idle_snapshot_advances_past_lower_priority_oldest_thread(system, monkeypatch):
+    from firm_runtime import messaging
+
+    runtime, founder, _ = system
+    peer = runtime.lifecycle.hire(founder, "peer", "Help", "default",
+                                  request_id="peer")["employee_id"]
+    runtime.start()
+    drain_births(runtime)
+    older = runtime.messaging.send(peer, [], [founder], "Old", subject="Ordinary",
+                                   request_id="old")
+    newer = runtime.owner.send_mail(OWNER, [founder], "New", subject="Owner",
+                                    action_recipients=[], request_id="new")
+    with runtime.store.read() as db:
+        rows = runtime.messaging.idle_rows(db, founder, runtime.store.clock())
+        one = runtime.messaging._overview(rows[:1], founder, newly_offered=True)
+    monkeypatch.setattr(messaging, "MAX_PEEK_BYTES", len(encoded(one).encode()) + 10)
+    first = run(runtime)
+    assert snapshot_ids(runtime, first.context["inbox"]) == [older["message_id"]]
+    assert frontier(runtime, founder) > 0
+    runtime.finish(first.activation_id)
+    second = run(runtime)
+    assert snapshot_ids(runtime, second.context["inbox"]) == [newer["message_id"]]
+    runtime.finish(second.activation_id)
+    assert runtime.admit() is None

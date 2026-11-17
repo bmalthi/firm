@@ -17,9 +17,9 @@ import pytest
 import yaml
 
 from firm_sandbox import Config, Sandbox, guest_control, mac_vm, mac_vm_guest, sandbox
-from firm_sandbox.compatibility import image_identity
 from firm_sandbox.guest_control import save
 from firm_sandbox.models import VMSettings
+from firm_sandbox.release import image_identity
 
 
 def settings(root, tmp_path):
@@ -125,7 +125,6 @@ def firm(tmp_path, monkeypatch):
                 "firm_id": "firm",
                 "image": str(tmp_path / "image"),
                 "created_with_release": metadata["created_with_release"],
-                "compatibility_generation": metadata["compatibility_generation"],
                 "image_id": metadata["image_id"],
                 "generation": "generation-new",
                 "cpus": 6,
@@ -270,7 +269,6 @@ def test_replace_uses_configured_image_across_sandbox_reopen(firm, tmp_path, mon
                 **original,
                 "image": str(selected),
                 "created_with_release": metadata["created_with_release"],
-                "compatibility_generation": metadata["compatibility_generation"],
                 "image_id": metadata["image_id"],
                 "generation": "replacement-generation",
             },
@@ -350,22 +348,6 @@ def test_clone_rejects_running_source_image_before_copy(tmp_path, monkeypatch):
     shutil.rmtree(root, ignore_errors=True)
 
 
-def test_clone_refuses_mismatched_image_before_creating_guest_state(tmp_path, monkeypatch):
-    image = tmp_path / "image"
-    image.mkdir(mode=0o700)
-    metadata = marked_image(control_user="firmvm")
-    metadata["compatibility_generation"] += 1
-    save(image / "image.json", metadata)
-    root = tmp_path / "firm"
-    monkeypatch.setattr(mac_vm.shutil, "which", lambda _: "/opt/homebrew/bin/limactl")
-    box = mac_vm.MacVM(settings(root, tmp_path), image=image)
-    with pytest.raises(ValueError, match="requires generation"):
-        box._clone(image)
-    assert not box.instance.exists()
-    monkeypatch.setattr(box.paths, "prepare", lambda: pytest.fail("projected Lima files"))
-    with pytest.raises(ValueError, match="requires generation"):
-        box.up()
-    assert not box.instance.exists()
 
 
 def test_down_uses_vz_stop_when_filter_is_unavailable(firm, monkeypatch):
@@ -1269,3 +1251,18 @@ def test_clone_records_the_image_account_inventory_once(firm, monkeypatch, count
     assert vm.instance == vm.root / "lima/mac"
     save(image / "image.json", marked_image(enrollment={"stations": 1}))
     assert len(vm.stations) == count
+
+
+@pytest.mark.parametrize("identity", [None, "", "wrong", "g" * 32])
+def test_clone_refuses_invalid_image_identity_before_creating_guest(
+    tmp_path, monkeypatch, identity
+):
+    image = tmp_path / "image"
+    image.mkdir(mode=0o700)
+    save(image / "image.json", marked_image(control_user="firmvm", image_id=identity))
+    root = tmp_path / "firm"
+    monkeypatch.setattr(mac_vm.shutil, "which", lambda _: "/opt/homebrew/bin/limactl")
+    box = mac_vm.MacVM(settings(root, tmp_path), image=image)
+    with pytest.raises(ValueError, match="image identity"):
+        box._clone(image)
+    assert not box.instance.exists()

@@ -434,8 +434,8 @@ def test_chooser_failures_retry_then_default_with_an_owner_notice(system):
     assert event["attempts"] == 3
     with runtime.store.read() as db:
         (notice,) = db.execute(
-            "SELECT subject,body,recipients_json FROM messages WHERE subject=?",
-            ("Hire level defaulted",),
+            "SELECT subject,body,recipients_json FROM messages WHERE body LIKE ?",
+            ("Hire level defaulted\n\n%",),
         ).fetchall()
     assert "founder/finance" in notice["body"] and "medium class at high effort" in notice["body"]
     assert OWNER in notice["recipients_json"]
@@ -473,7 +473,7 @@ def test_isolated_chooser_failure_records_the_provider_reason_through_to_the_not
             for row in db.execute("SELECT kind,state,reason FROM summary_runs").fetchall()
         }
         (notice,) = db.execute(
-            "SELECT body FROM messages WHERE subject='Hire level defaulted'"
+            "SELECT body FROM messages WHERE body LIKE 'Hire level defaulted\n\n%'"
         ).fetchall()
     assert reasons == {("staffing", "unavailable", "process_exit")}
     assert "Last reason: process_exit." in notice["body"]
@@ -563,7 +563,7 @@ def test_oversized_hire_defaults_once_without_reserving_or_rewriting_mandate(
         assert levels._mandate_body(db, employee_id) == mandate
         assert db.execute("SELECT COUNT(*) FROM summary_runs").fetchone()[0] == 0
         (notice,) = db.execute(
-            "SELECT body,recipients_json FROM messages WHERE subject='Hire level defaulted'"
+            "SELECT body,recipients_json FROM messages WHERE body LIKE 'Hire level defaulted\n\n%'"
         ).fetchall()
         assert "Failed assessments: 1." in notice["body"]
         assert decision["reason"] in notice["body"] and OWNER in notice["recipients_json"]
@@ -1002,8 +1002,8 @@ def test_inflight_guidance_success_and_failure_guards(system, action, failure):
         assert not events(runtime, "guidance.chosen") and not events(runtime, "guidance.defaulted")
         with runtime.store.read() as db:
             assert not db.execute(
-                "SELECT 1 FROM messages WHERE subject IN "
-                "('Hire level defaulted','Role guidance not selected')"
+                "SELECT 1 FROM messages WHERE body LIKE 'Hire level defaulted\n\n%' "
+                "OR body LIKE 'Role guidance not selected\n\n%'"
             ).fetchone()
     elif action == "owner":
         assert result["guidance_state"] == "owner" and result["scope_guidance"] == "team-leader"
@@ -1090,8 +1090,9 @@ def test_guidance_fallback_keeps_ids_and_sends_one_notice_then_no_retries(system
     assert role(runtime, employee)["guidance_state"] == "defaulted"
     assert role(runtime, employee)["scope_guidance"] == "specialist-adviser"
     with runtime.store.read() as db:
-        (notice,) = db.execute("SELECT body FROM messages WHERE subject IN "
-                              "('Hire level defaulted','Role guidance not selected')").fetchall()
+        (notice,) = db.execute("SELECT body FROM messages WHERE "
+                              "body LIKE 'Hire level defaulted\n\n%' OR "
+                              "body LIKE 'Role guidance not selected\n\n%'").fetchall()
         assert "Specialist adviser, Legal work" in notice[0]
         assert ("default level" in notice[0]) == level_due
     runtime.admit()
@@ -1171,7 +1172,7 @@ def test_long_default_reason_is_whole_in_storage_notice_and_inspection(system):
             == reason
         )
         (notice,) = db.execute(
-            "SELECT body FROM messages WHERE subject='Hire level defaulted'"
+            "SELECT body FROM messages WHERE body LIKE 'Hire level defaulted\n\n%'"
         ).fetchall()
         assert reason in notice[0]
     for kind in ("level.defaulted", "guidance.defaulted"):

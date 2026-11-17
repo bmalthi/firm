@@ -751,9 +751,9 @@ def main():
     if not (args.root / "durable" / "firm.sqlite3").is_file():
         parser.error(f"{args.root} has no runtime database; run `firm init` on it first, "
                      "because the check changes the network with `firm network`")
-    from firm_runtime.compatibility import validate_firm
+    from firm_sandbox.firm_paths import validate_firm_directories
 
-    validate_firm(args.root)
+    validate_firm_directories(args.root)
     from firm_sandbox import Config
 
     config = Config.load(args.root / "sandbox.toml")

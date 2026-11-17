@@ -233,9 +233,17 @@ class TaskService:
                         result = {"status": "completed", "answer": answer}
                     break
         except ProviderSetupError as exc:
-            if exc.category in {"auth", "config", "quota"}:
-                with self.store.transaction() as db:
-                    self.runtime.accounts.hold(db, "account", launch.account_id, exc.category)
+            with self.store.transaction() as db:
+                if exc.category in {"auth", "quota"}:
+                    self.runtime.accounts.hold(
+                        db, "account", launch.account_id, exc.category, code=exc.code
+                    )
+                elif exc.category == "config":
+                    # The task's own settings failed, not the account or the role's
+                    # profile: refuse this call and tell the owner, but pause nothing.
+                    self.runtime.accounts.report_task_setup(
+                        db, launch.provider, launch.model, exc.code
+                    )
             result = unavailable(
                 "configuration" if exc.category == "config" else "provider_failure"
             )

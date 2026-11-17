@@ -5,7 +5,7 @@ part.
 
 - Start from what the intended reader already knows and what they need to do or decide afterwards. Supply the
   knowledge they lack and leave out what they already have.
-- Find a weakness at the level where it lives: missing knowledge, an unsupported argument, poor organisation or
+- Find a weakness at the level where it lives: missing knowledge, an unsupported argument, poor organization or
   unclear wording. Fix it there. Polishing the sentences around a hole doesn't fill it.
 - For an argument, lay out the claim, the reasons and the evidence. Supply the missing connection, or narrow the claim
   to what the material supports.

@@ -165,6 +165,90 @@ def test_summary_service_normalizes_timeout_without_retry():
     assert result["reason"] == "timeout"
 
 
+def test_stateless_slot_reservations_survive_restart_and_quarantine_unconfirmed_runs(tmp_path):
+    store = Store.scratch(tmp_path / "firm.sqlite3")
+    service = SummaryService(store=store)
+    reservations = [service._reserve(summary_snapshot(), None) for _ in range(4)]
+    assert [value[1]["stateless_slot"] for value in reservations] == [0, 1, 2, 3]
+    assert service._reserve(summary_snapshot(), None) is None
+    restarted = SummaryService(store=Store.scratch(store.path))
+    assert restarted._reserve(summary_snapshot(), None) is None
+    # VM power-off kills processes but cannot prove persistent homes were erased.
+    assert restarted.reconcile(set(), host_stopped=True) == 0
+    assert restarted._reserve(summary_snapshot(), None) is None
+    # A healthy inventory still containing the unresolved calls retains every slot.
+    active = {value[0] for value in reservations}
+    assert restarted.reconcile(active) == 0
+    assert restarted._reserve(summary_snapshot(), None) is None
+    active.remove(reservations[2][0])
+    assert restarted.reconcile(active) == 1
+    assert restarted._reserve(summary_snapshot(), None)[1]["stateless_slot"] == 2
+
+
+@pytest.mark.parametrize("start_fails", [False, True])
+def test_provider_output_or_failed_start_keeps_slot_until_guest_cleanup(tmp_path, start_fails):
+    from firm_sandbox import Run, RunSpec
+
+    from firm_runtime.summaries import summary_role_id
+
+    class Sandbox:
+        def start(self, spec):
+            self.run = Run(spec.role_id, spec.run_id, "generation")
+            if start_fails:
+                raise RuntimeError("Stateless slot preparation did not complete")
+            return self.run
+
+        def follow(self, run):
+            yield b"valid completed provider output"
+
+        def status(self, run):
+            return {"running": False, "unresolved": True, "exit_code": 0}
+
+        stop = status
+
+        def retire(self, role_id):
+            pytest.fail("a stateless slot must never be retired")
+
+    box = Sandbox()
+    runner = SandboxSummaryRunner(
+        box,
+        lambda request: RunSpec(
+            summary_role_id(request.run_id, request.stateless_slot), ("true",),
+            run_id=request.run_id, stateless=True,
+        ),
+        lambda *args: pytest.fail("unconfirmed cleanup must reject provider output"),
+    )
+    store = Store.scratch(tmp_path / "firm.sqlite3")
+    service = SummaryService(runner, store=store)
+    result = service.run_isolated("fixture")
+    assert result == {"status": "unavailable", "reason": "provider_exit_unconfirmed"}
+    with store.read() as db:
+        record = dict(db.execute("SELECT * FROM summary_runs").fetchone())
+    assert record["state"] == "running" and record["stateless_slot"] == 0
+    runner.confirm_host_stop()
+    assert runner._handles[box.run.run_id].exit_confirmed is False
+    assert service.reconcile(set(), host_stopped=True) == 0
+    if start_fails:
+        assert runner._handles[box.run.run_id].run is None
+    # A restarted host also reserves a different account while this slot is dirty.
+    restarted = SummaryService(store=Store.scratch(store.path))
+    assert restarted._reserve(summary_snapshot(), None)[1]["stateless_slot"] == 1
+    active = runner.reconcile(
+        {box.run.run_id: (box.run, box.status(box.run))}, [record], now=0,
+    )
+    assert service.reconcile(active, candidate_ids={box.run.run_id}) == 0
+    # A later verified cleanup resolves the original run, without account retirement.
+    active = runner.reconcile(
+        {box.run.run_id: (box.run, {"running": False, "unresolved": False})}, [record], now=0,
+    )
+    assert service.reconcile(active, candidate_ids={box.run.run_id}) == 1
+    assert service._reserve(summary_snapshot(), None)[1]["stateless_slot"] == 0
+    with runner._lock:
+        maintenance = tuple(runner._maintenance.values())
+    for thread in maintenance:
+        thread.join(2)
+
+
 def test_summary_service_persists_usage_and_latency(tmp_path):
     class Provider:
         def summarize(self, prompt, *, timeout):
@@ -469,7 +553,11 @@ def test_generated_isolated_run_ids_build_real_provider_specs(tmp_path, kind):
         start_url="http://firm/summary/start",
     )
 
-    result = SummaryService(runner).run_isolated("bounded", kind=kind)
+    with pytest.raises(ValueError, match="durable slot reservations"):
+        SummaryService(runner).run_isolated("bounded", kind=kind)
+    result = SummaryService(runner, store=Store.scratch(tmp_path / "firm.sqlite3")).run_isolated(
+        "bounded", kind=kind,
+    )
 
     assert result == {"status": "completed", "text": "derived"}
     assert sandbox.spec.run_id.startswith("run-")
@@ -582,7 +670,7 @@ def test_reconcile_uses_the_dispatchers_own_inventory_status_without_asking_agai
     runner._handles[run.run_id] = handle
     maintenance = []
     runner._maintain = lambda action, run: maintenance.append((action, run))
-    records = [{"run_id": run.run_id, "deadline": 1_000_000}]
+    records = [{"run_id": run.run_id, "deadline": 1_000_000, "stateless_slot": None}]
     status = {"running": not unresolved, "unresolved": unresolved}
     active = runner.reconcile({run.run_id: (run, status)}, records, now=0)
     assert active == {run.run_id}
@@ -615,7 +703,7 @@ def test_completed_summary_backlog_retires_once_without_a_burst_or_delaying_stop
         for i in range(31)
     ]
     inventory = {run.run_id: (run, {"running": False}) for run in runs}
-    records = [{"run_id": run.run_id, "deadline": 0} for run in runs]
+    records = [{"run_id": run.run_id, "deadline": 0, "stateless_slot": None} for run in runs]
 
     def join_maintenance():
         with runner._lock:
@@ -659,7 +747,7 @@ def test_failed_summary_retirement_retries_until_success():
     for now in range(3):
         runner.reconcile(
             {run.run_id: (run, {"running": False})},
-            [{"run_id": run.run_id, "deadline": 0}],
+            [{"run_id": run.run_id, "deadline": 0, "stateless_slot": None}],
             now=now,
         )
         with runner._lock:

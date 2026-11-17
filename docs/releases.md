@@ -5,31 +5,13 @@ package versions must match; the runtime pins that exact sandbox release. Packag
 metadata checks enforce equality. The sandbox package is an implementation boundary,
 not a separately supported version choice for owners.
 
-## Existing firms and images
+## Development state
 
-`firm-release.json` records the creating release and compatibility generation.
-The single generation constant lives in
-`packages/firm-sandbox/src/firm_sandbox/compatibility.py`. It is shared by runtime
-state and VM/image contracts. Change it only for a breaking persisted-state or
-guest-contract change, not every patch release.
-
-Equal generations can reuse an existing firm. Its original creating release and
-image provenance remain intact. New Mac images and retained Linux/Mac VM records
-carry compatibility and image identity too. An image recipe/digest identifies what
-created a disk; it is not a second package version.
-
-The ordinary Store constructor checks the marker before any directory, database,
-WAL, schema or secret writes. CLI and host entry points also check before other
-mutating work. VM drivers check their records before booting or installing guest
-controllers. Missing, malformed, older
-and newer generations refuse changes. There is no force override or migration.
-Use the original runtime to stop and export an incompatible firm, retain that
-runtime with its data, and explicitly create a new firm and image for the new
-generation. Never add a marker to an old firm to bypass a refusal.
-
-`firm analyze` remains a read-only diagnostic, subject to its schema/coverage limits.
-The running original host can stop its firm; sandbox emergency power-off remains
-available without upgrading its database. See [runtime operations](runtime.md).
+Firm is under active development. Breaking database and guest-contract changes are
+allowed; there are no release markers, compatibility generations, or version gates.
+Do not add migrations or fallback shims. Use fresh disposable firms and images when
+a development change requires new state. Existing data is never automatically deleted
+or reset. Filesystem ownership, firm identity, and export integrity checks remain.
 
 ## Local candidate checks
 
@@ -53,7 +35,7 @@ separately, and does not launch a VM or contact a provider. Release verification
 requires this `offline_workflow` receipt check.
 
 `dist/release-evidence.json` records the source revision, dirty-checkout status,
-compatibility generation, package SHA256 hashes and checks. Generated reports and
+package SHA256 hashes and checks. Generated reports and
 firm data remain ignored. A dirty local checkout produces development evidence;
 publication requires evidence from a clean, tagged checkout.
 
@@ -85,7 +67,7 @@ candidate wheels as described in [installation](installation.md), then:
    after a host-process interruption; check the visible recovery state.
 
 Also exercise canceled sign-in, rejected credentials/model, insufficient resources,
-interrupted provisioning, occupied ports/second start, incompatible state/image,
+interrupted provisioning, occupied ports/second start,
 oversized/traversing artifact paths and provider limits. Every failure must preserve
 work and give an actionable next step. The automated fake-boundary and browser
 checks cover deterministic cases; they do not substitute for real provisioning and

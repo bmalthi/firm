@@ -21,7 +21,6 @@ import yaml
 
 from firm_sandbox import guest_control, linux_base, linux_vm
 from firm_sandbox import lima_paths as paths_module
-from firm_sandbox.compatibility import COMPATIBILITY_GENERATION
 from firm_sandbox.models import VMSettings
 
 
@@ -61,20 +60,6 @@ def test_image_policy_requires_linux_vz_usernet_without_mounts(image, tmp_path):
         linux_vm._validate_image(image)
 
 
-def test_retained_vm_generation_refuses_before_resize(vm, monkeypatch):
-    state = {
-        "firm_id": vm.settings.firm_id,
-        "subnet": vm.subnet,
-        "cpus": 1,
-        "memory_gib": 1,
-        "created_with_release": "0.0.9",
-        "compatibility_generation": COMPATIBILITY_GENERATION + 1,
-        "image_id": hashlib.sha256(linux_vm.IMAGE.read_bytes()).hexdigest(),
-    }
-    vm._state = lambda: state
-    monkeypatch.setattr(linux_vm, "resize_instance", lambda *args: pytest.fail("resized"))
-    with pytest.raises(ValueError, match="0.0.9.*requires generation"):
-        vm._validate_existing()
 
 
 def test_compatible_release_keeps_original_image_provenance(vm):
@@ -82,7 +67,6 @@ def test_compatible_release_keeps_original_image_provenance(vm):
         "firm_id": vm.settings.firm_id, "subnet": vm.subnet,
         "cpus": vm.settings.cpus, "memory_gib": vm.settings.memory_gib,
         "created_with_release": "0.0.9",
-        "compatibility_generation": COMPATIBILITY_GENERATION,
         "image_id": "0" * 64,
     }
     vm._state = lambda: state
@@ -98,7 +82,6 @@ def test_moved_vm_keeps_recorded_network(vm, tmp_path):
         "cpus": vm.settings.cpus,
         "memory_gib": vm.settings.memory_gib,
         "created_with_release": "0.1.0",
-        "compatibility_generation": COMPATIBILITY_GENERATION,
         "image_id": "0" * 64,
     }))
     destination = tmp_path / "moved-firm"
@@ -108,16 +91,6 @@ def test_moved_vm_keeps_recorded_network(vm, tmp_path):
     assert moved.subnet == moved.network.subnet == "192.168.68.0/24"
 
 
-def test_incompatible_vm_refuses_before_projecting_lima_files(vm, monkeypatch):
-    vm.record.parent.mkdir(parents=True, exist_ok=True)
-    guest_control.save(vm.record, {
-        "created_with_release": "0.0.9",
-        "compatibility_generation": COMPATIBILITY_GENERATION + 1,
-        "image_id": "0" * 64,
-    })
-    monkeypatch.setattr(vm.paths, "prepare", lambda: pytest.fail("projected Lima files"))
-    with pytest.raises(ValueError, match="requires generation"):
-        vm._prepare()
 
 
 def test_firm_recipe_configures_identity_and_marks_this_boot_ready(image):

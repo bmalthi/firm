@@ -5,7 +5,7 @@ Deterministic programs through the real dispatcher and the authenticated guest M
 in FIRM_DIR, so the owner's own commands (`firm analyze`, `firm requests`, `firm network`)
 read and decide the same record while the firm runs. Run only against a fresh disposable
 firm whose file server is unbound and which has no runtime database. Writes `result.json`
-with PASS or FAIL per step and each work period's log: mail subjects only, never bodies,
+with PASS or FAIL per step and each work period's log: notice titles only, never notice text,
 and never credentials.
 """
 
@@ -43,13 +43,15 @@ def result_fields(text):
     return values
 
 
-def waiting_mail(text):
-    """The waiting mail a rendered peek lists: message id, sender and subject, no body."""
+def notice_titles(text):
+    """Keep only the title line of each Operations notice returned by read."""
     rows = []
-    for line in text.splitlines():
-        match = re.match(r"\s+(\S+) · (.+?): (.+)$", line)
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(r"^(m[0-9a-z]+) · Operations · (?:Action|FYI) · ", line)
         if match:
-            rows.append({"message_id": match[1], "sender": match[2], "subject": match[3]})
+            rows.append({"message_id": match[1], "sender": "Operations",
+                         "title": lines[index + 1]})
     return rows
 '''
 
@@ -100,10 +102,12 @@ def access(name, host):
 
 def inbox():
     ok, text = tool("peek", {})
-    rows = waiting_mail(text) if ok else []
-    if rows:
-        tool("dismiss", {"request_id": f"requests-probe-{phase}-dismiss",
-                         "message_ids": [row["message_id"] for row in rows]})
+    rows = []
+    if ok:
+        for message_id in re.findall(r"^(m[0-9a-z]+) · ", text, re.MULTILINE):
+            read, messages = tool("read", {"message_id": message_id})
+            if read:
+                rows.extend(notice_titles(messages))
     return rows
 
 
@@ -170,8 +174,8 @@ def curl_result(value):
             "connect": code(codes.get("connect"))}
 
 
-def has_subject(mail, subject):
-    return any(row["subject"] == subject and "Operations" in row["sender"] for row in mail or ())
+def has_title(mail, title):
+    return any(row["title"] == title and "Operations" in row["sender"] for row in mail or ())
 
 
 def refused_with_note(answer):
@@ -382,8 +386,8 @@ class RequestsCheck:
         second = second or {}
         report.check(
             "grant_wakes_role",
-            activation["created_at"] >= granted_at - 1 and has_subject(
-                second.get("mail"), self.subject("access_granted_subject", HOST)),
+            activation["created_at"] >= granted_at - 1 and has_title(
+                second.get("mail"), self.notice_title("access_granted_subject", HOST)),
             {"activation": activation, "mail": second.get("mail")},
         )
         after = curl_result(second.get("host"))
@@ -421,7 +425,7 @@ class RequestsCheck:
         third = third or {}
         report.check(
             "deny_wakes_role",
-            has_subject(third.get("mail"), self.subject("access_denied_subject", WILDCARD)),
+            has_title(third.get("mail"), self.notice_title("access_denied_subject", WILDCARD)),
             {"activation": activation, "mail": third.get("mail")},
         )
         report.check("denied_host_under_wildcard", refused_with_note(third.get("under")),
@@ -441,7 +445,7 @@ class RequestsCheck:
         )
 
     @staticmethod
-    def subject(name, host):
+    def notice_title(name, host):
         from firm_runtime.prompt_resources import render
 
         return render("notices", name, resource=host)
@@ -474,12 +478,12 @@ def main():
         parser.error(f"{database} exists; this check creates the runtime database itself and "
                      "needs a fresh disposable firm")
     from firm_sandbox import Config, Sandbox
+    from firm_sandbox.firm_paths import validate_firm_directories
 
-    from firm_runtime.compatibility import validate_firm
     from firm_runtime.runtime import Runtime
     from firm_runtime.store import Store
 
-    validate_firm(args.root)
+    validate_firm_directories(args.root)
     box = Sandbox(Config.load(args.root / "sandbox.toml"))
     if box.file_server.database_identity() is not None:
         parser.error(f"{args.root} has already served a runtime database; use a fresh firm")

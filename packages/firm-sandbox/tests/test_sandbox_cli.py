@@ -9,11 +9,6 @@ import pytest
 from firm_sandbox import cli
 
 
-@pytest.fixture(autouse=True)
-def synthetic_firm_marker(monkeypatch):
-    monkeypatch.setattr(cli, "validate_firm_record", lambda _directory: None)
-
-
 @pytest.mark.parametrize("option", ["--env", "--secret", "--secret-env"])
 @pytest.mark.parametrize("value", ["NAME", "=value"])
 def test_assignment_options_explain_the_required_shape(option, value):
@@ -28,27 +23,17 @@ def test_assignment_options_preserve_empty_and_embedded_equals_values():
     }
 
 
-def test_sandbox_only_init_creates_marker_without_database_or_vm(tmp_path, monkeypatch, capsys):
+def test_sandbox_only_init_needs_no_marker_database_or_vm(tmp_path, monkeypatch, capsys):
     config = tmp_path / "sandbox.toml"
     config.write_text('[firm]\nid = "enrollment"\n')
     monkeypatch.setattr(cli, "Sandbox", lambda _: pytest.fail("constructed a sandbox"))
     monkeypatch.setattr(sys, "argv", ["firm-sandbox", "--config", str(config), "init"])
     cli.main()
-    assert json.loads(capsys.readouterr().out)["compatibility_generation"] > 0
-    assert (tmp_path / "firm-release.json").is_file()
+    assert json.loads(capsys.readouterr().out)["status"] == "initialized"
+    assert not (tmp_path / "firm-release.json").exists()
     assert not (tmp_path / "durable").exists()
 
 
-def test_sandbox_only_init_refuses_to_stamp_an_existing_vm(tmp_path, monkeypatch, capsys):
-    config = tmp_path / "sandbox.toml"
-    config.write_text('[firm]\nid = "enrollment"\n')
-    (tmp_path / "durable" / "linux").mkdir(parents=True)
-    monkeypatch.setattr(cli, "Sandbox", lambda _: pytest.fail("constructed a sandbox"))
-    monkeypatch.setattr(sys, "argv", ["firm-sandbox", "--config", str(config), "init"])
-    with pytest.raises(SystemExit):
-        cli.main()
-    assert "does not stamp or migrate" in capsys.readouterr().err
-    assert not (tmp_path / "firm-release.json").exists()
 
 
 def test_cli_loads_one_sandbox_configuration(tmp_path, monkeypatch, capsys):
@@ -74,33 +59,11 @@ def test_cli_loads_one_sandbox_configuration(tmp_path, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["running"] is True
 
 
-def test_cli_checks_compatibility_before_constructing_sandbox(tmp_path, monkeypatch):
+
+
+def test_emergency_down_needs_no_release_marker(tmp_path, monkeypatch):
     config = tmp_path / "sandbox.toml"
     config.write_text("[firm]\nid = 'test-firm'\n")
-    calls = []
-    monkeypatch.setattr(cli, "validate_firm_record", lambda root: calls.append(("guard", root)))
-
-    class Box:
-        def __init__(self, _config):
-            calls.append(("sandbox", None))
-
-        def up(self):
-            return {"running": True}
-
-    monkeypatch.setattr(cli, "Sandbox", Box)
-    monkeypatch.setattr(sys, "argv", ["firm-sandbox", "--config", str(config), "up"])
-    cli.main()
-    assert calls == [("guard", tmp_path), ("sandbox", None)]
-
-
-def test_emergency_down_bypasses_compatibility_marker(tmp_path, monkeypatch):
-    config = tmp_path / "sandbox.toml"
-    config.write_text("[firm]\nid = 'test-firm'\n")
-    monkeypatch.setattr(
-        cli,
-        "validate_firm_record",
-        lambda _root: pytest.fail("shutdown checked compatibility"),
-    )
 
     class Box:
         def __init__(self, _config):
@@ -278,7 +241,7 @@ def test_replace_cli_uses_loaded_configuration(monkeypatch):
     assert calls == ["replace"]
 
 
-@pytest.mark.parametrize("action", ["logs", "run"])
+@pytest.mark.parametrize("action", ["logs", "logs-selected", "run"])
 def test_cli_emits_complete_sandbox_logs(tmp_path, monkeypatch, capsysbinary, action):
     content = b"x" * (1024 * 1024) + b"last page\n"
     calls = []
@@ -288,6 +251,8 @@ def test_cli_emits_complete_sandbox_logs(tmp_path, monkeypatch, capsysbinary, ac
             pass
 
         def logs(self, run):
+            if action == "logs-selected":
+                assert run.run_id == "earlier" and run.role_id == "analyst"
             calls.append("logs")
             return content
 
@@ -300,6 +265,9 @@ def test_cli_emits_complete_sandbox_logs(tmp_path, monkeypatch, capsysbinary, ac
             assert role == "analyst"
             return object()
 
+        def runs(self):
+            return [SimpleNamespace(role_id="analyst", run_id=name) for name in ("earlier", "last")]
+
         def start(self, spec):
             return object()
 
@@ -309,6 +277,8 @@ def test_cli_emits_complete_sandbox_logs(tmp_path, monkeypatch, capsysbinary, ac
     monkeypatch.setattr(cli, "Sandbox", Box)
     monkeypatch.setattr(cli.Config, "load", lambda path: object())
     arguments = ["logs", "analyst"] if action == "logs" else ["run", "analyst", "true"]
+    if action == "logs-selected":
+        arguments = ["logs", "analyst", "--run-id", "earlier"]
     monkeypatch.setattr(sys, "argv", ["firm-sandbox", *arguments])
     if action == "run":
         with pytest.raises(SystemExit) as result:
@@ -317,7 +287,7 @@ def test_cli_emits_complete_sandbox_logs(tmp_path, monkeypatch, capsysbinary, ac
     else:
         cli.main()
     assert capsysbinary.readouterr().out == content
-    assert calls == ["logs" if action == "logs" else "follow"]
+    assert calls == ["follow" if action == "run" else "logs"]
 
 
 def test_mac_recovery_requires_explicit_owner_confirmation(tmp_path, monkeypatch):
@@ -582,3 +552,17 @@ def test_storage_help_explains_category_and_request_budgets(monkeypatch, capsys)
     help_text = " ".join(capsys.readouterr().out.split())
     assert "du estimates" in help_text and "share 60s" in help_text
     assert "unknown measurements individually" in help_text
+
+
+def test_cli_refuses_durable_symlink_before_constructing_sandbox(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "sandbox.toml"
+    config.write_text('[firm]\nid = "test-firm"\n')
+    external = tmp_path / "external"
+    external.mkdir()
+    (tmp_path / "durable").symlink_to(external)
+    monkeypatch.setattr(cli, "Sandbox", lambda _: pytest.fail("Sandbox constructed"))
+    monkeypatch.setattr(sys, "argv", ["firm-sandbox", "--config", str(config), "up"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert "owner-controlled" in capsys.readouterr().err
+    assert not list(external.iterdir())

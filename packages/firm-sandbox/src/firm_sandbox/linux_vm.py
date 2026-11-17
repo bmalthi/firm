@@ -25,15 +25,11 @@ import yaml
 
 from . import linux_base
 from .commands import Commands, VMStateError, lima_status, parse_lima_list, resize_instance
-from .compatibility import (
-    COMPATIBILITY_GENERATION,
-    release_identifier,
-    validate_retained_vm,
-)
 from .guest_control import GuestControl, lifecycle, private_directory, read_record, save
 from .host_network import HostNetwork
 from .lima_paths import lima_paths
 from .models import VMSettings
+from .release import release_identifier
 
 INSTANCE = "linux"
 IMAGE = Path(__file__).with_name("assets") / "linux-vm.yaml"
@@ -199,9 +195,9 @@ class LinuxVM(GuestControl):
         return read_record(self.record)
 
     def _validate_existing(self) -> None:
-        state = validate_retained_vm(self._state())
+        state = self._state()
         # This digest records the template the retained VM was created from.
-        # Compatible releases may change the template used to create new VMs.
+        # New VMs may use a different template.
         if state.get("firm_id") != self.settings.firm_id:
             raise ValueError("VM record belongs to another firm identity")
         if state.get("subnet") != self.subnet:
@@ -261,8 +257,6 @@ class LinuxVM(GuestControl):
         temporary.replace(path)
 
     def _prepare(self, *, checkpoint=lambda: None) -> None:
-        if self.record.exists():
-            validate_retained_vm(self._state())
         private_directory(self.root)
         private_directory(self.network.paths["scratch"])
         _validate_image(IMAGE)
@@ -300,7 +294,6 @@ class LinuxVM(GuestControl):
                 "firm_id": self.settings.firm_id,
                 "generation": uuid.uuid4().hex,
                 "created_with_release": release_identifier(),
-                "compatibility_generation": COMPATIBILITY_GENERATION,
                 "image_id": hashlib.sha256(IMAGE.read_bytes()).hexdigest(),
                 "base_image": {
                     "key": base.stem,

@@ -106,12 +106,9 @@ Both environment paths are ignored by Git. The `.nosync` suffix is an
 | `docs/` | Installation and operator instructions |
 | `design/` | Implemented contracts and explicit deferred proposals |
 
-There are no database migrations or compatibility shims. Stop and export a firm
-before updating code that changes its schema; read that export using its original
-code revision, and create a new firm for the changed schema.
-
-Both packages ship as one version; the runtime pins its matching sandbox package.
-Breaking persisted-state or guest-contract changes increment one shared compatibility
-generation. The marker must be checked before opening a mutating Store or changing
-a guest. Compatible releases retain original firm/image provenance. The
-[release guide](releases.md) covers archive/install checks, browser acceptance and live first-run evidence.
+Breaking persisted-state and guest-contract changes are allowed during development.
+There are no compatibility gates, generation markers, migrations, or fallback shims.
+Use fresh disposable state when a change needs it; never automatically reset existing
+data. Both packages ship as one version, with the runtime pinning its matching sandbox.
+The [release guide](releases.md) covers archive/install checks, browser acceptance and
+live first-run evidence.

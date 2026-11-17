@@ -23,6 +23,6 @@ can't say.
   they add reading without changing the decision.
 - Generate every reported table and figure from the data with steps someone else can rerun. Don't type calculated
   numbers in by hand.
-- Build a chart around the comparison the reader must make, and say whether a movement reflects behaviour, mix or a
+- Build a chart around the comparison the reader must make, and say whether a movement reflects behavior, mix or a
   changed denominator.
 - When a result will be used repeatedly, say what would show it has stopped being trustworthy.

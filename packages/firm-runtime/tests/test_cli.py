@@ -159,7 +159,7 @@ def test_init_missing_inputs_does_not_leave_an_empty_database(tmp_path, monkeypa
 
 
 def test_init_resumes_a_marked_database_schema_before_firm_record(tmp_path, monkeypatch, capsys):
-    from firm_runtime.compatibility import initialize_firm
+
     from firm_runtime.store import Store
 
     directory = tmp_path / "interrupted"
@@ -172,7 +172,6 @@ def test_init_resumes_a_marked_database_schema_before_firm_record(tmp_path, monk
     directory.mkdir()
     (directory / "mandate.md").write_text(mandate.read_text())
     (directory / "firm.toml").write_text(config.read_text())
-    initialize_firm(directory)
     database = directory / "durable" / "firm.sqlite3"
     Store(database)
 
@@ -180,61 +179,11 @@ def test_init_resumes_a_marked_database_schema_before_firm_record(tmp_path, monk
 
     assert result["firm"]["firm_id"] == directory.name
     assert result["firm"]["state"] == "stopped"
-    assert (directory / "firm-release.json").is_file()
-
-
-def test_init_never_stamps_or_opens_an_unmarked_legacy_database(tmp_path, monkeypatch, capsys):
-    from firm_runtime.store import Store
-
-    directory = tmp_path / "legacy"
-    mandate = tmp_path / "legacy-mandate.md"
-    mandate.write_text("Build a useful firm.\n")
-    config = tmp_path / "legacy-firm.toml"
-    config.write_text(
-        'max_active = 1\nstaffing = false\nfounder_profile = "controlled"\n[profiles.controlled]\n'
-    )
-    directory.mkdir()
-    (directory / "mandate.md").write_text(mandate.read_text())
-    (directory / "firm.toml").write_text(config.read_text())
-    database = directory / "durable" / "firm.sqlite3"
-    Store.scratch(database)
-    assert not (directory / "firm-release.json").exists()
-
-    monkeypatch.setattr(sys, "argv", ["firm", "init", str(directory)])
-    with pytest.raises(SystemExit) as error:
-        main()
-    assert error.value.code == 2
-    assert "no release compatibility record" in capsys.readouterr().err.lower()
     assert not (directory / "firm-release.json").exists()
 
 
-@pytest.mark.parametrize("exported", [False, True])
-@pytest.mark.parametrize("section", ["overview", "readiness"])
-def test_analyze_refuses_old_generation_without_touching_state(
-    tmp_path, monkeypatch, capsys, exported, section
-):
-    from firm_runtime.compatibility import FIRM_RECORD, initialize_firm
 
-    record = initialize_firm(tmp_path)
-    record["compatibility_generation"] = 1
-    (tmp_path / FIRM_RECORD).write_text(json.dumps(record))
-    if exported:
-        (tmp_path / "manifest.json").write_text("{}")
-        database = tmp_path / "firm.sqlite3"
-    else:
-        database = tmp_path / "durable" / "firm.sqlite3"
-        database.parent.mkdir()
-    with sqlite3.connect(database) as db:
-        db.execute("CREATE TABLE roles (employee_id TEXT PRIMARY KEY)")
-    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
 
-    monkeypatch.setattr(sys, "argv", ["firm", "analyze", str(tmp_path), "--section", section])
-    with pytest.raises(SystemExit) as error:
-        main()
-
-    assert error.value.code == 2
-    assert "requires generation" in capsys.readouterr().err
-    assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
 
 
 @pytest.mark.parametrize("filename", ["mandate.md", "firm.toml"])
@@ -298,11 +247,10 @@ def test_init_checks_directory_before_registering_github(tmp_path, monkeypatch, 
 def test_valid_marker_does_not_allow_durable_symlink_redirection(
     tmp_path, monkeypatch, capsys, command
 ):
-    from firm_runtime.compatibility import initialize_firm
+
 
     directory = tmp_path / "firm"
     _write_controlled_setup_files(directory)
-    initialize_firm(directory)
     external = tmp_path / "external"
     durable = external / "durable"
     durable.mkdir(parents=True)
@@ -321,12 +269,11 @@ def test_valid_marker_does_not_allow_durable_symlink_redirection(
 
 
 def test_check_refuses_durable_symlink_before_opening_external_database(tmp_path, monkeypatch):
-    from firm_runtime.compatibility import initialize_firm
+
     from firm_runtime.setup_check import check_setup
 
     directory = tmp_path / "firm"
     _write_controlled_setup_files(directory)
-    initialize_firm(directory)
     durable = tmp_path / "external" / "durable"
     durable.mkdir(parents=True)
     database = durable / "firm.sqlite3"
@@ -416,6 +363,7 @@ def test_guided_start_creates_starter_firm_and_starts_it(tmp_path, monkeypatch, 
     import builtins
 
     import firm_runtime.cli as cli
+    from firm_runtime import accounts
 
     class FakeTTY(io.StringIO):
         def isatty(self):
@@ -425,8 +373,13 @@ def test_guided_start_creates_starter_firm_and_starts_it(tmp_path, monkeypatch, 
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
     monkeypatch.setattr(sys, "stdin", FakeTTY())
     data_dir = tmp_path / "Firm Data"
+    monkeypatch.setattr(accounts, "CREDENTIALS_DIR", tmp_path / "credentials")
+    logins = []
     monkeypatch.setattr(
-        cli, "login_provider", lambda provider, account, **kwargs: data_dir / "credential.json"
+        cli,
+        "login_provider",
+        lambda provider, account, **kwargs: logins.append((provider, account, kwargs))
+        or data_dir / "credential.json",
     )
     monkeypatch.setattr(
         "firm_runtime.setup_check.check_setup", lambda *args, **kwargs: {"ok": True, "checks": []}
@@ -449,14 +402,18 @@ def test_guided_start_creates_starter_firm_and_starts_it(tmp_path, monkeypatch, 
 
     output = capsys.readouterr().out
 
-    from firm_runtime import compatibility
 
     firm = launch["directory"]
     assert firm.parent == data_dir
+    # A first run has no saved login: it signs in once, without asking and without a hold.
+    ((provider, account, login),) = logins
+    assert (provider, account, login["force_login"]) == ("codex", "codex-personal", False)
+    assert login["state_directory"] == firm / ".setup-login" / "codex-personal"
+    assert login["target_credentials_path"] == accounts.credentials_path("codex-personal")
     assert (firm / "mandate.md").read_text().startswith("# Make a useful weekly planner")
     assert 'model = "gpt-6-luna"' in (firm / "firm.toml").read_text()
     assert (firm / "durable" / "firm.sqlite3").is_file()
-    assert compatibility.validate_firm(firm)["compatibility_generation"] > 0
+    assert not (firm / "firm-release.json").exists()
     assert "Owner console: http://127.0.0.1:8766/unlock/test-key" in output
     assert "Owner console is ready; the firm is starting." in output
     assert f"Firm data directory: {firm}" in output
@@ -533,77 +490,259 @@ def test_guided_resume_checks_credentials_without_rejecting_live_console_ports(
     assert launched == [firm]
 
 
-@pytest.mark.parametrize("login_succeeds", [True, False])
-def test_guided_resume_refreshes_only_selected_account_auth_incidents(
-    tmp_path, monkeypatch, capsys, login_succeeds
-):
-    import builtins
+class _GuidedResume:
+    """An initialized firm resumed through guided start, answering prompts from a script.
 
-    import firm_runtime.cli as cli
-    from firm_runtime import foreground, onboarding
-    from firm_runtime.runtime import Runtime
-    from firm_runtime.store import OWNER, Store
+    The first answer is always the firm chooser; the rest answer the sign-in and resume
+    questions. A prompt beyond the script ends the test.
+    """
 
-    class FakeTTY(io.StringIO):
-        def isatty(self):
-            return True
+    def __init__(self, tmp_path, monkeypatch, capsys, answers, *, second_profile=False):
+        import builtins
 
-    root = tmp_path / "firms"
-    firm = root / "2026-10-28_codex"
-    onboarding.create_firm_files(firm, "codex", "Build a useful firm.")
-    configured_auth = tmp_path / "credentials" / "chosen-auth.json"
-    unrelated_auth = tmp_path / "credentials" / "other-auth.json"
-    with (firm / "firm.toml").open("a", encoding="utf-8") as output:
-        output.write(
-            f'auth_file = "{configured_auth}"\n\n'
-            '[accounts.codex-other]\nprovider = "codex"\nmax_active = 1\n'
-            f'auth_file = "{unrelated_auth}"\n'
+        import firm_runtime.cli as cli
+        from firm_runtime import foreground, onboarding
+        from firm_runtime.runtime import Runtime
+        from firm_runtime.store import Store
+
+        class FakeTTY(io.StringIO):
+            def isatty(self):
+                return True
+
+        self.cli, self.root, self.capsys = cli, tmp_path / "firms", capsys
+        self.firm = self.root / "2026-10-28_codex"
+        onboarding.create_firm_files(self.firm, "codex", "Build a useful firm.")
+        self.auth = tmp_path / "credentials" / "chosen-auth.json"
+        self.other_auth = tmp_path / "credentials" / "other-auth.json"
+        self.auth.parent.mkdir()
+        self.auth.write_text('{"tokens":{"access_token":"test-only"}}')
+        self.auth.chmod(0o600)
+        with (self.firm / "firm.toml").open("a", encoding="utf-8") as output:
+            output.write(f'auth_file = "{self.auth}"\n')
+            if second_profile:
+                output.write(
+                    '\n[accounts.codex-other]\nprovider = "codex"\nmax_active = 1\n'
+                    f'auth_file = "{self.other_auth}"\n'
+                    '\n[profiles.second]\nprovider = "codex"\nmodel = "gpt-6-luna"\n'
+                    'effort = "medium"\naccounts = ["codex-other"]\n'
+                )
+        _invoke(monkeypatch, capsys, "init", self.firm)
+        self.runtime = Runtime(Store(self.firm / "durable" / "firm.sqlite3"))
+        script = iter(["2", *answers])
+        monkeypatch.setattr(builtins, "input", lambda _prompt="": next(script))
+        monkeypatch.setattr(sys, "stdin", FakeTTY())
+        monkeypatch.setattr(
+            "firm_runtime.setup_check.check_setup",
+            lambda *args, **kwargs: {"ok": True, "checks": []},
         )
-    _invoke(monkeypatch, capsys, "init", firm)
-    runtime = Runtime(Store(firm / "durable" / "firm.sqlite3"))
-    selected_auth = runtime.accounts.pause(
-        OWNER, "account", "codex-personal", "auth"
-    )["incident_id"]
-    other_auth = runtime.accounts.pause(OWNER, "account", "codex-other", "auth")["incident_id"]
-    profile_config = runtime.accounts.pause(OWNER, "profile", "codex", "config")["incident_id"]
+        self.logins, self.launched, self.on_login = [], [], None
+        monkeypatch.setattr(cli, "login_provider", self._login)
+        monkeypatch.setattr(
+            foreground,
+            "launch_local_host",
+            lambda directory, **kwargs: self.launched.append(directory)
+            or {"url": "http://127.0.0.1:8766/", "unlock_url": "http://127.0.0.1:8766/unlock/k"},
+        )
 
-    monkeypatch.setattr(builtins, "input", lambda _prompt="": "2")
-    monkeypatch.setattr(sys, "stdin", FakeTTY())
-    monkeypatch.setattr(
-        "firm_runtime.setup_check.check_setup", lambda *args, **kwargs: {"ok": True, "checks": []}
-    )
-    login = {}
+    def _login(self, provider, account, **kwargs):
+        self.logins.append({"provider": provider, "account": account, **kwargs})
+        if self.on_login is not None:
+            self.on_login()
+        return self.auth
 
-    def refresh(provider, account, **kwargs):
-        login.update(provider=provider, account=account, **kwargs)
-        if not login_succeeds:
-            raise cli.FirmError("simulated sign-in failure")
-        return configured_auth
+    def hold(self, account="codex-personal", code=None):
+        from firm_runtime.store import OWNER
 
-    monkeypatch.setattr(cli, "login_provider", refresh)
-    launched = []
-    monkeypatch.setattr(
-        foreground,
-        "launch_local_host",
-        lambda directory, **kwargs: launched.append(directory)
-        or {"url": "http://127.0.0.1:8766/", "unlock_url": "http://127.0.0.1:8766/unlock/key"},
-    )
+        return self.runtime.accounts.pause(OWNER, "account", account, "auth", code=code)[
+            "incident_id"
+        ]
 
-    if login_succeeds:
-        cli.main(["start", "--data-dir", str(root)])
-    else:
-        with pytest.raises(SystemExit) as error:
-            cli.main(["start", "--data-dir", str(root)])
-        assert error.value.code == 2
+    def clear(self, incident):
+        from firm_runtime.store import OWNER
 
+        self.runtime.accounts.clear(OWNER, incident)
+
+    def open_ids(self):
+        return {item["incident_id"] for item in self.runtime.accounts.status()["incidents"]}
+
+    def start(self):
+        self.cli.main(["start", "--data-dir", str(self.root)])
+        return self.capsys.readouterr().err
+
+
+def test_guided_resume_signs_in_and_resumes_a_sign_in_hold_by_default(
+    tmp_path, monkeypatch, capsys
+):
+    guided = _GuidedResume(tmp_path, monkeypatch, capsys, ["", ""])
+    from firm_runtime.store import OWNER
+
+    incident = guided.hold(code="invalid_api_key")
+    profile_hold = guided.runtime.accounts.pause(OWNER, "profile", "codex", "config")["incident_id"]
+    err = guided.start()
+    (login,) = guided.logins
     assert login["provider"] == "codex" and login["account"] == "codex-personal"
-    assert login["target_credentials_path"] == configured_auth
     assert login["force_login"] is True
-    incidents = {item["incident_id"] for item in runtime.accounts.status()["incidents"]}
-    assert (selected_auth in incidents) is (not login_succeeds)
-    assert other_auth in incidents
-    assert profile_config in incidents
-    assert launched == ([firm] if login_succeeds else [])
+    assert login["target_credentials_path"] == guided.auth
+    assert login["state_directory"] == guided.firm / ".setup-login" / "codex-personal"
+    assert guided.open_ids() == {profile_hold}
+    assert "Account codex-personal is paused (invalid_api_key)." in err
+    assert "Resumed codex-personal." in err
+    assert incident not in err and guided.launched == [guided.firm]
+
+
+def test_guided_resume_declined_names_the_exact_incident_to_clear(tmp_path, monkeypatch, capsys):
+    import shlex
+
+    guided = _GuidedResume(tmp_path, monkeypatch, capsys, ["", "n"])
+    incident = guided.hold()
+    err = guided.start()
+    assert len(guided.logins) == 1
+    assert guided.open_ids() == {incident}
+    assert "Account codex-personal stays paused." in err
+    assert f"`firm clear-hold {shlex.quote(str(guided.firm))} {incident}`" in err
+    assert guided.launched == [guided.firm]
+
+
+@pytest.mark.parametrize("code,guidance", [
+    ("oauth_org_not_allowed", "organization does not allow subscription access"),
+    ("account_on_hold", "provider has put this account on hold"),
+])
+def test_guided_resume_does_not_sign_in_again_when_sign_in_cannot_help(
+    tmp_path, monkeypatch, capsys, code, guidance
+):
+    guided = _GuidedResume(tmp_path, monkeypatch, capsys, ["", ""])
+    incident = guided.hold(code=code)
+    err = guided.start()
+    assert guided.logins == []
+    assert guided.open_ids() == {incident}
+    assert f"Account codex-personal is paused ({code})." in err and guidance in err
+    assert "Account codex-personal stays paused." in err and incident in err
+
+
+def test_guided_resume_can_sign_in_with_a_different_account_after_a_provider_hold(
+    tmp_path, monkeypatch, capsys
+):
+    guided = _GuidedResume(tmp_path, monkeypatch, capsys, ["y", "y"])
+    incident = guided.hold(code="oauth_org_not_allowed")
+    guided.start()
+    assert len(guided.logins) == 1 and guided.logins[0]["force_login"] is True
+    assert incident not in guided.open_ids()
+
+
+@pytest.mark.parametrize("answer,cleared", [("", False), ("n", False), ("y", True)])
+def test_guided_resume_shows_a_replaced_holds_cause_before_asking(
+    tmp_path, monkeypatch, capsys, answer, cleared
+):
+    guided = _GuidedResume(tmp_path, monkeypatch, capsys, ["", answer])
+    old = guided.hold(code="invalid_api_key")
+    replaced = []
+
+    def replace():
+        guided.clear(old)
+        replaced.append(guided.hold(code="account_on_hold"))
+
+    guided.on_login = replace
+    err = guided.start()
+    (new,) = replaced
+    # The owner signed in for the first cause. The newer one is shown, and the sign-in
+    # is not taken as its answer: resuming it is no longer the default.
+    assert "Account codex-personal is paused (invalid_api_key)." in err
+    assert "Account codex-personal is paused (account_on_hold)." in err
+    assert "provider has put this account on hold" in err
+    if cleared:
+        assert guided.open_ids() == set() and "Resumed codex-personal." in err
+    else:
+        assert guided.open_ids() == {new} and new in err and old not in err
+
+
+def test_guided_resume_explains_again_when_the_same_hold_gains_a_cause(
+    tmp_path, monkeypatch, capsys
+):
+    guided = _GuidedResume(tmp_path, monkeypatch, capsys, ["", ""])
+    incident = guided.hold()
+    # A run still in flight reports the provider's restriction: same incident, cause filled in.
+    guided.on_login = lambda: guided.hold(code="account_on_hold")
+    err = guided.start()
+    assert guided.open_ids() == {incident}
+    assert "Account codex-personal is paused (account_on_hold)." in err
+    assert "Account codex-personal stays paused." in err and "Resumed" not in err
+
+
+def test_guided_resume_asks_nothing_more_when_the_hold_was_cleared_during_sign_in(
+    tmp_path, monkeypatch, capsys
+):
+    # Only the sign-in question is answered: a resume question would exhaust the script.
+    guided = _GuidedResume(tmp_path, monkeypatch, capsys, [""])
+    old = guided.hold()
+    guided.on_login = lambda: guided.clear(old)
+    err = guided.start()
+    assert guided.open_ids() == set() and guided.launched == [guided.firm]
+    assert "Resumed" not in err and "stays paused" not in err
+
+
+def test_guided_resume_does_not_report_resumed_while_another_hold_remains(
+    tmp_path, monkeypatch, capsys
+):
+    from firm_runtime.accounts import Accounts
+    from firm_runtime.store import OWNER
+
+    guided = _GuidedResume(tmp_path, monkeypatch, capsys, ["", ""])
+    incident = guided.hold()
+    clear, later = Accounts.clear, []
+
+    def clear_then_another_hold(self, actor, incident_id):
+        result = clear(self, actor, incident_id)
+        later.append(self.pause(OWNER, "account", "codex-personal", "quota")["incident_id"])
+        return result
+
+    monkeypatch.setattr(Accounts, "clear", clear_then_another_hold)
+    err = guided.start()
+    assert guided.open_ids() == set(later) and incident not in guided.open_ids()
+    assert "Resumed" not in err
+    assert "Account codex-personal stays paused." in err and later[0] in err
+
+
+def test_guided_resume_signs_in_every_routed_account_with_an_unusable_login(
+    tmp_path, monkeypatch, capsys
+):
+    guided = _GuidedResume(tmp_path, monkeypatch, capsys, [], second_profile=True)
+    err = guided.start()
+    (login,) = guided.logins
+    assert login["account"] == "codex-other" and login["force_login"] is False
+    assert login["target_credentials_path"] == guided.other_auth
+    assert login["state_directory"] == guided.firm / ".setup-login" / "codex-other"
+    assert "Account codex-other needs a Codex sign-in before the firm can start." in err
+    assert guided.launched == [guided.firm]
+
+
+def test_guided_resume_sign_in_failure_leaves_the_incident_and_does_not_start(
+    tmp_path, monkeypatch, capsys
+):
+    guided = _GuidedResume(tmp_path, monkeypatch, capsys, [""])
+    incident = guided.hold()
+
+    def fail():
+        raise guided.cli.FirmError("simulated sign-in failure")
+
+    guided.on_login = fail
+    with pytest.raises(SystemExit) as error:
+        guided.start()
+    assert error.value.code == 2
+    assert guided.open_ids() == {incident} and guided.launched == []
+
+
+def test_login_says_a_paused_firm_stays_paused_until_resumed(tmp_path, monkeypatch, capsys):
+    import firm_runtime.cli as cli
+
+    saved = tmp_path / "saved.json"
+    monkeypatch.setattr(cli, "login_provider", lambda provider, account, **kwargs: saved)
+    monkeypatch.setattr(sys, "argv", ["firm", "login", "codex-personal", "--provider", "codex"])
+    main()
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["auth_file"] == str(saved)
+    assert captured.err.startswith(
+        "Saved. A firm that paused this account stays paused until you resume it"
+    )
 
 
 def test_save_credentials_installs_private_default_file(tmp_path, monkeypatch, capsys):

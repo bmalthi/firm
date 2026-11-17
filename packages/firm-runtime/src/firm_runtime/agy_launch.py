@@ -319,6 +319,9 @@ def _environment(home):
             "no_proxy",
             "SSL_CERT_FILE",
             "SSL_CERT_DIR",
+            # The role's own Playwright cache, which links the base image's browsers.
+            "PLAYWRIGHT_BROWSERS_PATH",
+            "PLAYWRIGHT_SKIP_BROWSER_GC",
         )
         if key in os.environ
     }
@@ -378,7 +381,8 @@ def _run(command, home):
         stop_deadline = time.monotonic() + 5
         try:
             os.killpg(process.pid, signum)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
+            # macOS reports a group whose process exited but is not yet reaped as EPERM.
             pass
 
     previous = {sig: signal.signal(sig, forward) for sig in (signal.SIGTERM, signal.SIGINT)}

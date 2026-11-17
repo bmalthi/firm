@@ -1,5 +1,6 @@
 """Offline integrated AGY acceptance routing, projection, and resume evidence."""
 
+import asyncio
 import importlib.util
 import json
 import re
@@ -76,6 +77,7 @@ def test_cli_selects_agy_explicitly(module):
     assert module.argument_parser().parse_args(args).provider == "agy"
     if module is provider:
         assert module.argument_parser().parse_args([*args, "--resume"]).resume
+        assert module.argument_parser().parse_args([*args, "--catalog-only"]).catalog_only
     with pytest.raises(SystemExit):
         module.argument_parser().parse_args([*args[:-1], "unknown"])
 
@@ -247,6 +249,27 @@ def test_server_peek_receipt_requires_valid_activation_and_omits_contents(tmp_pa
     runtime.tools(invocation.token).peek()
     assert receipts == [{"tool": "peek", "activation_validated": True}]
     assert json.loads((tmp_path / "server-tools.json").read_text()) == receipts
+
+
+def test_server_catalog_receipt_requires_live_bearer_and_omits_credentials(tmp_path, monkeypatch):
+    from firm_runtime.errors import FirmError
+
+    runtime = Runtime(Store.scratch(tmp_path / "firm.sqlite3"))
+    runtime.lifecycle.initialize("vm-provider-live", provider.AGY_CATALOG_MANDATE, config())
+    runtime.start()
+    invocation = runtime.admit()
+    runtime.mark_started(invocation.activation_id)
+    server_class, receipts = provider.catalog_server(runtime, tmp_path)
+    server = server_class("catalog-proof")
+    monkeypatch.setattr(provider.mcp_http, "_request_token", lambda: "invalid-synthetic-token")
+    with pytest.raises(FirmError):
+        asyncio.run(server.list_tools())
+    assert not receipts
+    monkeypatch.setattr(provider.mcp_http, "_request_token", lambda: invocation.token)
+    asyncio.run(server.list_tools())
+    assert receipts == [{"method": "tools/list", "activation_id": invocation.activation_id,
+                         "tool_count": 0, "activation_validated": True}]
+    assert invocation.token not in (tmp_path / "server-catalog.json").read_text()
 
 
 @pytest.mark.parametrize("name", ["codex", "claude"])

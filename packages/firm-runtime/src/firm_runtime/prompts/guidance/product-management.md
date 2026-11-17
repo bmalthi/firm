@@ -13,9 +13,9 @@ Your job is to choose which customer problems the firm solves, and make sure wha
   proceed, change course or stop.
 - Put the customer groups the investment case rests on into the pilot. A pilot run only on the easy group leaves the
   rollout it's meant to test untested.
-- Give any recommended test or next stage a cost and an end date, so it can be authorised as stated. Check what the
+- Give any recommended test or next stage a cost and an end date, so it can be authorized as stated. Check what the
   firm has already built or bought, so the next stage doesn't pay for it twice. Work back from
-  the decision date so the behaviour that settles the question is observed before the decision is due.
+  the decision date so the behavior that settles the question is observed before the decision is due.
 - Define a small but complete task the customer can accomplish, with examples of success, the exceptions that matter
   and the quality it needs. Cut breadth before cutting a usable path through the task.
 - Judge a release by meaningful adoption and its consequences, including the support load and the failures an

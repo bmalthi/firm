@@ -5,15 +5,14 @@
   "retained": "Working memory is retained.",
   "lost": "Previous working memory is unavailable. Your files and mail remain.",
   "check_results": "Some actions may already have completed; check durable results before repeating actions.",
-  "recent_claims": "Recently claimed mail (claiming does not prove completion or unfinished work):",
   "handoff": "# Continuing your work\n\nYou are starting with fresh working memory. Your saved notes follow:\n<handoff-notes>\n${notes}\n</handoff-notes>",
   "fresh": "# Continuing your work\n\nYou are starting with fresh working memory. Your files and mail remain. Inspect saved work before continuing; no handoff notes were saved for this work period.",
   "update": "# Work update\n\n${reason}",
   "default": "Continue the work available to you.",
   "mandate_changed": "Your manager revised your responsibility. The current mandate in your standing instructions replaces the earlier mandate.",
   "temporary": "You have ${remaining} work periods remaining, including this one. Your manager can renew or make your role permanent. This work period may finish normally.",
-  "inbox": "Inbox snapshot before this work period began:\n${inbox}\nAlready pending mail will not cause another automatic wake.",
-  "empty_inbox": "No pending mail.",
+  "inbox": "Inbox snapshot before this work period began:\n${inbox}\nUnread mail already offered will not repeatedly trigger idle review. Previously unoffered mail may receive a later review when the firm is idle.",
+  "empty_inbox": "No unread mail.",
   "message": "Mail arrived since your previous work period began; it may already be read.",
   "owner_resume": "The owner reopened your work.",
   "owner_fresh_route": "The owner reopened your work with fresh working memory.",
@@ -21,5 +20,8 @@
   "promote": "Your manager made your appointment permanent.",
   "authorized_retry": "Your manager or owner authorized another attempt.",
   "dependency_recovery": "Operations is retrying work after a shared service interruption.",
-  "guidance_changed": "The role guidance in your standing instructions has changed and replaces any you had before."
+  "guidance_changed": "The role guidance in your standing instructions has changed and replaces any you had before.",
+  "idle_inbox_review": "Review newly offered unread mail while the firm has no runnable ordinary work.",
+  "idle_review_instructions": "## Idle inbox review\n\nLook through the offered unread mail, reading it in full or as a summary as useful. Act only where useful, and dismiss what needs nothing. This snapshot lists only newly offered mail; peek shows the whole inbox. Reading records receipt, not completed work: keep unfinished commitments in working memory or handoff notes. Do not send acknowledgment-only replies or repeat status updates just because this review happened. Once you have read or dismissed what was offered and nothing needs further work, finish normally.",
+  "recent_reads": "Recently read mail (reading does not prove its work is finished):"
 }

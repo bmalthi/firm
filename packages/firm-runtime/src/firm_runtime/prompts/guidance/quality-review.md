@@ -4,7 +4,7 @@ Your job is to tell the firm whether a piece of work is fit for use, with eviden
 wasn't there.
 
 - Start from how the work will be used and what a failure there would cost. Spend your effort where a defect would
-  matter most, not evenly across the artefact.
+  matter most, not evenly across the artifact.
 - Decide what the result should be independently of the producer: from the requirement, a worked example, or a
   relationship that must hold. Tests that share the author's assumptions prove only consistency.
 - Read what the producer says they checked, then put your checks where theirs stop: a calculation by another route, a

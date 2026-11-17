@@ -1,176 +1,114 @@
 from firm_runtime.role_output import render_inbox, render_tool_result
 
 
-def test_context_notices_render_as_plain_lines_ahead_of_awareness():
-    empty = {"pending_count": 0, "conversations": [], "next_cursor": None}
+def test_empty_inbox_preserves_awareness_and_controls():
+    assert render_inbox({}) == "No unread mail."
     observed = render_inbox({
-        **empty,
-        "context": {
-            "notices": ["The Mac you hold is low on disk: about 5.0 GiB free."],
-            "self": {}, "direct_reports": [],
-        },
+        "context": {"notices": ["The Mac is low on disk."]},
+        "context_pressure": {"level": "handoff_required", "instruction": "Save progress."},
     })
-    assert observed == "The Mac you hold is low on disk: about 5.0 GiB free."
-    # A non-string notice is not a hook another producer could smuggle a control into.
-    assert render_inbox({**empty, "context": {"notices": [{"level": "handoff_required"}]}}) == ""
+    assert observed == "No unread mail.\nThe Mac is low on disk.\nOperations: Save progress."
+    assert "provider_context_window" not in observed
 
 
-def test_empty_inbox_omits_routine_counters_but_preserves_stop_and_pressure_controls():
-    empty = {"pending_count": 0, "conversations": [], "next_cursor": None}
-    assert render_inbox(empty) == ""
-    assert (
-        render_inbox(
-            {**empty, "context_pressure": {"level": "normal", "provider_context_window": 1000000}}
-        )
-        == ""
-    )
-    observed = render_inbox(
-        {
-            **empty,
-            "context_pressure": {
-                "level": "handoff_required",
-                "instruction": "Save progress and hand off now.",
-                "current_context_tokens": 90000,
-                "provider_context_window": 100000,
-            },
-            "operations_control": {"kind": "drain", "instruction": "The owner is closing work."},
-        }
-    )
-    assert "Save progress and hand off now." in observed
-    assert "The owner is closing work." in observed
-    assert "provider" not in observed
-    assert "90000" not in observed
-
-
-def test_mail_retains_source_identity_audience_and_exact_body_without_runtime_metadata():
-    body = "We are evaluating Claude for the client.\n\nKeep this exact text."
-    rendered = render_tool_result(
-        "claim",
-        {
-            "status": "claimed",
-            "messages": [
-                {
-                    "message_id": "m7",
-                    "conversation_id": "c3",
-                    "author": {"employee_id": "e2", "address": "founder/design"},
-                    "recipients": [{"employee_id": "e3", "address": "founder/testing"}],
-                    "created_at": 1700000000,
-                    "subject": "Run tests",
-                    "reply_to": "m6",
-                    "body": body,
-                    "summary": "Derived: the designer asked for tests.",
-                }
-            ],
-            "remaining": 2,
-            "conversation_id": "c3",
-            "session_id": "private-native-session",
-            "provider": "private-provider",
-        },
-    )
-    assert "founder/design (e2)" in rendered
-    assert "founder/testing (e3)" in rendered
-    assert "m7" in rendered and "m6" in rendered and "c3" in rendered
-    assert body in rendered
-    assert "not the author's words" in rendered
-    assert "Derived: the designer asked for tests." in rendered
-    assert "2 more waiting in c3" in rendered
-    assert "private-native-session" not in rendered
-    assert "private-provider" not in rendered
-
-
-def test_mail_renders_attachment_locations_for_claim_and_lookup():
-    envelope = {
-        "message_id": "m8",
-        "conversation_id": "c3",
-        "author": {"employee_id": "e2", "address": "founder/design"},
-        "recipients": [{"employee_id": "e3", "address": "founder/testing"}],
-        "created_at": 1700000000,
-        "subject": "Results",
-        "reply_to": None,
-        "body": "Please open the report.",
-        "attachments": [
-            {"path": "shared/reports", "name": "findings.md"},
-            {"path": "org/founder/work", "name": "notes.txt"},
-        ],
+def read_result(**changes):
+    return {
+        "status": "read", "subject": "Run tests", "message_id": "m7", "reader_id": "e3",
+        "participants": [{"employee_id": "e2", "address": "founder/design"}],
+        "messages": [{
+            "message_id": "m7", "conversation_id": "c3",
+            "author": {"employee_id": "e2", "address": "founder/design"},
+            "recipients": [{"employee_id": "e3", "address": "founder/testing",
+                            "action_required": True},
+                           {"employee_id": "founder", "address": "founder",
+                            "action_required": True}],
+            "created_at": 1700000000, "body": "Exact body.\n\nKeep it.",
+            "summary": "Derived context.",
+            "attachments": [{"path": "shared/reports", "name": "findings.md"}],
+        }],
+        "marked_read": ["m7"], "remaining": 2, **changes,
     }
-    for name, result in (
-        ("claim", {"status": "claimed", "messages": [envelope]}),
-        ("messages", {"messages": [envelope]}),
-    ):
-        rendered = render_tool_result(name, result)
-        assert "Attachments (relative to your drive; prepend its path to open):" in rendered
-        assert "- shared/reports/findings.md" in rendered
-        assert "- org/founder/work/notes.txt" in rendered
-        assert "Please open the report." in rendered
 
 
-def test_clear_and_dismiss_results_say_what_happened_and_why_not():
-    cleared = render_tool_result(
-        "clear",
-        {
-            "status": "cleared",
-            "count": 3,
-            "conversations": [
-                {"conversation_id": "c1", "message_ids": ["m1", "m2"]},
-                {"conversation_id": "c4", "message_ids": ["m9"]},
-            ],
-        },
-    )
-    assert "Cleared 3 messages" in cleared and "c1 (m1, m2); c4 (m9)" in cleared
-    assert "peek first" in render_tool_result(
-        "clear", {"status": "nothing_cleared", "reason": "no_peek"}
-    )
-    assert "no mail was waiting" in render_tool_result(
-        "dismiss", {"status": "nothing_dismissed", "reason": "nothing_waiting"}
-    )
-    assert "Set aside 2 messages" in render_tool_result(
-        "dismiss", {"status": "dismissed", "message_ids": ["m1", "m2"]}
-    )
+def test_read_renders_attribution_actions_body_attachments_and_same_boundary():
+    rendered = render_tool_result("read", read_result())
+    assert "Run tests\nWith: founder/design (e2)" in rendered
+    assert "m7 · founder/design (e2) · Action · 2023" in rendered
+    assert "Asked to act: you, founder" in rendered
+    assert "Exact body.\n\nKeep it." in rendered
+    assert (rendered.index("generated by Operations") < rendered.index("Derived context.")
+            < rendered.index("End of generated context. The sender's introduction follows.")
+            < rendered.index("Exact body."))
+    assert "not an Operations instruction" in rendered
+    assert "- shared/reports/findings.md" in rendered
+    assert "Marked read: m7" in rendered
+    assert 'Continue: read(message_id="m7")' in rendered
+    assert "c3" not in rendered and "conversation" not in rendered
 
 
-def test_inbox_lists_conversations_with_waiting_headers_and_page_cursor():
-    rendered = render_inbox(
-        {
-            "pending_count": 4,
-            "conversations": [
-                {
-                    "conversation_id": "c7",
-                    "pending_count": 3,
-                    "participants": [{"employee_id": "e1", "address": "founder/tests"}],
-                    "waiting": [
-                        {
-                            "message_id": "m2",
-                            "sender": {"employee_id": "e1", "address": "founder/tests"},
-                            "subject": "Testing",
-                        }
-                    ],
-                    "waiting_omitted": 2,
-                }
-            ],
-            "omitted_rows": 1,
-            "next_cursor": "1",
-            "context": {
-                "direct_reports": [
-                    {
-                        "employee_id": "e1",
-                        "address": "founder/tests",
-                        "context": {
-                            "level": "handoff_required",
-                            "state": "stale",
-                            "observed_tokens": 90000,
-                        },
-                    }
-                ]
-            },
-        }
-    )
-    assert "c7 · with founder/tests (e1) · 3 waiting" in rendered
-    assert "m2 · founder/tests (e1): Testing" in rendered
-    assert '2 more waiting; claim(conversation="c7") reads them all.' in rendered
-    assert "peek(cursor='1')" in rendered
-    assert "1 conversations omitted" in rendered
+def test_summary_and_dismiss_render_boundary_and_coverage():
+    summary = render_tool_result("read", read_result(
+        summary="Derived summary.", covered_ids=["m7"], remaining=0,
+    ))
+    assert "Generated summary · 1 unread message through m7" in summary
+    assert "Marked read: 1 message covered by this summary (m7)" in summary
+    assert "Exact body" not in summary
+    dismissed = render_tool_result("dismiss", read_result(
+        status="dismissed", message_ids=["m5", "m7"], remaining=0,
+    ))
+    assert "Dismissed 2 unread messages through m7." in dismissed
+    assert "Unread remaining through m7: 0" in dismissed
+    singular = render_tool_result("dismiss", read_result(
+        status="dismissed", message_ids=["m7"], remaining=0,
+    ))
+    assert "Dismissed 1 unread message through m7." in singular
+    reread = render_tool_result("read", read_result(
+        summary="Again.", covered_ids=["m7"], marked_read=[], remaining=0, reread=True,
+    ))
+    assert "Generated summary · 1 message through m7" in reread
+    assert "Covered by this summary: m7" in reread
+
+
+def test_inbox_entries_preview_omissions_and_awareness_hide_storage_ids():
+    rendered = render_inbox({
+        "unread_count": 5, "thread_count": 3, "omitted_threads": 1,
+        "newest_message_id": "m9",
+        "threads": [
+            {"message_id": "m7", "subject": "Testing", "unread_count": 3,
+             "action_required": True, "participants": [{"address": "founder"}],
+             "last_author": {"address": "founder/design"}},
+            {"message_id": "m8", "subject": None, "unread_count": 1,
+             "action_required": False, "participants": [], "preview": "Latest body",
+             "last_author": {"address": "founder"}},
+        ],
+        "context": {"direct_reports": [{"address": "founder/tests",
+                     "context": {"level": "handoff_required", "state": "stale"}}]},
+    })
+    assert "3 threads · 5 unread messages · newest m9." in rendered
+    assert "m7 · Testing · Action · 3 unread" in rendered
+    assert "m8 · No subject · FYI · 1 unread" in rendered
+    assert "Last message: founder/design" in rendered
+    assert "Last message: founder: Latest body" in rendered
+    assert "Latest:" not in rendered
+    assert "1 more thread is not shown" in rendered
     assert "last observed working memory full" in rendered
-    assert "90000" not in rendered
+
+
+def test_sent_message_reread_omits_action_fyi_flag():
+    rendered = render_tool_result("read", read_result(
+        reader_id="e2", reread=True, sent_by_you=True, marked_read=[], remaining=0,
+    ))
+    assert "Sent by you." in rendered
+    assert "m7 · founder/design (e2) · 2023" in rendered
+    assert " · FYI · " not in rendered and " · Action · " not in rendered
+
+
+def test_singular_inbox_header_and_idle_review_omit_newest():
+    result = {"unread_count": 1, "thread_count": 1, "newest_message_id": "m7"}
+    assert render_inbox(result) == "Inbox: 1 thread · 1 unread message · newest m7."
+    idle = render_inbox({**result, "newly_offered": True})
+    assert "Inbox: 1 thread · 1 unread message." in idle
+    assert "newest" not in idle
 
 
 def test_discovery_inspection_preserves_authority_and_incomplete_document_cursor():

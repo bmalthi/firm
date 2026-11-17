@@ -149,23 +149,11 @@ def test_birth_has_onboarding_and_only_actual_mail(marked_prompts):
         fresh_session=True,
         mandate=mandate("DELEGATED WORK", "founder"),
         founder_mandate=mandate("OWNER PURPOSE"),
-        inbox={
-            "pending_count": 1,
-            "conversations": [
-                {
-                    "conversation_id": "c1",
-                    "pending_count": 1,
-                    "participants": [{"address": "owner"}],
-                    "waiting": [
-                        {
-                            "message_id": "m9",
-                            "subject": "Real first mail",
-                            "sender": {"address": "owner"},
-                        }
-                    ],
-                }
-            ],
-        },
+        inbox={"unread_count": 1, "thread_count": 1, "newest_message_id": "m9", "threads": [
+                {"message_id": "m9", "subject": "Real first mail", "unread_count": 1,
+                  "action_required": True, "participants": [{"address": "owner"}],
+                  "last_author": {"address": "owner"}},
+            ]},
     )
     assert "OWNER PURPOSE" not in employee
     assert "DELEGATED WORK" not in employee
@@ -187,7 +175,7 @@ def test_resume_handoff_and_recovery_preserve_distinct_memory_contracts(marked_p
             recovery={
                 "context_retained": retained,
                 "cause": "provider_broken",
-                "recent_claims": [{"message_id": "m17", "subject": "Review"}],
+                "recent_reads": [{"message_id": "m17", "subject": "Review"}],
             },
         )
         assert "<wake.json:check_results>" in recovery
@@ -208,10 +196,11 @@ def test_handoff_notes_precede_orientation_and_inbox_in_wake_text(marked_prompts
             "top_level_roles": [],
             "omitted": {"direct_reports": 0, "top_level_roles": 0},
         },
-        inbox={
-            "pending_count": 1,
-            "owner": [{"message_id": "m1", "subject": "Hi", "sender": {"address": "owner"}}],
-        },
+        inbox={"unread_count": 1, "thread_count": 1, "newest_message_id": "m1", "threads": [
+                {"message_id": "m1", "subject": "Hi", "unread_count": 1,
+                  "action_required": True, "participants": [{"address": "owner"}],
+                  "last_author": {"address": "owner"}},
+            ]},
     )
     assert (
         text.index("<wake.json:handoff>")
@@ -284,7 +273,7 @@ def test_zero_mail_does_not_hide_an_active_drain_control(marked_prompts):
     text = render(
         birth=True,
         inbox={
-            "pending_count": 0,
+            "unread_count": 0,
             "operations_control": {
                 "kind": "drain",
                 "instruction": "Save progress and stop; owner restart required.",

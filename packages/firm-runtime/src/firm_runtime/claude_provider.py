@@ -310,7 +310,8 @@ class ClaudeProvider:
         if auth_kind == "oauth-token":
             secret_env["CLAUDE_CODE_OAUTH_TOKEN"] = "claude-auth"
         return RunSpec(
-            role_id=summary_role_id(request.run_id),
+            role_id=summary_role_id(request.run_id, request.stateless_slot),
+            stateless=not task,
             run_id=request.run_id,
             argv=(layout.python, layout.credential("claude-launcher")),
             env={

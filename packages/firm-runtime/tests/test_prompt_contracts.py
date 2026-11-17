@@ -162,6 +162,7 @@ def test_workspace_path_is_supplied_while_prompt_records_stay_relative(birth):
         "context-handoff.md",
         "runtime_summary.md",
         "runtime_level-choice.md",
+        "runtime_task.md",
     ],
 )
 def test_standalone_prompt_resources_are_packaged_and_nonempty(name):
@@ -183,13 +184,13 @@ def test_templates_fail_on_missing_values_and_do_not_reinterpret_inserted_text()
 def test_birth_and_wake_resources_leave_routine_judgment_to_the_role():
     birth = " ".join(prompt("birth.md").split())
     founder_birth = " ".join(prompt("founder_birth.md").split())
-    wake = render("wake", "inbox", inbox="No pending mail.")
+    wake = render("wake", "inbox", inbox="No unread mail.")
     assert "missing information would materially change the work" not in birth
     assert "routine implementation decisions need not block progress" not in birth
     assert "current mandate supplied in your responsibility above" in founder_birth
     assert "Do work yourself only when it is small or no role would fit" in founder_birth
     assert "responsibilities, authority and coordination clear in its mandate" in founder_birth
-    assert "Already pending mail will not cause another automatic wake." in wake
+    assert "Unread mail already offered will not repeatedly trigger idle review." in wake
 
 
 def test_standing_describes_only_configured_optional_capabilities():
@@ -266,7 +267,7 @@ def test_removing_final_report_updates_retained_context(tmp_path):
     runtime.mark_started(has_report.activation_id)
     runtime.tools(has_report.token).fire(employee, "Done", "retire")
     runtime.finish(has_report.activation_id)
-    runtime.messaging.send(OWNER, [first.employee_id], "Continue", request_id="wake")
+    runtime.owner.send_mail(OWNER, [first.employee_id], "Continue", request_id="wake")
     empty = runtime.admit()
     assert not empty.context["fresh_session"]
     assert "Direct reports: none." in render_invocation(empty, str(uuid4()))
@@ -300,9 +301,9 @@ def test_concurrent_controls_compaction_escalation_and_new_work_period(tmp_path)
     with ThreadPoolExecutor(max_workers=4) as workers:
         responses = list(workers.map(lambda _: runtime.tools(first.token).peek(), range(4)))
     assert sum(map(checklists, responses)) == 1
-    # Claim gating doesn't depend on presentation history; the pending mail survives.
-    message = runtime.messaging.send(OWNER, [first.employee_id], "Work", request_id="mail")
-    blocked = runtime.tools(first.token).claim("claim", [message["message_id"]])
+    # Read gating doesn't depend on presentation history; the pending mail survives.
+    message = runtime.owner.send_mail(OWNER, [first.employee_id], "Work", request_id="mail")
+    blocked = runtime.tools(first.token).read(message["message_id"])
     assert blocked["status"] == "blocked" and checklists(blocked) == 0
     measured(runtime, first.activation_id, compactions=1)
     assert checklists(runtime.tools(first.token).peek()) == 1
@@ -348,3 +349,100 @@ def test_all_guidance_resources_are_packaged_and_nonempty():
 
     for entry in guidance.catalog():
         assert prompt("guidance/" + entry["id"] + ".md").strip()
+
+
+@pytest.mark.parametrize("extra", [
+    {"fresh_session": True},
+    {"handoff_notes": "Unfinished commitment"},
+    {"recovery": {"cause": "interrupted", "working_memory": "retained"}},
+])
+def test_idle_review_guidance_survives_opening_precedence(extra):
+    invocation = Invocation("a1", "founder", "token", "session", {
+        "employee_id": "founder", "manager_id": OWNER, "birth": False,
+        "idle_inbox_review": True, "inbox": {}, **extra,
+    })
+    rendered = render_invocation(invocation, None)
+    assert "Idle inbox review" in rendered
+    assert "keep unfinished commitments" in rendered
+    assert "Do not send acknowledgment-only replies" in rendered
+    assert "Reading records receipt, not completed work" in rendered
+    assert "This snapshot lists only newly offered mail; peek shows the whole inbox." in rendered
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("peek", "List threads with unread mail without marking anything read. One entry per named "
+     "thread or no-subject conversation: the other participants, who wrote the last message, the "
+     "unread count, the latest unread message ID, and Action if any unread message there asks you "
+     "to act, otherwise FYI. Pass an entry's message ID to read or dismiss. The header gives the "
+     "newest ID in the inbox, which is the one clear takes."),
+    ("clear", "Empty your inbox: set aside every unread message in every thread, up to and "
+     "including message_id, without reading it. Pass the newest ID from peek; mail that arrives "
+     "after it is untouched. Use it once nothing left in the inbox needs you. It tells the "
+     "senders nothing and does not mean requested work is done."),
+    ("introduce", "Bring new people into a thread. message_id is any message in the source "
+     "thread; add lists the people to bring in. For a named thread this starts a new thread "
+     "with the same subject and the larger group; for a no-subject conversation the message "
+     "goes into the larger group's own no-subject conversation. The original stays as it was, "
+     "and newcomers cannot read it. action lists who is asked to act, chosen from anyone in "
+     "the larger group ([] for all FYI). summarize=true prepends a summary of the source "
+     "thread, generated by Operations at your request and labeled as generated; omitted or false "
+     "sends only your body, so include what the newcomers need. If the summary cannot be generated "
+     "nothing is sent: call again, or use summarize=false."),
+])
+def test_second_pass_mail_tool_wording(name, expected):
+    assert TOOL_DESCRIPTIONS[name] == expected
+
+
+def test_idle_review_wording():
+    assert render("wake", "idle_review_instructions") == (
+        "## Idle inbox review\n\nLook through the offered unread mail, reading it in full or "
+        "as a summary as useful. Act only where useful, and dismiss what needs nothing. This "
+        "snapshot lists only newly offered mail; peek shows the whole inbox. Reading records "
+        "receipt, not completed work: keep unfinished commitments in working memory or handoff "
+        "notes. Do not send acknowledgment-only replies or repeat status updates just because "
+        "this review happened. Once you have read or dismissed what was offered and nothing "
+        "needs further work, finish normally."
+    )
+
+
+def test_mail_physics_wording_and_discussion_craft():
+    physics = " ".join(prompt("standing-physics.md").split())
+    assert "Attach deliverables they should open with send or reply" in physics
+    assert (
+        "Mail is kept in threads. Each set of people shares one conversation with no subject. "
+        "A send without a subject goes there; a send with a subject starts a separate named "
+        "thread, whose subject never changes. Another send with the same subject starts another "
+        "thread rather than joining the first, and each named thread is its own entry in every "
+        "recipient's inbox. reply continues the thread of any message in it, with the same "
+        "people. introduce starts a thread with a larger group and leaves the original as it "
+        "was; the newcomers see the introduction, and a generated summary of the thread if the "
+        "sender asks for one, but not the earlier messages."
+    ) in physics
+    assert (
+        "peek lists the threads with unread mail, with who wrote last and whether anything asks "
+        "you to act, and marks nothing read. read returns a thread's unread messages up to the "
+        "message you name and marks them read; with summarize it returns a generated summary "
+        "instead. dismiss sets one thread's unread mail aside without reading it, and clear does "
+        "the same for the whole inbox. Sending, replying and introducing never change what is "
+        "unread, and reading tells no one anything. Reading is receipt, not completion: keep "
+        "unfinished commitments in working memory and handoff notes. To see a message again, "
+        "read it by its ID."
+    ) in physics
+    assert "use it as a cue to peek and read relevant updates" in physics
+    worker = " ".join(prompt("standing-good-worker.md").split())
+    assert "answers or deliverables they are waiting on" in worker
+    discussion = (
+        "- Keep a discussion in one place. Reply in the thread it is already in rather than "
+        "starting a new message, and send without a subject for everyday mail to people you "
+        "already talk to. Give a subject only to a topic worth following on its own, such as a "
+        "piece of work that will take several exchanges. - Read the full messages when you will "
+        "act on what they say; a summary is for catching up. Dismiss or clear mail that needs "
+        "nothing from you, so your inbox shows what does."
+    )
+    assert "acknowledgment is still unnecessary. " + discussion in worker
+    assert "Keep a discussion in one place" not in physics
+    assert (
+        "Read mail is no longer unread; keep its message ID if you still need it."
+        in " ".join(prompt("context-handoff.md").split())
+    )
+    assert "Preserve message IDs" in " ".join(prompt("runtime_summary.md").split())

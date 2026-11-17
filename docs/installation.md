@@ -299,15 +299,15 @@ See [development checks](development.md),
 | `limactl` is missing or older than 2.2.0 | Install or upgrade Lima (`brew upgrade lima` when installed with Homebrew), then rerun `firm start`. 2.2.0 is the tested baseline. |
 | Provider CLI is missing and `npx` is unavailable | Install Node.js/npm, then rerun `firm start` to resume sign-in. |
 | Provider login was interrupted | Choose the incomplete firm under **Resume**; its isolated login state is retained until credentials save successfully. |
-| The provider rejected saved credentials | Choose the firm under **Resume** and complete sign-in again. Firm validates the replacement before clearing that account's authentication hold. |
+| A provider refused an account's login | Choose the firm under **Resume**. It says why each such account is paused, signs in again when that can help, and asks whether to resume. The account's next work period shows whether the provider accepts it; a recognized refusal brings the pause back with its reason. |
 | A configured model is rejected | Change its configured model and apply it with `firm configure DIRECTORY --config DIRECTORY/firm.toml`. |
 | Setup reports a local prerequisite failure | Follow the action shown by `firm check DIRECTORY`, then rerun `firm start`. |
 | A port is already in use | Stop the other host, or choose different `--console-port` and `--mcp-port` values. |
-| A saved firm needs attention | Do not initialize over it. Run `firm check DIRECTORY` and use its original compatible runtime to inspect or export it. |
+| A saved firm needs attention | Do not initialize over it. Run `firm check DIRECTORY` and inspect or export it before making changes. |
 
 For configuration, requests, recovery, backups and deletion see
-[runtime operations](runtime.md). Firm does not migrate incompatible firm databases
-or VM images; compatible releases retain their existing state.
+[runtime operations](runtime.md). During development, breaking state changes are allowed without compatibility gates
+or migrations. Use fresh disposable state when a change requires it.
 
 ## Optional: GitHub
 

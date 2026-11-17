@@ -1,8 +1,8 @@
-"""One real isolated summary and one hiring-level assessment in a disposable firm.
+"""A real isolated summary and hiring-level assessments in a disposable firm.
 
-Both turns go through the runtime's own path: the account reservation, the
+These turns go through the runtime's own path: the account reservation, the
 one-use summary gate, the provider's summary launch spec, the guest launcher and
-the output parser. Neither turn admits a role activation. Credentials come only
+the output parser. No turn admits a role activation. Credentials come only
 from the explicitly selected provider configuration; evidence holds run records
 and the guest's provider output, never credentials.
 """
@@ -18,6 +18,7 @@ from pathlib import Path
 
 from firm_sandbox import Config, Sandbox
 
+from firm_runtime.errors import FirmError
 from firm_runtime.hosting import LocalServer
 from firm_runtime.mcp_http import build_http_app
 from firm_runtime.providers import Providers
@@ -73,7 +74,9 @@ def main():
         },
         "profiles": {args.profile: profile},
         "accounts": accounts,
-        "summary": {profile["provider"]: source.get("summary", {}).get(profile["provider"], {})},
+        "summary": {profile["provider"]: source.get("summary", {}).get(
+            profile["provider"], {"model": profile["model"], "effort": profile["effort"]}
+        )},
     }
     sandbox_config = args.root / "sandbox.toml"
     os.umask(0o077)
@@ -95,8 +98,7 @@ def main():
     if preflight["failures"]:
         raise RuntimeError(f"Provider preflight failed: {preflight['failures']}")
 
-    # Keep each isolated turn's guest output: the runner retires the summary
-    # account once the turn exits.
+    # Keep each isolated turn's guest output before the reusable slot serves another call.
     follow = box.follow
 
     def capture_follow(run):
@@ -150,12 +152,19 @@ def main():
                     if selected is None:
                         raise RuntimeError(f"No fresh account is eligible for {args.profile}")
                     runtime.accounts.bind(db, role, session_id, selected)
-                sent = runtime.messaging.send(
-                    OWNER, [founder["address"]], MESSAGE, request_id="summary-probe-message"
+                sent = runtime.owner.send_mail(
+                    OWNER,
+                    [founder["address"]],
+                    MESSAGE,
+                    request_id="summary-probe-message",
                 )
-                summary = runtime.messaging.context(
-                    founder["employee_id"], sent["conversation_id"], session_id=session_id
-                )
+                try:
+                    summary = runtime.messaging.read(
+                        founder["employee_id"], sent["message_id"], summarize=True,
+                        session_id=session_id,
+                    )
+                except FirmError as error:
+                    summary = {"status": "unavailable", "reason": str(error)}
 
                 hired = runtime.lifecycle.hire(
                     founder["employee_id"],
@@ -163,19 +172,21 @@ def main():
                     HIRE_MANDATE,
                     request_id="summary-probe-hire",
                 )
-                assert runtime.levels.tick(background=False) == [hired["employee_id"]]
+                # The founder may also be awaiting its initial staffing decision.
+                assert hired["employee_id"] in runtime.levels.tick(background=False)
                 with runtime.store.read() as db:
                     level = runtime.levels.record(db, hired["employee_id"])
                     runs = [
                         dict(row)
                         for row in db.execute(
-                            "SELECT run_id,kind,provider,state,reason,latency_ms,output_tokens "
+                            "SELECT run_id,kind,provider,state,reason,latency_ms,output_tokens,"
+                            "stateless_slot "
                             "FROM summary_runs ORDER BY started_at"
                         )
                     ]
 
                 result = {
-                    "passed": summary["status"] == "summarized" and level["state"] == "chosen",
+                    "passed": summary["status"] == "read" and level["state"] == "chosen",
                     "provider": profile["provider"],
                     "summary": {
                         "status": summary["status"],
@@ -190,7 +201,7 @@ def main():
                 if profile["provider"] == "agy":
                     result["summary"].pop("text", None)
                     result["launches"], result["outputs"] = launches, outputs
-                    result["passed"] = result["passed"] and len(launches) == 2 and all(
+                    result["passed"] = result["passed"] and len(launches) == len(runs) >= 2 and all(
                         launch["passed"] and key in outputs and outputs[key]["success"]
                         and outputs[key]["model_matches"] and outputs[key]["tool_steps"] == 0
                         for key, launch in launches.items()

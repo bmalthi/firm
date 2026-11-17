@@ -1,10 +1,12 @@
 import base64
+import errno
 import json
 import os
 import shutil
 import socket
 import stat
 import sys
+import threading
 from pathlib import Path
 from uuid import uuid4
 
@@ -15,6 +17,7 @@ from firm_sandbox.host_network import (
     Boundary,
     HostNetwork,
     create_proxy_key,
+    forward,
     locations,
     policy_id,
     proxy_port,
@@ -25,11 +28,70 @@ from firm_sandbox.host_network import (
     write_hosts,
 )
 from firm_sandbox.models import VMSettings
+from firm_sandbox.network_observation import Traffic
 
 
 class FakeCommands:
     def __init__(self, env=None):
         self.env = dict(env or {})
+
+
+@pytest.mark.parametrize("direction", ["outbound", "inbound"])
+@pytest.mark.parametrize("reason", ["would_block", "enobufs", "truncated", "denied", "sent"])
+def test_forward_counts_transport_drops_separately_from_policy(direction, reason, monkeypatch):
+    stop = threading.Event()
+    traffic = Traffic()
+    observed = []
+    monkeypatch.setattr(traffic, "observe", lambda frame, allowed: observed.append(allowed))
+
+    class Endpoint:
+        def __init__(self):
+            self.sent = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def recvmsg(self, size):
+            return b"frame", [], socket.MSG_TRUNC if reason == "truncated" else 0, None
+
+        def send(self, frame):
+            if reason == "would_block":
+                raise BlockingIOError(errno.EAGAIN, "full")
+            if reason == "enobufs":
+                raise OSError(errno.ENOBUFS, "full")
+            self.sent.append(frame)
+
+    class Policy:
+        def outbound(self, frame):
+            assert reason != "truncated"  # Incomplete frames must never reach policy or send.
+            return reason != "denied"
+
+        inbound = outbound
+
+    guest, upstream, retained = Endpoint(), Endpoint(), Endpoint()
+    source, target = (guest, upstream) if direction == "outbound" else (upstream, guest)
+
+    def ready(*args):
+        stop.set()  # One readable frame, then leave the forwarder's loop.
+        return [source], [], []
+
+    monkeypatch.setattr("firm_sandbox.host_network.select.select", ready)
+    forward(guest, upstream, retained, Policy(), stop, traffic)
+    counts = traffic.snapshot()["dropped_frames"]
+    assert sum(sum(row.values()) for row in counts.values()) == (
+        1 if reason in {"would_block", "enobufs", "truncated"} else 0
+    )
+    if reason in counts[direction]:
+        assert counts[direction][reason] == 1
+    assert target.sent == ([b"frame"] if reason == "sent" else [])
+    assert observed == (
+        [reason != "denied"] if direction == "outbound" and reason != "truncated" else []
+    )
+    counts[direction]["truncated"] = 100
+    assert traffic.snapshot()["dropped_frames"][direction]["truncated"] != 100
 
 
 def test_the_network_and_vm_settings_refuse_to_run_as_root(tmp_path, monkeypatch):

@@ -25,7 +25,11 @@ def _auth_error(code: str, message: str) -> ProviderSetupError:
 
 
 def read_auth(path: Path) -> tuple[str, bytes]:
-    raw = read_private_credential(path, "Claude")
+    return parse_auth(read_private_credential(path, "Claude"))
+
+
+def parse_auth(raw: bytes) -> tuple[str, bytes]:
+    """Classify credential bytes by the one rule used for both saving and reading."""
     if b"\0" in raw:
         raise _auth_error(
             "credential_invalid", "configured Claude authentication contains a NUL byte"
@@ -91,6 +95,10 @@ def read(path):
 
 def decode(raw):
     try:
+        if isinstance(raw, bytes):
+            # What is saved must be readable later: a pasted token with a stray line
+            # is refused here instead of being installed and rejected at the next read.
+            raw = parse_auth(raw)[1]
         text = raw.decode() if isinstance(raw, bytes) else raw
         if not text.lstrip().startswith(("{", "[")):
             if not text.strip():

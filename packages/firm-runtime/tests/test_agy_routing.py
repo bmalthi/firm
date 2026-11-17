@@ -283,6 +283,35 @@ def test_transient_build_failure_retries_without_shared_hold(tmp_path, monkeypat
             assert role["retry_at"] > runtime.store.clock()
 
 
+def test_task_model_quota_refusal_is_reported_once_and_holds_nothing(tmp_path):
+    from test_agy_provider import quota_stream
+
+    from firm_runtime.task_runner import TaskExecutionError
+
+    runtime = runtime_for(tmp_path)
+    logs = encode(quota_stream())
+
+    def notices():
+        with runtime.store.read() as db:
+            return db.execute(
+                "SELECT body FROM messages WHERE body LIKE 'Task workers cannot run on agy\n\n%'"
+            ).fetchall()
+
+    # A run that did not exit by itself never reports or holds.
+    with pytest.raises(TaskExecutionError) as stopped:
+        record_task_output(runtime, "task-0", "agy", "subscription", logs, 0,
+                           apply_holds=False, model="gemini-4-task")
+    assert str(stopped.value) == "provider_failure" and notices() == []
+    for run_id in ("task-1", "task-2"):
+        with pytest.raises(TaskExecutionError) as refused:
+            record_task_output(runtime, run_id, "agy", "subscription", logs, 0,
+                               apply_holds=True, model="gemini-4-task")
+        assert str(refused.value) == "configuration"
+    assert runtime.accounts.status()["incidents"] == []
+    (notice,) = notices()
+    assert "gemini-4-task" in notice[0] and "model_quota_reached" in notice[0]
+
+
 @pytest.mark.parametrize("code", ["resume_state_missing", "settings_invalid", "token_headroom"])
 def test_local_task_failure_never_creates_account_hold(tmp_path, code):
     from firm_runtime.task_runner import TaskExecutionError

@@ -302,9 +302,14 @@ class RunSpec:
     run_id: str | None = None
     organization: Organization | None = None
     clean_up: bool = False
+    stateless: bool = False
 
     def __post_init__(self):
         identifier(self.role_id)
+        if type(self.stateless) is not bool:
+            raise ValueError("stateless must be a boolean")
+        if self.stateless and self.organization is not None:
+            raise ValueError("stateless runs cannot receive organization authority")
         if self.organization is not None:
             if not isinstance(self.organization, Organization):
                 raise ValueError("organization must be an Organization grant")

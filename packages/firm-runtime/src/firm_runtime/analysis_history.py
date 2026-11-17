@@ -257,7 +257,7 @@ def summary_bound(db, now, run_id, caller_session_id, reservation, *, activation
 
 @best_effort
 def context_observed(db, now, session_id, cause):
-    # Observe accepted counters; do not invoke the claim gate or guidance writer.
+    # Observe accepted counters; do not invoke the read gate or guidance writer.
     row = dict(
         db.execute("SELECT * FROM context_sessions WHERE session_id=?", (session_id,)).fetchone()
     )

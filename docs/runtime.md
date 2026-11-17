@@ -182,11 +182,38 @@ Save each account's login with `firm save-credentials <account> --provider claud
 It validates credentials from stdin (or a paste ended with Ctrl-D) and installs them at
 `~/.config/firm-runtime/credentials/<account>.json`, mode `0600` in a mode-`0700` directory,
 outside the repository and firm directories. Accounts without `auth_file` use that path;
-initialization and `firm configure` record it. When credentials stop working, repeat the
-login and save, then clear the account's `auth` hold with `firm clear-hold`. For an
-initialized firm, guided `firm start` detects an authentication hold on the selected
-account, starts a fresh isolated sign-in, saves to that account's configured `auth_file`,
-and clears only that matching hold after the replacement passes local validation.
+initialization and `firm configure` record it.
+
+When a provider refuses an account with a structured error Firm recognizes, or a saved
+login can no longer be read or renewed, Firm pauses that account with an `auth` incident
+and records the cause on it: the provider's own code, or Firm's credential code such as
+`credential_refresh_rejected`. The notice carries the cause known when the incident
+opened. `firm accounts`, the console card and guided `firm start` show the incident's
+current cause, with the same recovery advice.
+
+* Most causes are repaired by signing in again with
+  `firm login ACCOUNT --provider PROVIDER`. The notice and the console print the exact
+  command, including `--auth-file PATH` for an account with a custom `auth_file`.
+* Claude's `oauth_org_not_allowed` means the account's organization does not allow
+  subscription access, and `account_on_hold` means the provider has put the account on
+  hold. Signing in again to the same account repairs neither. The organization's
+  administrator or the provider has to act, or you sign in with a different provider
+  account.
+
+Then resume the account with **Resume work** on its console card or
+`firm clear-hold DIR INCIDENT_ID`. Resuming is your decision and tests nothing by itself;
+saving credentials never resumes an account. The account's next work period is the test,
+over the same guest path every role uses. If the provider refuses the account again with
+a recognized error, the pause returns as a new incident with the current cause, and no
+role attempt is spent. A refusal Firm cannot classify is not an account pause: it uses the
+role's bounded retries and can end as a role hold. AGY reports provider-side failures
+only as prose, so a refused AGY login takes that route unless the saved login has also
+expired.
+
+For an initialized firm, guided `firm start` walks through this for every account a
+profile routes to. It signs in where a saved login is unusable, explains each account
+under an authentication hold, asks before signing in when the cause says that will not
+help, and asks whether to resume. `server_error` uses Firm's bounded transient retry budget.
 
 An explicit absolute `auth_file` (`~` is expanded) overrides the default. Pointing it at a
 CLI's own login, such as `~/.codex/auth.json` or an export of Claude Code's Keychain item,
@@ -289,12 +316,12 @@ The `/credentials` endpoint accepts only a live activation token or a started, u
 summary token. It resolves the account from the existing binding, never a caller-supplied
 account or path, and rechecks authorization after renewal. Responses are not cached.
 
-Expired or revoked refresh credentials create an account authentication hold; temporary
-transport failures preserve the last access token. Repair the configured credential file, then
-explicitly clear its authentication hold — replacing credentials does not implicitly clear the
-incident. The guided sign-in flow clears the selected account's matching authentication hold
-only after the replacement is saved and validated. The console displays other blockers and
-the required owner action.
+Expired or revoked refresh credentials create an account authentication hold with the code
+`credential_refresh_rejected`; temporary transport failures preserve the last access token.
+Sign in again, then resume the account — replacing credentials does not resume it by
+itself. Guided sign-in saves the replacement and asks whether to resume; local
+validation never clears a hold. The console displays other blockers and the required
+owner action.
 
 Only Firm participants honor the account-file lock. Changes made by another CLI are reread
 before persistence or after a failed renewal, but unrelated programs using cloned logins
@@ -320,18 +347,22 @@ A summary uses the authenticated caller's retained provider and account, and tak
 account's slots. With all four firm-wide isolated slots already busy, or the account held, it
 returns an unavailable result rather than switching providers. Its
 foreground process receives no MCP server, activation token, workspace or drive.
+The four slots reuse dedicated Linux accounts without Docker. Each call gets private
+temporary files and IPC, a read-only guest filesystem except its own home and run state,
+and a complete wipe before reuse. Unconfirmed process exit or cleanup keeps that slot
+unavailable until reconciliation confirms cleanup; other slots remain usable.
 
 An unavailable summary or hiring-level assessment records a short reason in
 `summary_runs.reason`, such as `busy`, `timeout`, `output_limit` or `empty_summary`.
 `output_limit` means a chooser answer exceeded 16 KiB or the provider stream exceeded 256 KiB.
-Conversation summaries are limited to 16 KiB of text. A longer summary is cut to fit and
-ends with the line `[THIS SUMMARY WAS CUT OFF at 16 KiB; the rest was not delivered.]`;
-the `context` result or `reply` receipt then carries `truncated: true`. Reported output
-tokens are recorded as usage. When the
+Thread summaries are limited to 16 KiB of text. A longer summary is cut to fit and
+ends with the line `[THIS SUMMARY WAS CUT OFF at 16 KiB; the rest was not delivered.]`.
+Reported output tokens are recorded as usage. When the
 provider turn itself fails, the reason is the provider's failure kind — `process_exit`,
 `result_error`, `turn_failed`, `invalid_output`, `activation_gate` or `launcher_setup` — and
 `provider_error` only when there is none. For `process_exit`, read the guest log with
-`firm-sandbox --config SANDBOX_TOML logs s-<last 32 characters of the run ID>`.
+`firm-sandbox --config SANDBOX_TOML ps` to find its `s-slot-N` account, then
+`firm-sandbox --config SANDBOX_TOML logs s-slot-N --run-id RUN_ID`.
 
 ### Tasks
 
@@ -360,7 +391,13 @@ effort = "medium"
 A task runs on the calling role's own provider and account. While the role waits, its first
 running task uses the role's slot; each further concurrent task needs a free slot on that
 account or is refused at once (`unavailable: capacity`), and one beyond `max_concurrent`
-is refused as `busy`. Account holds apply as they do to roles. The worker runs
+is refused as `busy`. Account and profile holds apply as they do to roles, and a task
+whose login is refused or whose account allowance is exhausted pauses the account, because
+that is true of the account. A task whose own settings fail (a model the provider does not
+offer, an unsupported effort, a worker that cannot be set up, or on AGY a task model whose
+own allowance is spent) is refused as `configuration` and pauses nothing: roles keep
+working, and Operations tells you once per model and code so you can correct
+`[task.<provider>]`. The worker runs
 as the role's Linux user inside the role's current work period, with the role's files and
 shell but no firm tools and no conversation history; a timeout or the end of the work
 period kills that task alone and the role keeps running. Anything the worker hands to the
@@ -563,8 +600,9 @@ a network host the firm has not allowed, a GitHub repository the firm did not cr
 you revoked, a repository when creation is off or the cap is reached, or the Mac while it
 is not enrolled, a desktop awaits your verified cleanup or no desktop account is ready. A
 refusal the role can act on — bad input, a name in use, a service down, a Mac that is
-busy or full — stays a refusal. The role is told to take up other work or hand off and
-wait, because the answer arrives as mail that wakes it. Each role holds one open request
+busy or full — stays a refusal. The role is told to take up other work or finish
+normally to pause with working memory intact, because the answer arrives as mail that
+wakes it. Each role holds one open request
 per resource; asking again returns it, and another role asking for the same thing gets
 its own, so one decision answers everyone waiting. What you declined stays declined: a
 later request for the same thing is refused `access_denied` with your reason, so decline
@@ -786,7 +824,9 @@ Retained conversations wait on their account's quota hold instead of silently ch
 The owner-supplied observation interface accepts an explicit source and validity period; it does
 not scrape provider prose. Structured provider errors supply shared holds and supported retry
 times. A provider-reported reset on a refused Claude subscription window times the quota hold;
-without an unambiguous reset, the hold remains for owner clearance. API billing and request-rate
+without an unambiguous reset, the hold remains for owner clearance. A quota hold is on the
+account when the allowance is the account's, and on the profile when it is one model's, as
+with [AGY](#experimental-agy-configuration). API billing and request-rate
 limits are separate from subscription windows and are not assigned a guessed reset.
 
 An account may set `stop_admitting_at` to a fraction from 0 through 1. A streamed subscription
@@ -822,9 +862,17 @@ incident needs owner intervention rather than expiry.
 
 Shared incidents notify the owner and affected managers through Operations mail, which,
 like any mail to you, also posts a macOS notification while the host runs. Repeated
-observations do not generate duplicate notices. Clearing a specific incident does not clear a
+observations do not generate duplicate notices, and an incident keeps the first cause reported
+for it. A different kind of hold on the same account or profile replaces the open one, except
+that a timed pause never replaces a hold that waits for you: a quota reset cannot end an
+authentication hold. Clearing a specific incident does not clear a
 newer incident or reset a role's attempt budget. Manager retry releases only an exact isolated
 refusal or exhaustion episode and reports when execution remains blocked on a dependency.
+During timed backoff, the owner may explicitly run
+`firm retry DIR EMPLOYEE --episode EPISODE --request-id ID --immediate`.
+This cancels the pending recovery wake and queues an immediate attempt atomically,
+while preserving spent attempts, stopped-role state, and shared auth/config/quota holds.
+It creates a new recovery revision; repeating the same request ID is idempotent.
 
 On a named account, a transient provider-setup failure before launch consumes one role
 attempt and uses the normal retry delay; the fourth failure holds the role with
@@ -908,12 +956,15 @@ The Overview badge and browser tab title count decisions; Inbox separately count
 mail to you. A request explains who asked, their stated purpose, why it is waiting and
 what allowing or declining does. Declining requires a reason.
 
-Incident cards give recovery steps. For a failed login, sign in again and save the
-credentials with the displayed `firm save-credentials` command, or replace the configured
-credential file when the account uses a custom path. Credentials never pass through the
+Incident cards give recovery steps. An authentication card states the recorded cause. For a
+rejected or unrenewable login it shows the `firm login` command for that account; for an
+organization restriction or a provider account hold it says that signing in again to the
+same account will not help, and what will. Credentials never pass through the
 browser. For a configuration hold, fix the named entry; for an indefinite quota or outage
 hold, resume when ready. Clearing reports **Hold cleared**, then **Work started** once a
-work period is admitted on that account; it does not claim sign-in succeeded.
+work period is admitted on that account; it does not claim sign-in succeeded. If the
+provider refuses the account again with a recognized error, a new card appears with the
+current cause.
 
 Reading mail changes nothing. **Mark done** sets aside that pending delivery to you; it
 does not complete the role's work or decide a request. Sending a reply also marks the
@@ -923,20 +974,50 @@ notices have no Reply action: notices about the same incident are grouped togeth
 request notices appear with the decision they refer to. Their status follows the current
 incident or request record; the message text stays unchanged.
 
-Roles send deliverables with `send` or `reply` attachments, using absolute paths under
-their drive mount. Attached files appear in **Latest results**, **Results** and Inbox's
+Every role message states who is asked to act and who is FYI. `send` takes `to_action`
+and `to_fyi`, and `reply` and `introduce` take `action`; the lists may not overlap, and a
+`send` needs at least one recipient. Everyone still receives the message; body mentions
+have no scheduling effect. The choice belongs to that one message and is never inherited
+from the thread or an earlier message. Receipts label each recipient Action or FYI; a
+message that is read shows the reader's own designation and who else was asked to act;
+`peek` entries show Action when any unread message in the thread asks the reader to act. Owner notifications are unchanged. In group console replies, select who
+should act; none selected means all FYI. `firm send` supports repeatable `--action-to`
+or `--fyi`.
+
+When the firm is running with no active work periods and no admissible ordinary work,
+an eligible role can receive an `idle_inbox_review` for previously unoffered pending mail.
+Each review offers a bounded chronological prefix. Mail already offered does not keep
+triggering reviews, even if left pending; a large backlog can take several reviews.
+Ordinary admission and role peek record only the thread entries actually returned.
+A conservative durable frontier stops at unseen unread gaps, so an out-of-order
+ordinary peek may leave some previously shown mail eligible to reappear.
+Counts, summaries and new-mail sender notices do not record an offer. The frontier
+survives session replacement and restart. Pre-start launch failure restores the reserved
+frontier; after the start handshake an offer is consumed under normal recovery rules.
+Future scheduled wakes remain scheduled and idle review does not cross them early.
+
+Review useful mail and read or dismiss it without acknowledgment-only replies or repeated
+status updates. Reading records receipt, not completion: preserve unfinished commitments
+in working memory or handoff notes. An idle snapshot lists only newly offered mail;
+`peek` shows the whole inbox. New FYI content can still lead to later reviews.
+The runtime status `waiting` count continues to count ordinary scheduling opportunities,
+excluding these conditional idle reviews.
+
+Roles send deliverables with `send` or `reply` attachments (up to 10 per message; `introduce`
+carries none), using absolute paths under their drive mount. Attached files appear in
+**Latest results**, **Results** and Inbox's
 **Read** and **Download** links. The reader previews HTML, Markdown and text up to 2 MiB
 in an isolated frame; other types can be downloaded. HTML can run its own scripts, with
 no console access, cookies, local storage or network; Markdown and text run no scripts.
 **About this file** shows its folder and delivering messages. **Write a follow-up** replies
-in the delivering conversation with the file attached. Attachments refer to the current
+in the delivering thread with the file attached. Attachments refer to the current
 file, not a saved version. Browse folders remains available below the reader, but reading
 guest files requires the Linux VM to be running and never starts it automatically.
 
 The **Firm** menu is on every page. **Stop after current work** closes admission, lets
 current work finish and shuts down the VMs. **Force stop now** interrupts work.
 **Resume Firm** starts the VMs and accepts work again after confirmed shutdown; idle roles
-still need a message or scheduled wake. **Close Firm** closes the stopped local host and
+may review previously unoffered mail when the firm is idle. **Close Firm** closes the stopped local host and
 releases its ports; reopen it with `firm start DIRECTORY`. Each action explains its effect
 and asks for confirmation. Closing the browser does not stop the firm.
 
@@ -1009,11 +1090,10 @@ The same read-only reader serves authenticated GET routes at
 `/api/analysis/conversations/{conversation_id}` and `/api/analysis/roles/{employee_id}/readiness`.
 It uses
 SQLite `mode=ro` and `query_only`, never initializes schema, and excludes credentials and
-invocation contexts. A missing database is an error. The CLI requires a valid release record with the current
-compatibility generation for both live firms and exports, and refuses incompatible state before opening
-the analysis reader. Use the original compatible runtime to analyze an older firm or export; read-only
-access does not imply support for older schemas. Export integrity verification remains independent of
-the current schema generation.
+invocation contexts. A missing database is an error. Analysis has no release-marker or compatibility-generation
+gate. Older schemas are not supported through migrations or fallback shims; use matching
+code to inspect older data if the current reader cannot read it. Export integrity
+verification checks the exported files and database independently of release versions.
 
 `firm analyze` is the diagnostic surface for "what has the firm done" and "what is waiting"
 questions, including for an assistant answering them on your behalf. Querying
@@ -1027,7 +1107,7 @@ questions, including for an assistant answering them on your behalf. Querying
 | **`readiness`** | Current (`sampled_at`) | Per-role scheduling readiness, blockers, retained session bindings, and unreleased reminders. |
 | **`timeline`** | Window | Every work period in the window with `wake_reasons`, `tool_calls` (by name), `operations`, and `failure` classification. |
 | **`usage`** | Admitted in window | Token usage by role, model, workload, session, and tool, plus provider-reported `resolved_models`. |
-| **`conversations`** | Window (or `--conversation-id`) | Message traffic edges, delivery counts, and claim delays (`while_running`, `before_work_period`, `after_notice`). |
+| **`conversations`** | Window (or `--conversation-id`) | Message traffic edges, delivery counts, and read delays (`while_running`, `before_work_period`, `after_notice`). |
 | **`mac`** | Window | Mac station leases, durations, release check outcomes, busy refusals, and desktop tool timings. |
 | **`resources`** | Window | 1-minute host/Linux/Mac CPU, memory, and disk samples, plus per-run cgroup peak memory and CPU usage. |
 | **`network`** | Current / last run | Egress mode (`enforce` vs `observe`), active allowlist by source, pending host requests, and per-role proxy byte/request tallies. |
@@ -1074,22 +1154,22 @@ Interpret the evidence by its scope:
   exact rather than parsed, but covers only mutating runtime operations that carry a request ID:
   peeks, discovery, desktop calls and everything inside the guest are not in it.
 - Messages count once; each recipient delivery counts separately. A role filter selects messages
-  authored or received by that employee; delivery totals and claim delays include all deliveries
-  of those messages, and traffic edges are limited to that employee. Claim delay excludes
-  dismissals and undeliverable mail. `claims_by_arrival` splits those claims by whether the
-  claiming work period had already started when the message arrived: `while_running` is mail a
+  authored or received by that employee; delivery totals and read delays include all deliveries
+  of those messages, and traffic edges are limited to that employee. Read delay excludes
+  dismissals and undeliverable mail. `reads_by_arrival` splits those reads by whether the
+  reading work period had already started when the message arrived: `while_running` is mail a
   role noticed mid-period, `before_work_period` is mail that waited for a wake. Those measure from
   arrival; `after_notice` measures from the
   [waiting-mail notice](../design/messaging.md#presentation) that first named the message, and
-  `claimed_without_notice` counts mail claimed with no such notice — seen at wake or through the
-  role's own peek. A peek that claimed nothing leaves no trace beyond its count in the period's
+  `read_without_notice` counts mail read with no such notice — seen at wake or through the
+  role's own peek. A peek leaves no trace beyond its count in the period's
   `tool_calls`. `undeliverable_reasons` groups the window's undeliverable deliveries by why they
   failed. Current older backlog shows pending deliveries to the selected role. A conversation
   drill-down (`--conversation-id`) reads stored messages across the conversation's lifetime
   without a summary call.
 - The inbox section is your own waiting mail: every delivery to you still pending now, oldest
   first, with author, age and full body. It is sampled at `sampled_at`, so the window does not
-  bound it and claimed or dismissed mail is not in it; a role filter selects mail from that
+  bound it and read or dismissed mail is not in it; a role filter selects mail from that
   author. Reading it changes no disposition. `pending_requests` lists what roles are waiting
   on you for, each with its kind, resource and cause, and `needs_owner_count` is mail plus
   requests.
@@ -1102,7 +1182,7 @@ Interpret the evidence by its scope:
   bindings, primary and alternate constraints and summary account occupancy. "No observed
   blocker" does not promise admission, select an account or verify host liveness.
 - Keep inbox residence age separate from time waiting for compute: old mail does not show that a
-  role lacked capacity, and activation or claim counts alone do not establish useful work
+  role lacked capacity, and activation or read counts alone do not establish useful work
   completed.
 - Resources report the host Mac, the Linux VM and the firm's Mac VM from samples taken once a minute
   while it runs, and each work period from the counters its slice held when it stopped. The
@@ -1307,12 +1387,24 @@ names/namespaces, including search, `manage_task` and `mcp(*)`, under strict
 permissions. Empty declarations alone do not enforce isolation: implicit native
 tools, delegation, browser and scheduler exclusion are unproven, and an implicit
 `manage_task` step can occur. Summaries have no shares or role authority.
+Firm rejects summary/chooser results containing a structured native tool step,
+including the captured implicit `manage_task` case. Role/task tool-step names
+remain visible in execution telemetry, including names outside the declared catalog.
+This detects reported contract violations after execution; it does not undo tool
+effects or prove that native reporting includes every execution.
 
 Only roles get eager authenticated Firm MCP, with an activation bearer and the
 configured task timeout. Tasks and summaries get no MCP config. A tool ERROR
 does not fail an otherwise successful activation: the protocol cannot distinguish
 ordinary tool errors from transport/auth failures. Missing MCP without a structured
-failure cannot be reliably inferred from prose.
+failure cannot be reliably inferred from prose. Before an AGY role activation
+completes, Firm requires its own authenticated `tools/list` receipt for that exact
+activation. A previous activation's receipt does not satisfy a resume. Missing
+discovery is a transient failure with normal bounded retries; exhaustion notices
+name the Firm MCP connection. Live fresh/resumed catalog-only checks establish the
+supported AGY client's eager listing behavior without requesting model tool use.
+Codex and Claude do not use this gate because their discovery/cache behavior needs
+separate verification.
 
 Each Firm session retains a private native HOME at `.firm/agy-sessions/SESSION_UUID`
 for conversations, summaries and cache. Settings/agents are rewritten per activation;
@@ -1330,7 +1422,16 @@ failure budget. The launcher forwards signals, kills process-group children and
 reaps its child; sandbox cgroup cleanup provides the final execution boundary.
 Terminal ERROR and transient pre-launch failures use the ordinary four-attempt
 role budget/backoff and role-scoped hold; local resume/settings failures do not
-create shared account/profile holds. See [expiry recovery and clock requirements](installation.md#experimental-agy-integration).
+create shared account/profile holds. One terminal ERROR is recognized: the CLI's own
+`Individual quota reached. ... Resets in 106h1m57s.` refusal, matched exactly in the
+result's error field. AGY allowances are per model, so when a role's turn is refused this
+way Firm pauses the profile that names the model until the stated reset, spends no
+attempt, and leaves the account's other profiles running; a refusal with no usable reset
+time waits for you. The reset permits one more attempt, so a refusal after it is a new
+pause until the reset it states. The pause is the profile's: it also holds a role on that
+profile whose effort selects another model (`xhigh` always selects Argon), and it is not
+opened by such a role, which keeps the ordinary retries because no profile stands for the
+model it ran. Summaries and staffing assessments refused this way only fail that turn. See [expiry recovery and clock requirements](installation.md#experimental-agy-integration).
 
 Usage is cumulative per conversation: input, output, cache-read and thinking map
 to session counters, with thinking included in output. Activation deltas, context

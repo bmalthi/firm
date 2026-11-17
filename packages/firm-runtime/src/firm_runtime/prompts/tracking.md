@@ -46,7 +46,7 @@ Activation prompt, in order:
 - Mandate-change notice when applicable to a resumed provider session.
 - Guidance-change notice when a retained native session receives a different selection.
 - Organization orientation, where available.
-- Inbox snapshot, or “No pending mail.”
+- Inbox snapshot, or “No unread mail.”
 
 ## 3. Non-founder — first activation
 
@@ -89,7 +89,7 @@ Activation prompt, in order:
 - Guidance-change notice when a retained native session receives a different selection.
 - Organization orientation, where available.
 - Remaining work-period allowance, if temporarily employed.
-- Inbox snapshot, or “No pending mail.”
+- Inbox snapshot, or “No unread mail.”
 
 ## Shared behavior
 
@@ -120,6 +120,7 @@ These are used by isolated runtime calls, not injected into employee activations
 - `runtime_summary.md`: correspondence summarization. Employees receive the
   derived summary, not these instructions.
 - `runtime_level-choice.md`: one isolated staffing assessment for pending level and/or guidance decisions.
+- `runtime_task.md`: bounded `task` worker instructions.
 
 ## Role guidance and limits
 

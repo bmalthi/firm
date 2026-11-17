@@ -83,8 +83,9 @@ def setup(tmp_path):
 
     def build(request):
         return RunSpec(
-            "s-" + request.run_id[-32:],
+            summaries.summary_role_id(request.run_id, request.stateless_slot),
             ("provider",),
+            stateless=True,
             run_id=request.run_id,
             secrets={"summary-token": request.start_token.encode()},
         )
@@ -147,7 +148,7 @@ def test_real_sandbox_facade_supports_summary_stream_and_cleanup(tmp_path):
     assert retired.wait(2)
 
 
-def test_summary_inventory_is_recognized_and_private_resources_retired(setup):
+def test_summary_inventory_is_recognized_and_slot_account_remains_reusable(setup):
     runtime, box, runner, host = setup
     box.release_output.clear()
     results = []
@@ -163,9 +164,16 @@ def test_summary_inventory_is_recognized_and_private_resources_retired(setup):
     call.join(2)
     assert not call.is_alive()
     assert results[0]["status"] == "summarized"
-    assert box.retired.wait(2)
+    assert not box.retired.is_set()
     host.reconcile()
     assert runner._handles == {}
+    host.stop(force=True)
+    host.tick()
+    assert runtime.status()["state"] == "stopped"
+    host.start()
+    with runtime.store.read() as db:
+        assert db.execute("SELECT state FROM summary_runs").fetchone()[0] == "summarized"
+    assert runtime.summary_service._reserve(summary_snapshot(), None)[1]["stateless_slot"] == 0
 
 
 def test_unregistered_summary_prefix_does_not_bypass_inventory_ownership(setup):
@@ -201,12 +209,13 @@ def test_new_failed_launch_cannot_use_inventory_from_before_its_reservation(setu
 
     def create_after_inventory():
         inventory = original_inventory()
-        run_id, _ = runtime.summary_service._reserve(summary_snapshot(), None)
+        run_id, reservation = runtime.summary_service._reserve(summary_snapshot(), None)
         handle = summaries._SummaryHandle(SummaryLaunch(run_id, "fixture", 30))
         handle.launch_pending = False
         handle.result.set_exception(RuntimeError("sandbox call failed after creation"))
         runner._handles[run_id] = handle
-        run = Run("s-" + run_id[-32:], run_id, "f" * 64)
+        run = Run(summaries.summary_role_id(run_id, reservation["stateless_slot"]),
+                  run_id, "f" * 64)
         handle.run = run
         box.invocations[run_id] = [run, True, b"", None]
         created.append(handle)
@@ -228,8 +237,10 @@ def test_one_late_summary_is_powered_off_while_another_launch_remains_pending(se
     runtime, box, runner, host = setup
     handles = []
     for _ in range(2):
-        run_id, _ = runtime.summary_service._reserve(summary_snapshot(), None)
-        handle = summaries._SummaryHandle(SummaryLaunch(run_id, "fixture", 30))
+        run_id, reservation = runtime.summary_service._reserve(summary_snapshot(), None)
+        handle = summaries._SummaryHandle(SummaryLaunch(
+            run_id, "fixture", 30, stateless_slot=reservation["stateless_slot"],
+        ))
         runner._handles[run_id] = handle
         handles.append(handle)
     first, second = handles
@@ -255,7 +266,7 @@ def test_one_late_summary_is_powered_off_while_another_launch_remains_pending(se
         assert runtime.status()["state"] == "stopping"
         with runtime.store.read() as db:
             states = dict(db.execute("SELECT run_id,state FROM summary_runs"))
-        assert states[first.request.run_id] == "unavailable"
+        assert states[first.request.run_id] == "running"
         assert states[second.request.run_id] == "running"
         assert not second.exit_confirmed
     finally:
@@ -291,7 +302,35 @@ def test_pending_start_timeout_and_dead_network_hard_stop_retain_ownership(setup
     assert not box.live
     assert runtime.status()["state"] == "stopped"
     with runtime.store.read() as db:
+        assert db.execute("SELECT state FROM summary_runs").fetchone()[0] == "running"
+    box.unavailable = False
+    host.start()
+    with runtime.store.read() as db:
         assert db.execute("SELECT state FROM summary_runs").fetchone()[0] == "unavailable"
+
+
+def test_failed_slot_cleanup_survives_poweroff_without_preventing_firm_stop(setup, monkeypatch):
+    runtime, box, runner, host = setup
+    run_id, reservation = runtime.summary_service._reserve(summary_snapshot(), None)
+    runtime.summary_service._inflight.discard(run_id)  # The unavailable caller already returned.
+    run = Run(summaries.summary_role_id(run_id, reservation["stateless_slot"]), run_id, "f" * 64)
+    box.invocations[run_id] = [run, False, b"", 125]
+    original_status = box._status
+    dirty = True
+    monkeypatch.setattr(
+        box, "_status", lambda state: {**original_status(state), "unresolved": dirty},
+    )
+    host.stop(force=True)
+    host.tick()
+    assert runtime.status()["state"] == "stopped" and not box.live
+    host.start()
+    with runtime.store.read() as db:
+        row = db.execute("SELECT state FROM summary_runs WHERE run_id=?", (run_id,)).fetchone()
+        assert row[0] == "running"
+    assert runtime.summary_service._reserve(summary_snapshot(), None)[1]["stateless_slot"] == 1
+    dirty = False
+    host.reconcile()
+    assert runtime.summary_service._reserve(summary_snapshot(), None)[1]["stateless_slot"] == 0
 
 
 def test_stream_limit_stops_collection_before_unbounded_allocation(setup):
@@ -300,7 +339,7 @@ def test_stream_limit_stops_collection_before_unbounded_allocation(setup):
     result = runtime.summary_service.summarize(summary_snapshot())
     assert result["status"] == "unavailable"
     assert box.read_chunks <= summaries.MAX_SUMMARY_LOG_BYTES // 8192 + 1
-    assert box.retired.wait(2)
+    assert not box.retired.is_set()
     host.reconcile()
     with runtime.store.read() as db:
         assert db.execute("SELECT state FROM summary_runs").fetchone()[0] == "unavailable"

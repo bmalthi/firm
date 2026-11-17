@@ -16,8 +16,8 @@ from types import SimpleNamespace
 import pytest
 
 from firm_sandbox import mac_image as image
-from firm_sandbox.compatibility import COMPATIBILITY_GENERATION, release_identifier
 from firm_sandbox.mac_station import ASSETS, DIRTY_MARKER
+from firm_sandbox.release import release_identifier
 
 # ---- building a base image -----------------------------------------------------------
 
@@ -159,7 +159,6 @@ def test_build_creates_fresh_stopped_control_account_only_image(
 
     assert manifest == {
         "created_with_release": release_identifier(),
-        "compatibility_generation": COMPATIBILITY_GENERATION,
         "image_id": manifest["image_id"],
         "name": "base",
         "stations": 2,
