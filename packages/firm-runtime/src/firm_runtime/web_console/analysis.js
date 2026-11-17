@@ -1,5 +1,5 @@
 // Observations only. No runtime commands or provider-backed summaries.
-import {bytes, machineName, seconds} from "./format.js";
+import {bytes, machineName, seconds, mailTitle, mailText} from "./format.js";
 
 const $ = (selector) => document.querySelector(selector);
 const root = $("#analysis");
@@ -181,7 +181,7 @@ function conversationDetail(id, cacheKey = id) {
     const data = await api(`conversations/${encodeURIComponent(id)}`, {from: 0, ...(filters.employee_id ? {employee_id: filters.employee_id} : {}), ...(cursorValue ? {cursor: cursorValue} : {})});
     for (const message of data.rows) {
       const article = el("article", undefined, "message-card");
-      article.append(el("strong", `${label(message.author_id)} · ${time(message.created_at)}`), el("p", message.subject), el("p", message.body, "message-body"), el("p", message.deliveries.map((d) => `${label(d.employee_id)}: ${d.disposition === "claimed" ? "picked up" : d.disposition}`).join(" · "), "role-meta"));
+      article.append(el("strong", `${label(message.author_id)} · ${time(message.created_at)}`), el("p", mailTitle(message)), el("p", mailText(message), "message-body"), el("p", message.deliveries.map((d) => `${label(d.employee_id)}: ${d.disposition}`).join(" · "), "role-meta"));
       content.append(article);
     }
     next = data.next_cursor;
@@ -195,10 +195,10 @@ function messaging(items) {
   const conversations = items.filter((r) => r.type === "conversation");
   const traffic = items.filter((r) => r.type === "traffic");
   const backlog = items.filter((r) => r.type === "backlog");
-  const nodes = [el("p", `${pageMeta.message_count} messages · median time to claim: ${seconds(pageMeta.claim_delay.median_seconds)}.`, "role-meta"),
-    el("p", "Pending means not claimed or dismissed; it does not establish whether mail was read, answered, or its work completed.", "role-meta")];
+  const nodes = [el("p", `${pageMeta.message_count} messages · median time to read: ${seconds(pageMeta.read_delay.median_seconds)}.`, "role-meta"),
+    el("p", "Unread means not read or dismissed; reading records receipt, not completed work.", "role-meta")];
   if (conversations.length) nodes.push(el("h3", "Conversations"),
-    table(["Between", "First subject in window", "Messages", "Pending deliveries"], conversations.sort((a, b) => b.messages - a.messages).map((r) => [detail(r.id, r.participants.map(label).join(", "), conversationDetail(r.conversation_id)), r.subject || "", r.messages, r.dispositions.pending || 0])));
+    table(["Between", "Thread", "Messages", "Pending deliveries"], conversations.sort((a, b) => b.messages - a.messages).map((r) => [detail(r.id, r.participants.map(label).join(", "), conversationDetail(r.conversation_id)), mailTitle(r), r.messages, r.dispositions.pending || 0])));
   if (traffic.length) nodes.push(el("h3", "Who is talking to whom"), table(["From", "To", "Messages delivered"], traffic.map((r) => [label(r.author_id), label(r.employee_id), r.deliveries])));
   if (backlog.length) nodes.push(el("h3", "Older mail still waiting"), table(["Recipient", "Waiting for", "Conversation"], backlog.map((r) => [label(r.employee_id), seconds(r.pending_age_seconds), detail(r.id, "Read conversation", conversationDetail(r.conversation_id, r.id))])));
   const undeliverable = Object.entries(pageMeta.undeliverable_reasons || {}).sort((a, b) => b[1] - a[1]);
@@ -209,6 +209,7 @@ function messaging(items) {
 function readiness(items) {
   const activities = {running: "Working", admitted: "Starting", ready: "Queued", idle: "Idle", blocked: "Blocked", retired: "Retired"};
   const explanations = {
+    idle_inbox_review: "Idle inbox review", idle_inbox_review_available: "Mail available for idle review",
     idle_no_wake: "No work requested", scheduled_wake: "Scheduled to run later", retry_wait: "Waiting to retry",
     owner_paused: "Paused by owner", firm_capacity: "All execution slots occupied", account_capacity: "Account slots occupied",
     temporary_exhausted: "Temporary work allowance used up", pending_mail_no_wake: "Mail waiting without a work request",

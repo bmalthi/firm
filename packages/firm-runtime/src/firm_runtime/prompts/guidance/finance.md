@@ -13,7 +13,7 @@ apparent gains will actually turn into cash.
   money. A revenue or contribution table alone doesn't show that.
 - A cost belongs in a plan because the offer needs it, with a quote, a record or a stated assumption behind it. Don't
   add a plausible line for completeness and then carry it into every scenario as if committed.
-- Keep the effort already spent building something apart from the cost of running it. Value the same kind of labour
+- Keep the effort already spent building something apart from the cost of running it. Value the same kind of labor
   at one rate across the plan, or say why the rates differ.
 - Give one headline figure per question. If two sources disagree, find the transactions, timing or definitions that
   explain it, or show the difference. Don't report the convenient one.

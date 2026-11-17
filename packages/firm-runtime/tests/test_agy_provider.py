@@ -99,6 +99,74 @@ def test_native_error_prose_is_not_classified_or_leaked():
     assert "synthetic-private" not in str(result)
 
 
+QUOTA_SENTENCE = (
+    "Individual quota reached. Please upgrade your subscription to increase your limits. "
+    "Resets in {wait}."
+)
+
+
+def quota_stream(error=None, *, status="ERROR", response=""):
+    error = QUOTA_SENTENCE.format(wait="106h1m57s") if error is None else error
+    events = stream(status=status)
+    events.insert(
+        1,
+        {
+            "event": "step_update",
+            "step_update": {"conversation_id": "synthetic-id", "step_type": "error_message"},
+        },
+    )
+    events[-1]["result"].update(
+        error=error, response=response, finished_reason="error", num_turns=1
+    )
+    return events
+
+
+def test_model_quota_refusal_is_a_quota_failure_with_the_stated_wait():
+    result = parse_result(encode(quota_stream()), 0)
+    assert result.success is False
+    assert result.provider_session_id == "synthetic-id"
+    assert result.error.kind == "result_error"
+    assert result.error.code == "model_quota_reached"
+    assert result.error.category == "quota"
+    assert result.error.retry_after_seconds == 381717
+
+
+@pytest.mark.parametrize(
+    "wait,seconds",
+    [
+        ("57s", 57),
+        ("1m0s", 60),
+        ("2h0m0s", 7200),
+        ("0s", None),
+        ("0h0m0s", None),
+        ("200h0m0s", None),
+        ("", None),
+    ],
+)
+def test_model_quota_wait_is_parsed_and_unusable_waits_are_none(wait, seconds):
+    result = parse_result(encode(quota_stream(QUOTA_SENTENCE.format(wait=wait))), 0)
+    assert result.error.code == "model_quota_reached"
+    assert result.error.category == "quota"
+    assert result.error.retry_after_seconds == seconds
+
+
+@pytest.mark.parametrize(
+    "error,status,response",
+    [
+        (QUOTA_SENTENCE.format(wait="1m0s") + " Contact support.", "ERROR", ""),
+        ("Quota reached. Resets in 1m0s.", "ERROR", ""),
+        ("Something failed", "ERROR", QUOTA_SENTENCE.format(wait="1m0s")),
+        (QUOTA_SENTENCE.format(wait="1m0s"), "CANCELED", ""),
+    ],
+)
+def test_other_model_quota_text_is_not_classified(error, status, response):
+    result = parse_result(encode(quota_stream(error, status=status, response=response)), 0)
+    assert result.success is False
+    assert result.error.code is None
+    assert result.error.category == "unknown"
+    assert result.error.retry_after_seconds is None
+
+
 def test_session_totals_never_become_activation_totals():
     first = parse_usage(encode(stream(usage={"input_tokens": 100, "output_tokens": 20})))
     second = parse_usage(encode(stream(usage={"input_tokens": 160, "output_tokens": 30})))
@@ -140,6 +208,37 @@ def test_summary_uses_fresh_session_totals():
     assert result.text == "FIRM_OK" and result.error is None
     assert result.output_tokens == 8
     assert result.usage["output_tokens"] == 8
+
+
+def test_captured_tool_free_manage_task_invalidates_summary():
+    capture = json.loads((FIXTURES / "captured_tool_free_manage_task.json").read_bytes())
+    logs = encode(capture["events"])
+    assert parse_result(logs, capture["exit_code"]).success
+    assert parse_result(logs, capture["exit_code"], tool_free=True).error.code == (
+        "tool_free_violation"
+    )
+    summary = parse_summary(logs, capture["exit_code"])
+    assert summary.text is None and summary.error is not None
+
+
+@pytest.mark.parametrize("name", ["browser_subagent", "invoke_subagent", "manage_task"])
+def test_unexpected_tools_are_counted_but_rejected_in_tool_free_results(name):
+    events = stream()
+    events.insert(1, {"event": "step_update", "step_update": {
+        "conversation_id": "synthetic-id", "step_type": "tool", "step_index": 1,
+        "state": "DONE", "tool_name": name,
+    }})
+    logs = encode(events)
+    assert parse_result(logs, 0).success
+    assert parse_tool_calls(logs) == {name: 1}
+    assert parse_summary(logs, 0).error is not None
+
+
+def test_tool_catalog_and_response_prose_are_not_execution_evidence():
+    events = stream()
+    events[0]["init"]["tools"] = ["manage_task", "browser_subagent"]
+    events[-1]["result"]["response"] = "I used manage_task and browser_subagent"
+    assert parse_summary(encode(events), 0).error is None
 
 
 @pytest.mark.parametrize("mode", ["role", "task", "tool_free"])
@@ -305,6 +404,16 @@ def test_guest_environment_drops_admission_and_cloud_credentials(monkeypatch, tm
     env = agy_launch._environment(tmp_path)
     assert "synthetic-secret" not in str(env)
     assert env["HOME"] == str(tmp_path)
+
+
+def test_guest_environment_keeps_the_roles_playwright_cache(monkeypatch, tmp_path):
+    # AGY's HOME is its session folder, so Playwright must be told where the role's
+    # cache, with its links to the base image's browsers, is.
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "/home/role/.cache/ms-playwright")
+    monkeypatch.setenv("PLAYWRIGHT_SKIP_BROWSER_GC", "1")
+    env = agy_launch._environment(tmp_path)
+    assert env["PLAYWRIGHT_BROWSERS_PATH"] == "/home/role/.cache/ms-playwright"
+    assert env["PLAYWRIGHT_SKIP_BROWSER_GC"] == "1"
 
 
 @pytest.mark.parametrize("mode", ["role", "task", "tool_free"])

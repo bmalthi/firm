@@ -7,14 +7,11 @@ from dataclasses import dataclass, field
 from firm_sandbox import Run
 
 from .errors import FirmError
+from .prompt_resources import prompt
 from .tasks import TaskExecutionError, TaskLaunch
 
 LOG_LIMIT = 4 * 1024 * 1024
-WORKER_INSTRUCTIONS = (
-    "Complete the supplied task using ordinary file, search and shell tools as needed. "
-    "Return one concise final answer. You share files with the caller; coordinate writes "
-    "as instructed. Do not delegate or start background work."
-)
+WORKER_INSTRUCTIONS = prompt("runtime_task.md")
 
 
 @dataclass

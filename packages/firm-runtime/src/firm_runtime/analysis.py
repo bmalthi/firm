@@ -849,9 +849,10 @@ class AnalysisReader:
     def conversations(
         self, db, now, start, end, employee_id, cutoffs, *, conversation_id=None
     ):
-        query = "SELECT message_id,sequence,conversation_id,author_id,subject,created_at,reply_to"
+        query = ("SELECT message_id,sequence,conversation_id,author_id,subject,body,"
+                 "created_at,reply_to")
         if conversation_id:
-            query += ",body"
+            query += ",summary"
         query += " FROM messages WHERE rowid<=?"
         args = [cutoffs["messages"]]
         if conversation_id:
@@ -861,7 +862,7 @@ class AnalysisReader:
         deliveries = defaultdict(list)
         for r in db.execute(
             "SELECT message_id,employee_id,disposition,disposition_at,failure_reason,"
-            "claimed_activation_id FROM message_deliveries"
+            "read_activation_id FROM message_deliveries"
         ):
             if r["message_id"] in messages:
                 deliveries[r["message_id"]].append(dict(r))
@@ -894,9 +895,9 @@ class AnalysisReader:
         selected = []
         backlog = []
         edges = Counter()
-        claims = []
-        # Claimed mail split by whether its claiming work period had already begun when it
-        # arrived: mail claimed while the role was already running was noticed mid-period.
+        reads = []
+        # Read mail split by whether its reading work period had already begun when it
+        # arrived: mail read while the role was already running was noticed mid-period.
         while_running = []
         before_work_period = []
         unattributed = []
@@ -914,10 +915,10 @@ class AnalysisReader:
             if start <= message["created_at"] < end:
                 selected.append(message)
                 for d in recipients:
-                    if d["disposition"] == "claimed":
+                    if d["disposition"] == "read":
                         delay = duration(message["created_at"], d["disposition_at"])
-                        claims.append(delay)
-                        began = started_at.get(d["claimed_activation_id"])
+                        reads.append(delay)
+                        began = started_at.get(d["read_activation_id"])
                         if began is None:
                             unattributed.append(delay)
                         elif began <= message["created_at"]:
@@ -958,7 +959,7 @@ class AnalysisReader:
                 duration(m["created_at"], d["disposition_at"])
                 for m in group
                 for d in m["deliveries"]
-                if d["disposition"] == "claimed"
+                if d["disposition"] == "read"
             ]
             ages = [
                 duration(m["created_at"], now)
@@ -972,6 +973,8 @@ class AnalysisReader:
                     "type": "conversation",
                     "conversation_id": cid,
                     "subject": min(group, key=lambda m: m["sequence"])["subject"],
+                    "preview": (" ".join(group[-1]["body"].split())[:80]
+                                if group[-1]["subject"] is None else None),
                     "messages": len(group),
                     "replies": sum(m["reply_to"] is not None for m in group),
                     "participants": sorted(
@@ -979,7 +982,7 @@ class AnalysisReader:
                     ),
                     "last_activity": max(m["created_at"] for m in group),
                     "dispositions": dict(Counter(d["disposition"] for d in ds)),
-                    "claim_delay": latency(delays),
+                    "read_delay": latency(delays),
                     "pending_age": latency(ages),
                 }
             )
@@ -1004,23 +1007,18 @@ class AnalysisReader:
             "rows": rows,
             "message_count": len(selected),
             "delivery_count": sum(len(m["deliveries"]) for m in selected),
-            "claim_delay": latency(claims),
-            "claims_by_arrival": {
+            "read_delay": latency(reads),
+            "reads_by_arrival": {
                 "while_running": latency(while_running),
                 "before_work_period": latency(before_work_period),
                 "unattributed": latency(unattributed),
                 "after_notice": latency(after_notice),
-                "claimed_without_notice": never_announced,
-                "semantics": "Claimed mail, by whether the claiming work period had already "
-                "started when the message arrived. while_running means the role was mid-period "
-                "and claimed it there; before_work_period means it arrived before that period. "
-                "Those two "
-                "measure from arrival; after_notice measures from the waiting-mail notice that "
-                "first named the message. These measure recorded claims (including reply "
-                "acknowledgments), not when mail "
-                "was first read, answered, understood, or its work completed. Mail claimed "
-                "without a notice has no recorded notice for that claiming period. Reads and "
-                "replies can precede a claim; a peek that claimed nothing is invisible here.",
+                "read_without_notice": never_announced,
+                "semantics": "Recorded reads, by whether the reading work period had already "
+                "started when the message arrived. while_running and before_work_period "
+                "measure from arrival; after_notice measures from the waiting-mail notice "
+                "that first named the message. Reading records receipt, not completion or "
+                "understanding. read_without_notice counts reads without a recorded notice.",
             },
             "pending_deliveries_from_before_window": len(backlog),
             "dispositions": dict(
@@ -1039,7 +1037,7 @@ class AnalysisReader:
     def inbox(self, db, now, employee_id, cutoff):
         """The mail still waiting in the owner's inbox, with its bodies, sampled now.
 
-        Dispositions are current, so claimed and dismissed mail is gone from here and the
+        Dispositions are current, so read and dismissed mail is gone from here and the
         analysis window does not bound it; `conversations` is where a window's traffic is
         counted.
         """
@@ -1191,6 +1189,18 @@ class AnalysisReader:
                 "WHERE d.disposition='pending' GROUP BY d.employee_id"
             )
         }
+        review_available = {
+            row["employee_id"] for row in db.execute(
+                "SELECT d.employee_id FROM message_deliveries d JOIN messages m USING(message_id) "
+                "JOIN roles r ON r.employee_id=d.employee_id WHERE d.disposition='pending' "
+                "AND m.sequence>r.last_offered_message_sequence "
+                "AND (d.scheduling_ready_at IS NULL OR d.scheduling_ready_at<=?) "
+                "AND NOT EXISTS(SELECT 1 FROM message_deliveries older JOIN messages om "
+                "USING(message_id) WHERE older.employee_id=d.employee_id "
+                "AND older.disposition='pending' AND om.sequence>r.last_offered_message_sequence "
+                "AND om.sequence<m.sequence AND older.scheduling_ready_at>?)", (now, now)
+            )
+        }
         incidents = [
             dict(r)
             for r in db.execute(
@@ -1310,6 +1320,11 @@ class AnalysisReader:
                             ]
                         },
                     )
+                elif eid in review_available:
+                    add("idle_inbox_review_available", pending[eid])
+                    if future:
+                        add("scheduled_wake", {"next_due_at": min(future)})
+                        deadlines.append(min(future))
                 elif future:
                     add("scheduled_wake", {"next_due_at": min(future)})
                     deadlines.append(min(future))
@@ -1354,7 +1369,7 @@ class AnalysisReader:
                             blockers.append("account_config_hold")
                         if option_incidents:
                             blockers.extend(
-                                "account_quota_hold"
+                                i["scope"] + "_quota_hold"
                                 if i["kind"] == "quota"
                                 else i["scope"] + "_config_hold"
                                 if i["kind"] == "config"
@@ -1417,7 +1432,8 @@ class AnalysisReader:
                 if reasons == ["ready"]
                 else "idle"
                 if all(
-                    r in ("idle_no_wake", "pending_mail_no_wake", "scheduled_wake") for r in reasons
+                    r in ("idle_no_wake", "pending_mail_no_wake", "scheduled_wake",
+                          "idle_inbox_review_available") for r in reasons
                 )
                 else "blocked"
             )

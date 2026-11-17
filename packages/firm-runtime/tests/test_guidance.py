@@ -171,7 +171,8 @@ def test_removed_guides_reconcile_once_keep_owner_or_request_current_revision(
     with runtime.store.read() as db:
         before = list(db.iterdump())
         (notice,) = db.execute(
-            "SELECT body FROM messages WHERE subject=?", ("Role guidance no longer available",)
+            "SELECT body FROM messages WHERE body LIKE ?",
+            ("Role guidance no longer available\n\n%",),
         ).fetchall()
         assert "removed-scope, removed-function" in notice[0]
     runtime.start()
@@ -195,7 +196,8 @@ def test_removed_guides_with_staffing_off_drop_ids_without_a_notice(system):
     assert result["guidance_state"] == "chosen"
     with runtime.store.read() as db:
         assert not db.execute(
-            "SELECT 1 FROM messages WHERE subject=?", ("Role guidance no longer available",)
+            "SELECT 1 FROM messages WHERE body LIKE ?",
+            ("Role guidance no longer available\n\n%",),
         ).fetchall()
 
 

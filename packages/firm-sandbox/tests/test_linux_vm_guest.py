@@ -99,6 +99,129 @@ def journal(run_id, request, record=None):
 # ---- identity, ranges, units -----------------------------------------------------------
 
 
+def test_stateless_slot_reuses_uid_without_docker_and_wipes_home_and_credentials(sim):
+    request = {"role_id": "s-slot-0", "run_id": "first", "argv": ["true"], "stateless": True}
+    guest.start(request)
+    info = guest.role_record("s-slot-0")
+    home = Path(info["home"])
+    outside = sim.tree / "outside"
+    outside.write_text("keep")
+    (home / "cache").mkdir()
+    (home / "cache" / "old-secret").write_text("old")
+    (home / "link").symlink_to(outside)
+    Path(info["credentials"]).joinpath("token").write_text("old token")
+    guest.supervise("first")
+    assert not guest.status("first")["unresolved"]
+    assert list(home.iterdir()) == []
+    assert not Path(info["credentials"]).exists()
+    assert outside.read_text() == "keep"
+    guest.start({**request, "run_id": "second"})
+    assert guest.role_record("s-slot-0")["uid"] == info["uid"]
+    assert len([argv for argv in sim.commands if argv[0] == "useradd"]) == 1
+    assert not any("docker" in " ".join(argv) for argv in sim.commands)
+    assert not (guest.SUBID / "subuid").exists()
+    assert not (home / "cache").exists()
+    guest.supervise("second")
+
+
+def test_stateless_cleanup_failure_quarantines_until_retry_confirms_clean(sim, monkeypatch):
+    request = {"role_id": "s-slot-0", "run_id": "first", "argv": ["true"], "stateless": True}
+    guest.start(request)
+    worker = guest.scratch_worker
+    monkeypatch.setattr(guest, "scratch_worker", lambda *args, **kwargs:
+                        {"completed": False, "skipped": {"deadline": 1}})
+    guest.supervise("first")
+    assert guest.status("first")["unresolved"]
+    with pytest.raises(ValueError, match="active or unresolved"):
+        guest.start({**request, "run_id": "second"})
+    with pytest.raises(RuntimeError, match="cleanup could not be confirmed"):
+        guest.stop_run("first")
+    monkeypatch.setattr(guest, "scratch_worker", worker)
+    assert not guest.stop_run("first")["unresolved"]
+    guest.start({**request, "run_id": "second"})
+
+
+def test_stateless_wipe_does_not_claim_an_empty_home_with_live_processes(sim, monkeypatch):
+    info = guest.provision("s-slot-0", stateless=True)
+    monkeypatch.setattr(guest, "slice_empty", lambda uid: False)
+    with pytest.raises(RuntimeError, match="still has processes"):
+        guest.clean_stateless_home(info)
+
+
+@pytest.mark.parametrize("failed_cleanup", [False, True])
+def test_stateless_reboot_keeps_home_quarantined_until_cleanup(sim, monkeypatch, failed_cleanup):
+    request = {"role_id": "s-slot-0", "run_id": "first", "argv": ["true"], "stateless": True}
+    guest.start(request)
+    home = Path(guest.role_record("s-slot-0")["home"])
+    (home / "old-secret").write_text("private")
+    worker = guest.scratch_worker
+    monkeypatch.setattr(guest, "scratch_worker", lambda *args, **kwargs:
+                        {"completed": False, "skipped": {"deadline": 1}})
+    if failed_cleanup:
+        guest.supervise("first")
+    monkeypatch.setattr(guest, "boot", lambda: "boot-2")
+    assert guest.status("first")["unresolved"]
+    with pytest.raises(ValueError, match="active or unresolved"):
+        guest.start({**request, "run_id": "second"})
+    with pytest.raises(RuntimeError, match="cleanup could not be confirmed"):
+        guest.stop_run("first")
+    assert guest.status("first")["unresolved"]
+    monkeypatch.setattr(guest, "scratch_worker", worker)
+    assert not guest.stop_run("first")["unresolved"]
+    assert list(home.iterdir()) == []
+    guest.start({**request, "run_id": "second"})
+
+
+def test_stateless_before_launch_cleanup_failure_is_durably_quarantined(sim, monkeypatch):
+    request = {"role_id": "s-slot-0", "run_id": "first", "argv": ["true"], "stateless": True,
+               "secrets": {"token": base64.b64encode(b"private-test-token").decode()}}
+    worker = guest.scratch_worker
+    monkeypatch.setattr(guest, "scratch_worker", lambda *args, **kwargs:
+                        {"completed": False, "skipped": {"deadline": 1}})
+    with pytest.raises(RuntimeError, match="cleanup could not be confirmed"):
+        guest.start(request)
+    assert not sim.spawned
+    assert guest.status("first")["unresolved"]
+    assert not (guest.run_path("first") / "request.json").exists()
+    assert guest.start(request)["unresolved"]  # Identical replay never launches a second attempt.
+    with pytest.raises(ValueError, match="active or unresolved"):
+        guest.start({**request, "run_id": "second"})
+    # Simulate a controller death after publication, before its exception handler.
+    guest.save(guest.run_path("first") / "request.json", request)
+    (guest.run_path("first") / "stdin").write_bytes(b"private-test-input")
+    with pytest.raises(RuntimeError, match="cleanup could not be confirmed"):
+        guest.stop_run("first")
+    assert not (guest.run_path("first") / "request.json").exists()
+    assert not (guest.run_path("first") / "stdin").exists()
+    assert guest.status("first")["unresolved"]
+    monkeypatch.setattr(guest, "scratch_worker", worker)
+    assert not guest.stop_run("first")["unresolved"]
+    guest.start({**request, "run_id": "second"})
+
+
+def test_stateless_service_hides_shared_runtime_and_does_not_put_secrets_in_argv(sim):
+    info = guest.provision("s-slot-0", stateless=True)
+    command = guest.stateless_command(info, {"run_id": "r1", "argv": ["true"]},
+                                      {"SECRET": "private-value"}, info["home"])
+    assert "--scope" not in command
+    assert "--property=ProtectSystem=strict" in command
+    assert "--property=ProtectHome=tmpfs" in command
+    assert "--property=TemporaryFileSystem=/run:ro /dev/shm:rw,nosuid,nodev,mode=1777" in command
+    assert "--property=RestrictNamespaces=yes" in command
+    assert "--property=RestrictAddressFamilies=AF_INET AF_INET6" in command
+    assert "--property=SystemCallArchitectures=native" in command
+    assert (
+        "--property=SystemCallFilter=~sendmsg sendmmsg recvmsg recvmmsg "
+        "io_uring_setup io_uring_enter io_uring_register"
+        " add_key request_key keyctl"
+    ) in command
+    assert "--property=PrivateIPC=yes" in command
+    assert "--setenv=SECRET" in command
+    assert "private-value" not in " ".join(command)
+    with pytest.raises(ValueError, match="profile cannot change"):
+        guest.provision("s-slot-0")
+
+
 def test_file_server_identities_keep_their_names_and_ranges():
     account, uid = guest.allocate_identity(
         "firm:analyst", account_prefix="firmfile-", uid_start=50000, uid_count=10000,
@@ -115,6 +238,29 @@ def test_file_server_identities_keep_their_names_and_ranges():
         used_uids=set(range(57146, 60000)) | {50000},
     )
     assert wrapped == 50001
+
+
+def test_identity_exhaustion_fails_and_keeps_reserved_uids():
+    with pytest.raises(RuntimeError, match="UID range is exhausted"):
+        guest.allocate_identity(
+            "summary", account_prefix="firmrole-", uid_start=2000, uid_count=3,
+            used_uids={None, 1999, 2000, 2001, 2002, 2003},
+        )
+    # Tombstones stay reserved; the last available identity is still usable.
+    _, uid = guest.allocate_identity(
+        "summary", account_prefix="firmrole-", uid_start=2000, uid_count=3,
+        used_uids={2000, 2002},
+    )
+    assert uid == 2001
+
+
+@pytest.mark.parametrize("count", [0, -1])
+def test_identity_range_must_be_nonempty(count):
+    with pytest.raises(ValueError, match="at least one UID"):
+        guest.allocate_identity(
+            "summary", account_prefix="firmrole-", uid_start=2000, uid_count=count,
+            used_uids=set(),
+        )
 
 
 def test_role_account_is_the_layout_home_and_a_valid_identifier():
@@ -199,6 +345,58 @@ def test_provision_reserves_identity_range_units_and_docker(sim):
     sim.commands.clear()
     assert guest.provision(ROLE) == info
     assert sim.commands == []
+
+
+def test_provision_links_only_the_shared_browsers_into_the_roles_own_cache(sim, monkeypatch):
+    shared = sim.tree / "opt" / "ms-playwright"
+    for name in ("chromium-1200", "chromium_headless_shell-1200", "ffmpeg-1011",
+                 ".links", "__dirlock"):
+        (shared / name).mkdir(parents=True)
+    (shared / "stray-file").write_text("")
+    monkeypatch.setattr(guest, "SHARED_BROWSERS", shared)
+    info = guest.provision(ROLE)
+    cache = Path(info["home"]) / ".cache" / "ms-playwright"
+    assert sorted(entry.name for entry in cache.iterdir()) == [
+        "chromium-1200", "chromium_headless_shell-1200", "ffmpeg-1011",
+    ]
+    for entry in cache.iterdir():
+        assert entry.is_symlink() and entry.readlink() == shared / entry.name
+    for path in (cache.parent, cache):
+        assert path.stat().st_mode & 0o777 == 0o700
+    environment = guest.role_environment(info)
+    assert environment["PLAYWRIGHT_BROWSERS_PATH"] == str(cache)
+    assert environment["PLAYWRIGHT_SKIP_BROWSER_GC"] == "1"
+
+
+def test_provision_without_shared_browsers_or_for_a_stateless_slot_links_nothing(
+    sim, monkeypatch,
+):
+    monkeypatch.setattr(guest, "SHARED_BROWSERS", sim.tree / "opt" / "missing")
+    info = guest.provision(ROLE)
+    assert not (Path(info["home"]) / ".cache").exists()
+    shared = sim.tree / "opt" / "ms-playwright"
+    (shared / "chromium-1200").mkdir(parents=True)
+    monkeypatch.setattr(guest, "SHARED_BROWSERS", shared)
+    slot = guest.provision("s-slot-0", stateless=True)
+    assert not (Path(slot["home"]) / ".cache").exists()
+
+
+def test_resumed_provision_keeps_the_links_it_already_made(sim, monkeypatch):
+    shared = sim.tree / "opt" / "ms-playwright"
+    (shared / "chromium-1200").mkdir(parents=True)
+    monkeypatch.setattr(guest, "SHARED_BROWSERS", shared)
+    original = guest.subordinate_range
+
+    def interrupted(account, index):
+        raise KeyboardInterrupt("synthetic guest controller interruption")
+
+    monkeypatch.setattr(guest, "subordinate_range", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        guest.provision(ROLE)
+    monkeypatch.setattr(guest, "subordinate_range", original)
+    info = guest.provision(ROLE)
+    link = Path(info["home"]) / ".cache" / "ms-playwright" / "chromium-1200"
+    assert link.readlink() == shared / "chromium-1200"
 
 
 def test_provision_does_not_commit_role_before_docker_install_is_durable(sim, monkeypatch):
@@ -458,7 +656,7 @@ from pathlib import Path
 from firm_sandbox import linux_vm_guest as guest
 guest.STATE = Path(sys.argv[1])
 guest.RUN_ROOT = Path(sys.argv[1]) / "run"
-guest.provision = lambda role: {{"role_id": role, "account": "test", "uid": {UID},
+guest.provision = lambda role, **kwargs: {{"role_id": role, "account": "test", "uid": {UID},
                                  "gid": {UID}}}
 guest.settle = lambda info: None
 guest.prepare_run_state = lambda info: None
@@ -1576,6 +1774,10 @@ def test_child_inherits_parent_identity_cwd_clean_environment_and_deadline(
     assert options["env"]["FIRM_STATE_DIR"].endswith("/task-homes/child/state")
     assert options["env"]["FIRM_CREDENTIALS_DIR"].endswith("/tasks/child/credentials")
     assert options["env"]["FIRM_PRIVATE_HOME"] == options["env"]["HOME"]
+    # The task's HOME is its own, but Playwright still finds the role's browsers.
+    assert options["env"]["PLAYWRIGHT_BROWSERS_PATH"] == (
+        str(sim.tree / "home" / ACCOUNT / ".cache" / "ms-playwright")
+    )
     assert not (guest.STATE / "task-homes/child").exists()
     assert all(command[0] == "ps" for command in sim.commands)  # no account/service/mount work
     assert guest.child_status("child")["exit_code"] == 0

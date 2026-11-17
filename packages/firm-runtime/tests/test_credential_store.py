@@ -156,6 +156,17 @@ def test_refresh_failure_preserves_original_and_hides_secrets(tmp_path, provider
     assert path.read_bytes() == original
 
 
+def test_claude_token_save_refuses_what_a_later_read_would_reject(tmp_path):
+    path = tmp_path / "token"
+    store = CredentialStore("claude", path)
+    with pytest.raises(ProviderSetupError) as error:
+        store.save(b"first-token\nsecond-line\n")
+    assert error.value.code == "credential_invalid"
+    assert not path.exists()
+    store.save(b"plain-token\n")
+    assert store.snapshot(force=True)["data"] == "plain-token"
+
+
 @pytest.mark.parametrize("provider", ["claude", "codex"])
 def test_missing_refresh_does_not_launch_renewal(tmp_path, provider):
     path = tmp_path / "auth.json"

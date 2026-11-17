@@ -3,6 +3,7 @@
 import math
 
 from .analysis import disk_state
+from .prompt_resources import render
 from .store import encoded
 
 # A quiet provider does not make its last measurement a fresh observation.
@@ -70,10 +71,7 @@ def _mac_disk_notice(db, actor_id, now):
     state = disk_state(dict(sample), now) if sample is not None else None
     if state is None or not state["low_disk"]:
         return []
-    return [
-        f"The Mac you hold is low on disk: about {state['free_bytes'] / (1024**3):.1f} GiB "
-        "free. Delete what you no longer need in your scratch folder."
-    ]
+    return [render("results", "mac_disk_low", free=f"{state['free_bytes'] / (1024**3):.1f}")]
 
 
 def _linux_disk_notice(db, now):
@@ -87,10 +85,7 @@ def _linux_disk_notice(db, now):
     if state is None or not state["low_disk"]:
         return []
     free = state["free_bytes"] / (1024**3)
-    return [
-        f"The Linux disk you share with your colleagues is low: about {free:.1f} GiB free. "
-        "Delete scratch files and Docker containers, images and volumes you no longer need."
-    ]
+    return [render("results", "linux_disk_low", free=f"{free:.1f}")]
 
 
 def _housekeeping_notice(db, actor_id):
@@ -100,11 +95,7 @@ def _housekeeping_notice(db, actor_id):
     ).fetchone()[0]
     if (finished + 1) % HOUSEKEEPING_EVERY:
         return []
-    return [
-        "Housekeeping: see what your scratch directory and Docker hold (du -sh on scratch, "
-        "docker system df) and remove checkouts, containers, images and volumes from finished "
-        "work. Keep what current work still needs."
-    ]
+    return [render("results", "housekeeping")]
 
 
 def _facts(db, role, now: float) -> dict:

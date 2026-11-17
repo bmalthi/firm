@@ -25,11 +25,10 @@ def test_tool_descriptions_are_resource_backed_and_keep_registered_operations():
         "send",
         "reply",
         "peek",
-        "claim",
+        "introduce",
+        "read",
         "dismiss",
         "clear",
-        "messages",
-        "context",
         "set_reminder",
         "list_reminders",
         "cancel_reminder",
@@ -74,10 +73,10 @@ def test_request_access_names_its_kinds_resources_and_refusals():
 
 
 def test_mail_tool_descriptions_explain_deliverable_attachments():
-    for name in ("send", "reply"):
-        description = TOOL_DESCRIPTIONS[name]
-        assert "Attach a file the reader should open, such as a report." in description
-        assert "absolute path under your drive" in description
+    assert "attachments are files the reader should open" in TOOL_DESCRIPTIONS["send"]
+    assert "absolute paths under your drive" in TOOL_DESCRIPTIONS["send"]
+    assert "attachments work as in send" in TOOL_DESCRIPTIONS["reply"]
+    assert "attachments" not in TOOL_DESCRIPTIONS["introduce"]
 
 
 def test_standing_and_starter_mandate_explain_deliverable_attachments():
@@ -147,22 +146,13 @@ def test_template_values_are_substituted_once_and_user_text_stays_literal():
     assert result.count(marker) == 1
     assert "e1" in result
     assert render("tools", "hire", mandate_guidance=marker).count(marker) == 1
-    rendered = render_tool_result(
-        "messages",
-        {
-            "messages": [
-                {
-                    "message_id": "m1",
-                    "conversation_id": "c1",
-                    "author": "founder",
-                    "recipients": ["analyst"],
-                    "created_at": 1700000000,
-                    "subject": "Literal",
-                    "body": marker,
-                }
-            ]
-        },
-    )
+    rendered = render_tool_result("read", {
+        "status": "read", "subject": "Literal", "message_id": "m1", "reader_id": "e1",
+        "participants": [], "marked_read": [], "remaining": 0, "reread": True,
+        "messages": [{"message_id": "m1", "author": {"employee_id": "founder"},
+                      "created_at": 1700000000,
+                      "body": marker}],
+    })
     assert marker in rendered
 
 
@@ -186,10 +176,7 @@ def test_action_result_guidance_comes_from_results_resources():
     assert render_tool_result("handoff", {"status": "saved", "next": "wait"}) == render(
         "controls", "saved"
     )
-    assert render_tool_result("claim", {"status": "claimed", "messages": []}).startswith(
-        render("results", "claim_reading")
-    )
-    assert render_tool_result("peek", {}).endswith(render("results", "no_pending_mail"))
+    assert render_tool_result("peek", {}).endswith(render("results", "no_unread_mail"))
 
 
 def test_saved_handoff_orders_distinct_controls_once_and_omits_checklist():
@@ -276,3 +263,41 @@ def test_physics_and_limits_do_not_duplicate_authority_rules():
         assert phrase in limits
         assert phrase not in physics
     assert "access_denied" not in common_standing()
+
+
+def test_prompts_use_us_english_and_task_worker_prompt_is_resource_backed():
+    import re
+    from pathlib import Path
+
+    from firm_runtime.task_runner import WORKER_INSTRUCTIONS
+
+    assert WORKER_INSTRUCTIONS == prompt("runtime_task.md")
+    uk_pattern = re.compile(
+        r"\b(?:"
+        r"behaviours?|organis(?:e|ed|ing|ations?)|"
+        r"(?:un)?authoris(?:e|ed|ing)|"
+        r"recognis(?:e|ed|ing|able)|"
+        r"labell(?:ed|ing)|"
+        r"honour(?:s|ed|ing)?|"
+        r"labour(?:s|ed|ing)?|"
+        r"artefacts?|"
+        r"defences?|"
+        r"fulfil(?:ment)?|"
+        r"licences?|"
+        r"specialis(?:e|ed|ing)|"
+        r"synthesising|"
+        r"favoured|"
+        r"neighbour(?:ing|s)?|"
+        r"acknowledgements?"
+        r")\b",
+        re.IGNORECASE,
+    )
+    prompts_dir = Path(__file__).parents[1] / "src/firm_runtime/prompts"
+    offenders = {}
+    for path in sorted(prompts_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        matches = uk_pattern.findall(path.read_text(encoding="utf-8"))
+        if matches:
+            offenders[str(path.relative_to(prompts_dir))] = matches
+    assert offenders == {}

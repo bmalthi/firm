@@ -17,6 +17,12 @@ class Traffic:
         self.gateway = ipaddress.IPv4Address(gateway).packed
         self.destinations = {}
         self.allowed_bytes = self.blocked_bytes = self.overflow_bytes = 0
+        # Transport loss is distinct from policy refusals. Count frames rather
+        # than bytes: recvmsg does not report the original size of a truncated one.
+        self.dropped_frames = {
+            direction: {reason: 0 for reason in ("would_block", "enobufs", "truncated")}
+            for direction in ("outbound", "inbound")
+        }
         self.started = time.time()
         self.lock = threading.Lock()
 
@@ -52,6 +58,10 @@ class Traffic:
             record["last_seen"] = now
             record["allowed_bytes" if allowed else "blocked_bytes"] += len(frame)
 
+    def drop(self, direction, reason):
+        with self.lock:
+            self.dropped_frames[direction][reason] += 1
+
     def snapshot(self):
         with self.lock:
             return {
@@ -60,6 +70,9 @@ class Traffic:
                 "allowed_bytes": self.allowed_bytes,
                 "blocked_bytes": self.blocked_bytes,
                 "overflow_bytes": self.overflow_bytes,
+                "dropped_frames": {
+                    direction: dict(counts) for direction, counts in self.dropped_frames.items()
+                },
                 "units": "outbound Ethernet bytes including headers and retransmissions",
                 "destinations": [dict(item) for item in self.destinations.values()],
             }

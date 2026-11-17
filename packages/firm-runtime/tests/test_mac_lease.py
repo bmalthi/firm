@@ -500,7 +500,8 @@ def test_the_owners_grant_answers_every_role_waiting_on_the_mac(environment):
     assert [r["decided_by"] for r in mac_requests(runtime)] == ["owner", "owner"]
     for role in (founder, other):
         (notice,) = mail_to(runtime, role.employee_id)
-        assert notice["subject"] == "Access granted: mac"
+        assert notice["subject"] is None
+        assert notice["body"].startswith("Access granted: mac\n\n")
         assert notice["scheduling_ready_at"] is not None
     assert runtime.tools(founder.token).mac_acquire()["status"] == "granted"
     with pytest.raises(FirmError, match="already granted"):
@@ -530,7 +531,9 @@ def test_a_denial_answers_one_request_and_does_not_stand(environment):
     assert result["status"] == "denied" and result["answered"] == [first["request_id"]]
     assert [r["status"] for r in mac_requests(runtime)] == ["denied", "pending"]
     (declined,) = mail_to(runtime, founder.employee_id)
-    assert declined["subject"] == "Access declined: mac" and "Not today." in declined["body"]
+    assert declined["subject"] is None
+    assert declined["body"].startswith("Access declined: mac\n\n")
+    assert "Not today." in declined["body"]
     assert mail_to(runtime, other.employee_id) == []
     # The Mac's state changes, so the next refusal asks afresh, for any role.
     again = runtime.tools(founder.token).mac_acquire()
@@ -681,7 +684,8 @@ def test_failed_release_of_an_ended_activation_awaits_owner_recovery(one_mac):
     assert [r["status"] for r in mac_requests(runtime)] == ["granted"]
     assert [r["decided_by"] for r in mac_requests(runtime)] == ["runtime"]
     (notice,) = mail_to(runtime, founder.employee_id)
-    assert notice["subject"] == "Access granted: mac"
+    assert notice["subject"] is None
+    assert notice["body"].startswith("Access granted: mac\n\n")
     assert events(runtime)[-1] == ("recovered", analyst.employee_id, analyst.activation_id,
                                    row["lease_id"], 1)
     runtime.mac.drain()

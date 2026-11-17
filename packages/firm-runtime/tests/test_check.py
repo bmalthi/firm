@@ -155,10 +155,9 @@ def test_resource_check_uses_configured_vm_memory_and_disk(tmp_path, monkeypatch
 
 
 def test_database_initialization_state_distinguishes_safe_partial_and_live_data(tmp_path):
-    from firm_runtime.compatibility import initialize_firm
+
     from firm_runtime.setup_check import database_initialization_state
 
-    initialize_firm(tmp_path)
     database_path = tmp_path / "durable" / "firm.sqlite3"
     assert database_initialization_state(database_path) == "missing"
     Runtime(Store(database_path))
@@ -312,9 +311,8 @@ def test_check_initialized_firm_uses_saved_config_without_mutating_database_or_c
     (directory / "mandate.md").write_text(mandate)
     (directory / "sandbox.toml").write_text('[firm]\nid = "demo"\n')
     (directory / "durable").mkdir()
-    from firm_runtime.compatibility import initialize_firm
 
-    initialize_firm(directory)
+
     Runtime(Store(directory / "durable" / "firm.sqlite3")).lifecycle.initialize(
         "demo", mandate, validate_config(tomllib.loads(config_text))
     )
@@ -385,9 +383,8 @@ def test_check_and_accounts_warn_about_a_long_lived_claude_setup_token(
     assert ("firm save-credentials personal --provider claude" in check.get("action", "")) is warned
 
     (directory / "durable").mkdir()
-    from firm_runtime.compatibility import initialize_firm
 
-    initialize_firm(directory)
+
     Runtime(Store(directory / "durable" / "firm.sqlite3")).lifecycle.initialize(
         "demo", "Build.", validate_config(tomllib.loads((directory / "firm.toml").read_text()))
     )
@@ -399,13 +396,12 @@ def test_check_and_accounts_warn_about_a_long_lived_claude_setup_token(
 
 
 def test_check_reads_current_saved_configuration_from_wal(tmp_path, monkeypatch, capsys):
-    from firm_runtime.compatibility import initialize_firm
+
 
     directory = tmp_path / "demo"
     _write_controlled_files(directory)
     database = directory / "durable" / "firm.sqlite3"
     database.parent.mkdir()
-    initialize_firm(directory)
     initial = validate_config(tomllib.loads((directory / "firm.toml").read_text()))
     Runtime(Store(database)).lifecycle.initialize(
         "demo", (directory / "mandate.md").read_text(), initial

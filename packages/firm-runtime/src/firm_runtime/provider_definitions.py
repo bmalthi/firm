@@ -77,6 +77,15 @@ PROVIDER_DEFINITIONS: Mapping[str, ProviderDefinition] = MappingProxyType({
 PROVIDER_NAMES = tuple(PROVIDER_DEFINITIONS)
 
 
+def effective_model(provider: str | None, model: str | None, effort: str | None) -> str | None:
+    """The model a run really uses, and so whose allowance it draws on.
+
+    Effort normally leaves the model alone. AGY's xhigh is the exception: it always
+    selects Argon, whatever model the profile names.
+    """
+    return "gemini-4-argon" if provider == "agy" and effort == "xhigh" else model
+
+
 def incompatible_service(provider: str | None, config: Mapping[str, object]) -> str | None:
     """Return a configured service forbidden by the provider's declared policy."""
     definition = PROVIDER_DEFINITIONS.get(provider)

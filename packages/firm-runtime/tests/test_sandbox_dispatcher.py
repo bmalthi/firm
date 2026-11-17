@@ -11,7 +11,11 @@ from firm_sandbox import Layout, Organization, Run, RunSpec
 from runtime_test_support import FakeProvider, FakeSandbox
 
 from firm_runtime.errors import FirmError
-from firm_runtime.provider_contract import ProviderUsage, SubscriptionObservation
+from firm_runtime.provider_contract import (
+    ProviderSetupError,
+    ProviderUsage,
+    SubscriptionObservation,
+)
 from firm_runtime.runtime import Runtime
 from firm_runtime.sandbox_dispatcher import SandboxDispatcher
 from firm_runtime.store import OWNER, Store
@@ -49,6 +53,56 @@ def launch(dispatcher, runtime):
     runtime.begin_execution(invocation.token)
     dispatcher.tick()
     return invocation
+
+
+def test_agy_missing_catalog_consumes_bounded_attempts_and_names_mcp_hold(system):
+    runtime, box, provider = system
+    provider.name = "agy"
+    now = [runtime.store.clock()]
+    runtime.store.clock = lambda: now[0]
+    with host(system) as dispatcher:
+        dispatcher.start()
+        for attempt in range(1, 5):
+            invocation = launch(dispatcher, runtime)
+            box.complete(sandbox_run_id(invocation.activation_id))
+            assert dispatcher.tick() == []
+            with runtime.store.read() as db:
+                result = runtime._activation(db, invocation.activation_id)
+                role = runtime.store.role(db, invocation.employee_id)
+            assert result["state"] == "failed"
+            assert result["failure_category"] == "transient"
+            assert result["failure"] == "provider: mcp_connection_unavailable"
+            assert role["attempt_count"] == attempt
+            if attempt < 4:
+                assert role["retry_at"] > now[0]
+                now[0] = role["retry_at"]
+        assert role["hold_reason"] == "attempts_exhausted"
+        with runtime.store.read() as db:
+            notices = db.execute(
+                "SELECT body FROM messages "
+                "WHERE body LIKE 'Employee work requires manager action\n\n%'"
+            ).fetchall()
+        assert len(notices) == 1 and "Firm MCP connection" in notices[0][0]
+
+
+def test_agy_resume_requires_this_activations_catalog_receipt(system):
+    runtime, box, provider = system
+    provider.name = "agy"
+    with host(system) as dispatcher:
+        dispatcher.start()
+        first = launch(dispatcher, runtime)
+        runtime.record_mcp_catalog(first.token)
+        box.complete(sandbox_run_id(first.activation_id))
+        assert dispatcher.tick() == []
+        with runtime.store.read() as db:
+            assert runtime._activation(db, first.activation_id)["state"] == "completed"
+        runtime.owner.send_mail(OWNER, [first.employee_id], "Continue", request_id="resume-catalog")
+        second = launch(dispatcher, runtime)
+        assert second.session_id == first.session_id
+        box.complete(sandbox_run_id(second.activation_id))
+        assert dispatcher.tick() == []
+        with runtime.store.read() as db:
+            assert runtime._activation(db, second.activation_id)["state"] == "failed"
 
 
 def test_opening_creates_the_firm_lock_directory_the_sandbox_can_lock(system):
@@ -374,7 +428,7 @@ def test_launch_handoff_shutdown_and_real_session_resume(system):
         run_id = next(iter(box.invocations))
         box.complete(run_id)
         dispatcher.tick()
-        runtime.messaging.send(OWNER, ["founder"], "New work", request_id="mail")
+        runtime.owner.send_mail(OWNER, ["founder"], "New work", request_id="mail")
         second = launch(dispatcher, runtime)
         assert provider.resumed == [None, "native-session"]
         assert second.session_id == first.session_id
@@ -952,7 +1006,7 @@ def test_a_run_that_completes_between_the_refresh_and_the_stop_is_not_a_timeout(
         dispatcher.tick()
 
 
-@pytest.mark.parametrize("activity", ["output", "peek", "context"])
+@pytest.mark.parametrize("activity", ["output", "peek", "read"])
 def test_role_activity_allows_work_beyond_total_timeout(system, monkeypatch, activity):
     runtime, box, provider = system
     if activity == "output":
@@ -964,7 +1018,7 @@ def test_role_activity_allows_work_beyond_total_timeout(system, monkeypatch, act
         )
     now = [runtime.store.clock()]
     runtime.store.clock = lambda: now[0]
-    monkeypatch.setattr(runtime.messaging, "context", lambda *args, **kwargs: {})
+    monkeypatch.setattr(runtime.messaging, "read", lambda *args, **kwargs: {})
     with host(system) as dispatcher:
         dispatcher.start()
         invocation = launch(dispatcher, runtime)
@@ -976,7 +1030,7 @@ def test_role_activity_allows_work_beyond_total_timeout(system, monkeypatch, act
             elif activity == "peek":
                 runtime.tools(invocation.token).peek()
             else:
-                runtime.tools(invocation.token).context("c1")
+                runtime.tools(invocation.token).read("m1", summarize=True)
             dispatcher.tick()
             assert not box.stops
         # Over 113 minutes of work, then 30 minutes of silence.
@@ -1034,7 +1088,7 @@ def test_polling_incoming_mail_and_invalid_tokens_do_not_refresh_activity(system
             now[0] += 600
             runtime.status()
             runtime.authenticate(invocation.token)  # Authorization inspection is not a tool call.
-            runtime.messaging.send(OWNER, ["founder"], "Update", request_id=f"mail-{step}")
+            runtime.owner.send_mail(OWNER, ["founder"], "Update", request_id=f"mail-{step}")
             with pytest.raises(FirmError, match="invalid"):
                 runtime.tools("invalid-token").peek()
             dispatcher.tick()
@@ -1238,6 +1292,113 @@ def test_provider_setup_failure_closes_admission_without_spending_attempt(system
         assert dispatcher.tick() == []
         assert runtime.status()["state"] == "stopped"
         assert not box.live
+
+
+def with_account(runtime):
+    with runtime.store.transaction() as db:
+        config = runtime.accounts.config(db)
+        config["accounts"] = {
+            "main": {"provider": "codex", "max_active": 1, "auth_file": "/missing/main"}
+        }
+        config["profiles"]["codex"] = {
+            "provider": "codex", "model": "test", "effort": "low", "accounts": ["main"],
+        }
+        db.execute("UPDATE firm SET config_json=?", (json.dumps(config),))
+
+
+def auth_failure(code):
+    error = SimpleNamespace(kind="result_error", category="auth", code=code)
+    return lambda *_: SimpleNamespace(provider_session_id="native-1", success=False, error=error)
+
+
+def activations(runtime):
+    with runtime.store.read() as db:
+        return [dict(r) for r in db.execute("SELECT * FROM activations ORDER BY rowid")]
+
+
+def finish_run(dispatcher, box):
+    box.complete(next(reversed(box.invocations)))
+    assert dispatcher.tick() == []
+
+
+def test_setup_auth_error_opens_an_account_incident_with_its_code_and_keeps_attempts(system):
+    runtime, box, provider = system
+    with_account(runtime)
+
+    def refuse(*args, **kwargs):
+        raise ProviderSetupError(
+            category="auth", code="credential_refresh_rejected", message="refresh was rejected"
+        )
+
+    provider.build_spec = refuse
+    with host(system) as dispatcher:
+        dispatcher.start()
+        assert dispatcher.tick() == []
+        (incident,) = runtime.accounts.status()["incidents"]
+        assert (incident["scope"], incident["dependency"]) == ("account", "main")
+        assert incident["code"] == "credential_refresh_rejected"
+        assert incident["repair"] == "sign_in"
+        (activation,) = activations(runtime)
+        assert activation["failure"] == "setup: credential_refresh_rejected"
+        with runtime.store.read() as db:
+            assert runtime.store.role(db, "founder")["attempt_count"] == 0
+        assert dispatcher.tick() == [] and len(activations(runtime)) == 1
+
+
+def test_cleared_auth_incident_lets_the_same_session_and_account_finish_the_work(system):
+    runtime, box, provider = system
+    with_account(runtime)
+    provider.parse_result = auth_failure("invalid_api_key")
+    with host(system) as dispatcher:
+        dispatcher.start()
+        first = launch(dispatcher, runtime)
+        finish_run(dispatcher, box)
+        (incident,) = runtime.accounts.status()["incidents"]
+        assert incident["code"] == "invalid_api_key" and incident["dependency"] == "main"
+        with runtime.store.read() as db:
+            assert runtime.store.role(db, "founder")["attempt_count"] == 0
+            account = runtime.accounts.binding(db, first.session_id)["account_id"]
+        for _ in range(2):
+            assert dispatcher.tick() == [] and len(activations(runtime)) == 1
+        runtime.accounts.clear(OWNER, incident["incident_id"])
+        provider.parse_result = lambda *_: SimpleNamespace(
+            provider_session_id=None, success=True, error=None
+        )
+        second = launch(dispatcher, runtime)
+        assert second.session_id == first.session_id and provider.resumed[-1] == "native-1"
+        with runtime.store.read() as db:
+            assert runtime.accounts.binding(db, second.session_id)["account_id"] == account
+        finish_run(dispatcher, box)
+        states = [a["state"] for a in activations(runtime)]
+        assert states[-1] == "completed"
+        with runtime.store.read() as db:
+            assert runtime.store.role(db, "founder")["attempt_count"] == 0
+            rows = db.execute("SELECT resolved_by FROM execution_incidents").fetchall()
+        assert [r["resolved_by"] for r in rows] == ["owner"]
+
+
+def test_a_still_broken_account_pauses_again_with_a_new_incident(system):
+    runtime, box, provider = system
+    with_account(runtime)
+    provider.parse_result = auth_failure("invalid_api_key")
+    with host(system) as dispatcher:
+        dispatcher.start()
+        launch(dispatcher, runtime)
+        finish_run(dispatcher, box)
+        (first,) = runtime.accounts.status()["incidents"]
+        runtime.accounts.clear(OWNER, first["incident_id"])
+        provider.parse_result = auth_failure("oauth_org_not_allowed")
+        launch(dispatcher, runtime)
+        finish_run(dispatcher, box)
+        (second,) = runtime.accounts.status()["incidents"]
+        assert second["incident_id"] != first["incident_id"]
+        assert second["code"] == "oauth_org_not_allowed" and second["repair"] == "organization"
+        count = len(activations(runtime))
+        for _ in range(2):
+            assert dispatcher.tick() == []
+        assert len(activations(runtime)) == count == 2
+        with runtime.store.read() as db:
+            assert runtime.store.role(db, "founder")["attempt_count"] == 0
 
 
 def test_setup_failure_names_firm_errors_and_only_the_kind_of_others(system):
@@ -2069,6 +2230,80 @@ def test_provider_yield_uses_retained_interruption_path(system):
             assert runtime.store.role(db, "founder")["attempt_count"] <= 1
 
 
+def test_agy_model_quota_refusal_pauses_the_profile_until_the_stated_reset(system, monkeypatch):
+    from test_agy_provider import encode, quota_stream
+
+    from firm_runtime.agy_provider import parse_result
+
+    runtime, box, provider = system
+    with_account(runtime)
+    clock = [runtime.store.clock()]
+    monkeypatch.setattr(runtime.store, "clock", lambda: clock[0])
+    logs = encode(quota_stream())
+    provider.parse_result = lambda *_: parse_result(logs, 0)
+    started = clock[0]
+    with host(system) as dispatcher:
+        dispatcher.start()
+        launch(dispatcher, runtime)
+        finish_run(dispatcher, box)
+        (incident,) = runtime.accounts.status()["incidents"]
+        assert (incident["scope"], incident["dependency"], incident["kind"]) == (
+            "profile",
+            "codex",
+            "quota",
+        )
+        assert incident["code"] == "model_quota_reached"
+        assert incident["until_at"] == started + 381717
+        with runtime.store.read() as db:
+            role = runtime.store.role(db, "founder")
+        assert role["hold_reason"] is None and role["attempt_count"] == 0
+        count = len(activations(runtime))
+        clock[0] = started + 381716
+        for _ in range(2):
+            assert dispatcher.tick() == []
+        assert len(activations(runtime)) == count
+        assert len(runtime.accounts.status()["incidents"]) == 1
+        clock[0] = started + 381717
+        provider.parse_result = lambda *_: SimpleNamespace(
+            provider_session_id=None, success=True, error=None
+        )
+        launch(dispatcher, runtime)
+        assert len(activations(runtime)) == count + 1
+        assert runtime.accounts.status()["incidents"] == []
+
+
+def test_agy_model_quota_refused_again_after_its_reset_pauses_again_at_no_cost(
+    system, monkeypatch
+):
+    from test_agy_provider import QUOTA_SENTENCE, encode, quota_stream
+
+    from firm_runtime.agy_provider import parse_result
+
+    runtime, box, provider = system
+    with_account(runtime)
+    clock = [runtime.store.clock()]
+    monkeypatch.setattr(runtime.store, "clock", lambda: clock[0])
+    logs = encode(quota_stream(QUOTA_SENTENCE.format(wait="5m0s")))
+    provider.parse_result = lambda *_: parse_result(logs, 0)
+    seen = []
+    with host(system) as dispatcher:
+        dispatcher.start()
+        for _ in range(3):
+            # A reset permits one more attempt, not a guaranteed allowance: each refusal
+            # is a new timed pause until the reset it states, and costs the role nothing.
+            launch(dispatcher, runtime)
+            finish_run(dispatcher, box)
+            (incident,) = runtime.accounts.status()["incidents"]
+            assert (incident["scope"], incident["kind"]) == ("profile", "quota")
+            assert incident["until_at"] == clock[0] + 300
+            seen.append(incident["incident_id"])
+            with runtime.store.read() as db:
+                role = runtime.store.role(db, "founder")
+            assert role["hold_reason"] is None and role["attempt_count"] == 0
+            clock[0] = incident["until_at"]
+    assert len(set(seen)) == 3
+
+
 def test_expiry_poisoned_agy_resume_uses_existing_bounded_role_retry(system, monkeypatch):
     from test_agy_provider import FIXTURES, encode
 
@@ -2127,7 +2362,7 @@ def test_completed_handoff_cleanup_is_consumed_by_next_started_period(system, cl
         runtime.begin_execution(next_period.token)
         box.complete(sandbox_run_id(next_period.activation_id))
         assert dispatcher.tick() == []
-        runtime.messaging.send(OWNER, ["founder"], "More work", request_id="wake-again")
+        runtime.owner.send_mail(OWNER, ["founder"], "More work", request_id="wake-again")
         (following,) = dispatcher.tick()
         assert launched_spec(dispatcher, box, following).clean_up is False
 
@@ -2301,7 +2536,7 @@ def test_waiting_handoff_is_cleaned_once_without_another_period(
         assert "reclaim" in caplog.text
         dispatcher.tick()
         assert box.disposals == ["r-founder"]
-        runtime.messaging.send(OWNER, ["founder"], "New work", request_id="wake")
+        runtime.owner.send_mail(OWNER, ["founder"], "New work", request_id="wake")
         (next_period,) = dispatcher.tick()
         assert launched_spec(dispatcher, box, next_period).clean_up is False
 
@@ -2331,7 +2566,7 @@ def test_handoff_disposal_exception_backs_off_but_next_start_still_cleans(system
         dispatcher.tick()
         assert attempts == ["r-founder", "r-founder"]
         assert actor.activation_id not in dispatcher._cleaned
-        runtime.messaging.send(OWNER, ["founder"], "New work", request_id="wake")
+        runtime.owner.send_mail(OWNER, ["founder"], "New work", request_id="wake")
         (next_period,) = dispatcher.tick()
         assert launched_spec(dispatcher, box, next_period).clean_up is True
         assert len(attempts) == 2
@@ -2457,7 +2692,7 @@ def test_expiry_disposal_requires_latest_finished_periods_own_result(
 ):
     runtime, box, _ = system
     # These tests classify the result; account incident handling is covered separately.
-    monkeypatch.setattr(runtime.accounts, "record_failure", lambda *_: {})
+    monkeypatch.setattr(runtime.accounts, "record_failure", lambda *_, **__: {})
     with host(system) as dispatcher:
         dispatcher.start()
         founder = launch(dispatcher, runtime)
@@ -2467,7 +2702,7 @@ def test_expiry_disposal_requires_latest_finished_periods_own_result(
         box.complete(sandbox_run_id(first.activation_id))
         assert dispatcher.tick() == []
         assert box.disposals == []
-        tools.send([first.employee_id], "Next period", "wake")
+        tools.send([first.employee_id], [], "Next period")
         final = launch(dispatcher, runtime)
         runtime.finish(final.activation_id, outcome, category=category)
         with runtime.store.transaction() as db:

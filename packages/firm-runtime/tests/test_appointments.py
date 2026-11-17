@@ -40,7 +40,7 @@ def test_last_period_finishes_and_renewal_retains_identity_mail_and_context(syst
     assert hired["access_on_activation"]["shared"] == layout.shared
     runtime.begin_execution(analyst.token)  # duplicate handshake cannot spend twice
     runtime.finish(analyst.activation_id)
-    tools.send([analyst.employee_id], "More work waiting for renewal", "more")
+    tools.send([analyst.employee_id], [], "More work waiting for renewal")
     assert runtime.admit() is None
     with runtime.store.read() as db:
         assert runtime.appointments.terms(db, analyst.employee_id)["used_periods"] == 1

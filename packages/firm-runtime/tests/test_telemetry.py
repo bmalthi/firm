@@ -82,7 +82,7 @@ def test_historical_usage_backfills_finished_activation_without_touching_resumed
     first = start(runtime)
     runtime.record_usage(first.activation_id, usage(100, inputs=10))
     runtime.finish(first.activation_id)
-    runtime.messaging.send(OWNER, ["founder"], "More work", request_id="more")
+    runtime.owner.send_mail(OWNER, ["founder"], "More work", request_id="more")
     now[0] = 2000.0
     second = start(runtime)
     assert second.session_id == first.session_id
@@ -119,8 +119,8 @@ def test_historical_usage_backfills_finished_activation_without_touching_resumed
 
 def test_role_guidance_and_claim_gate_use_current_context_and_packaged_checklist(tmp_path):
     runtime = make_runtime(tmp_path)
-    message = runtime.messaging.send(
-        OWNER, ["founder"], "A new assignment body", request_id="assignment"
+    message = runtime.owner.send_mail(
+        OWNER, ["founder"], "A new assignment body", request_id="assignment",
     )
     invocation = start(runtime)
 
@@ -131,7 +131,7 @@ def test_role_guidance_and_claim_gate_use_current_context_and_packaged_checklist
     assert advisory["change_since_previous_guidance"] is None
 
     assert runtime.record_usage(invocation.activation_id, usage(9_100, inputs=200))
-    blocked = runtime.tools(invocation.token).claim("claim", [message["message_id"]])
+    blocked = runtime.tools(invocation.token).read(message["message_id"])
     assert blocked["status"] == "blocked"
     assert blocked["reason"] == "context_handoff_required"
     pressure = blocked["context_pressure"]
@@ -151,7 +151,7 @@ def test_role_guidance_and_claim_gate_use_current_context_and_packaged_checklist
     runtime.record_usage(
         invocation.activation_id, usage(2_000, high=9_100, compactions=1, inputs=250)
     )
-    claimed = runtime.tools(invocation.token).claim("after-compact", [message["message_id"]])
+    claimed = runtime.tools(invocation.token).read(message["message_id"])
     assert claimed["messages"][0]["body"] == "A new assignment body"
     assert claimed["context_pressure"]["level"] == "normal"
     diagnostics = runtime.usage_diagnostics()
@@ -159,28 +159,26 @@ def test_role_guidance_and_claim_gate_use_current_context_and_packaged_checklist
     assert diagnostics["sessions"][0]["native_compactions"] == 1
 
 
-def test_reply_claims_only_target_with_activation_even_at_handoff_pressure(tmp_path):
+def test_reply_leaves_unread_mail_even_at_handoff_pressure(tmp_path):
     runtime = make_runtime(tmp_path)
-    target = runtime.messaging.send(OWNER, ["founder"], "Investigate", request_id="target")
+    target = runtime.owner.send_mail(OWNER, ["founder"], "Investigate", request_id="target")
     invocation = start(runtime)
     tools = runtime.tools(invocation.token)
-    tools.messages([target["message_id"]])
-    late = runtime.messaging.send(OWNER, ["founder"], "New requirement", request_id="late")
+    late = runtime.owner.send_mail(OWNER, ["founder"], "New requirement", request_id="late")
     runtime.record_usage(invocation.activation_id, usage(9_100))
-    assert tools.claim("blocked", [target["message_id"]])["status"] == "blocked"
-    assert tools.reply(target["message_id"], "Investigation continues after handoff.",
-                       "reply")["status"] == "sent"
+    assert tools.read(target["message_id"])["status"] == "blocked"
+    assert tools.reply(
+        target["message_id"], [], "Investigation continues after handoff.",
+    )["status"] == "sent"
     with runtime.store.read() as db:
         row = db.execute(
-            "SELECT disposition,claimed_activation_id,claim_sequence FROM message_deliveries "
+            "SELECT disposition,read_activation_id,read_sequence FROM message_deliveries "
             "WHERE message_id=? AND employee_id='founder'", (target["message_id"],),
         ).fetchone()
-        assert row["disposition"] == "claimed"
-        assert row["claimed_activation_id"] == invocation.activation_id
-        assert row["claim_sequence"] is not None
-        assert runtime.messaging.recent_claims(db, "founder", invocation.session_id)[0][
-            "message_id"
-        ] == target["message_id"]
+        assert row["disposition"] == "pending"
+        assert row["read_activation_id"] is None
+        assert row["read_sequence"] is None
+        assert runtime.messaging.recent_reads(db, "founder", invocation.session_id) == []
         assert db.execute(
             "SELECT disposition FROM message_deliveries WHERE message_id=?", (late["message_id"],),
         ).fetchone()[0] == "pending"
@@ -312,7 +310,7 @@ def test_codex_compaction_invalidates_persisted_occupancy_until_remeasured(tmp_p
 
     runtime = make_runtime(tmp_path)
     actor = start(runtime)
-    sent = runtime.messaging.send(OWNER, [actor.employee_id], "Work", request_id="work")
+    sent = runtime.owner.send_mail(OWNER, [actor.employee_id], "Work", request_id="work")
     info = {
         "last_token_usage": {"total_tokens": 9500},
         "total_token_usage": {"input_tokens": 12000},
@@ -335,7 +333,7 @@ def test_codex_compaction_invalidates_persisted_occupancy_until_remeasured(tmp_p
 
     record()
     tools = runtime.tools(actor.token)
-    assert tools.claim("blocked", [sent["message_id"]])["status"] == "blocked"
+    assert tools.read(sent["message_id"])["status"] == "blocked"
     events.append(
         {"type": "firm.telemetry", "provider": "codex", "native_compaction": True}
         if projected
@@ -349,7 +347,7 @@ def test_codex_compaction_invalidates_persisted_occupancy_until_remeasured(tmp_p
     assert observed.native_compactions == 1
     assert "context_pressure" not in tools.peek()
     assert tools.peek()["context"]["self"]["context"]["state"] == "unknown"
-    assert tools.claim("after-compaction", [sent["message_id"]])["messages"]
+    assert tools.read(sent["message_id"])["messages"]
     with runtime.store.read() as db:
         assert (
             db.execute("SELECT current_context_tokens FROM context_sessions").fetchone()[0] is None

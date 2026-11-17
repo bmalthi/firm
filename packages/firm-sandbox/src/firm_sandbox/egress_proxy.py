@@ -65,6 +65,8 @@ PORTS = {"https": 443, "http": 80}
 HEAD_LIMIT = 64 * 1024
 HEAD_TIMEOUT = 30
 CONNECT_TIMEOUT = 15
+CONNECT_STAGGER = 0.25
+CONNECT_PARALLEL = 4
 # A relay with no bytes either way for this long is closed (record reason ``idle``).
 IDLE_TIMEOUT = 300
 # How often the proxy re-checks hosts.json without a request to prompt it.
@@ -115,6 +117,78 @@ async def resolve(host: str, port: int) -> list[str]:
         host, port, family=socket.AF_INET, type=socket.SOCK_STREAM
     )
     return list(dict.fromkeys(row[4][0] for row in rows))
+
+
+async def connect_public(addresses, port, opener):
+    """Race only already-approved addresses, within one deadline and socket bound.
+
+    No request bytes are sent here. A slow first address must not hold up a reachable
+    alternative, and every connection except the winner is closed before returning.
+    """
+    loop = asyncio.get_running_loop()
+    addresses = tuple(dict.fromkeys(addresses))
+    batches = max(1, -(-len(addresses) // CONNECT_PARALLEL))
+    attempt_timeout = CONNECT_TIMEOUT / batches
+    stagger = min(CONNECT_STAGGER, attempt_timeout / CONNECT_PARALLEL)
+    remaining = iter(addresses)
+    address = next(remaining, None)
+    pending, attempts, connections = set(), [], []
+    finishing = False
+    winner = None
+    next_start = loop.time()
+
+    async def open_address(address):
+        connection = await opener(address, port)
+        if finishing:
+            connection[1].close()
+        else:
+            connections.append(connection)
+        return connection
+
+    async def attempt(address):
+        return await asyncio.wait_for(open_address(address), attempt_timeout)
+
+    try:
+        try:
+            async with asyncio.timeout(CONNECT_TIMEOUT):
+                while address is not None or pending:
+                    if (address is not None and len(pending) < CONNECT_PARALLEL
+                            and (not pending or loop.time() >= next_start)):
+                        task = asyncio.create_task(attempt(address))
+                        pending.add(task)
+                        attempts.append(task)
+                        address = next(remaining, None)
+                        next_start = loop.time() + stagger
+                    delay = (max(0, next_start - loop.time())
+                             if address is not None and len(pending) < CONNECT_PARALLEL
+                             else None)
+                    done, pending = await asyncio.wait(
+                        pending, timeout=delay, return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in done:
+                        try:
+                            winner = task.result()
+                        except OSError:
+                            continue
+                        break
+                    if winner is not None:
+                        break
+                if winner is None:
+                    raise OSError("No reachable public address")
+        finally:
+            finishing = True
+            for task in attempts:
+                if not task.done():
+                    task.cancel()
+            for connection in connections:
+                if connection is not winner:
+                    connection[1].close()
+            await asyncio.gather(*attempts, return_exceptions=True)
+    except BaseException:
+        if winner is not None:
+            winner[1].close()
+        raise
+    return winner
 
 
 def literal(host: str) -> bool:
@@ -318,6 +392,8 @@ async def pipe(reader, writer, counts, key, activity) -> bool:
             writer.write_eof()
         return True
     except OSError:
+        if counts.get("reason") is None:
+            counts["reason"] = "relay_error"
         return False
 
 
@@ -655,32 +731,34 @@ class EgressProxy:
                 writer, record, 403, "not_allowed", f"Host not allowed by the firm: {host}"
             )
         record["allowed"] = True
-        try:
-            addresses = await asyncio.wait_for(self.resolver(host, port), CONNECT_TIMEOUT)
-        except (OSError, TimeoutError):
-            return await self._deny(writer, record, 502, "unresolved", f"Cannot resolve {host}")
-        public = [address for address in addresses if self.acceptable(address)]
-        if not public:
-            record["allowed"] = False
-            return await self._deny(
-                writer, record, 403, "private_address",
-                f"{host} resolves only to private or host addresses",
-            )
-        for address in public:
-            try:
-                upstream_reader, upstream_writer = await asyncio.wait_for(
-                    self.opener(address, port), CONNECT_TIMEOUT
-                )
-                break
-            except (OSError, TimeoutError):
-                continue
-        else:
-            return await self._deny(writer, record, 502, "unreachable", f"Cannot reach {host}")
-        # Registered before anything is answered: a revocation reaches a tunnel even while
-        # it waits for its ClientHello.
+        # Revocation also reaches DNS and connection attempts, before any bytes go out.
         task, counted, logged = asyncio.current_task(), False, False
+        upstream_writer = None
         self._relays[task] = record
         try:
+            try:
+                addresses = await asyncio.wait_for(self.resolver(host, port), CONNECT_TIMEOUT)
+            except (OSError, TimeoutError):
+                logged = True
+                return await self._deny(writer, record, 502, "unresolved", f"Cannot resolve {host}")
+            public = [address for address in addresses if self.acceptable(address)]
+            if not public:
+                record["allowed"], logged = False, True
+                return await self._deny(
+                    writer, record, 403, "private_address",
+                    f"{host} resolves only to private or host addresses",
+                )
+            try:
+                upstream_reader, upstream_writer = await connect_public(public, port, self.opener)
+            except (OSError, TimeoutError):
+                logged = True
+                return await self._deny(writer, record, 502, "unreachable", f"Cannot reach {host}")
+            self.refresh()
+            if not self.allowed(host):
+                record["allowed"], logged = False, True
+                return await self._deny(
+                    writer, record, 403, "revoked", f"Host grant revoked: {host}",
+                )
             if method == "CONNECT":
                 writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
                 await writer.drain()
@@ -710,18 +788,24 @@ class EgressProxy:
                     reader, writer, upstream_reader, upstream_writer, record,
                     f"{method} {path} {version}", headers, length,
                 )
+        except OSError:
+            # A reset or broken pipe is an interrupted exchange, even when
+            # some bytes already reached the client. Never replay the request.
+            if record["reason"] is None:
+                record["reason"] = "relay_error"
         except asyncio.CancelledError:
             # A revocation or cutoff ends the relay; its record says which. Before any
             # byte was forwarded, it is a refusal.
             if record["reason"] is None:
                 record["reason"] = "closed"
-            if not counted:
+            if not counted and not logged:
                 record["allowed"], counted = False, True
                 self.summary.request(role, host, False, record["listed"])
             raise
         finally:
             self._relays.pop(task, None)
-            upstream_writer.close()
+            if upstream_writer is not None:
+                upstream_writer.close()
             if not logged:
                 if not counted:
                     self.summary.request(role, host, record["allowed"], record["listed"])
@@ -778,6 +862,8 @@ class EgressProxy:
             record["reason"] = "idle"
             return False
         except OSError:
+            if record["reason"] is None:
+                record["reason"] = "relay_error"
             return False
 
     async def _relay(self, reader, writer, upstream_reader, upstream_writer, record):

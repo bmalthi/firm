@@ -24,6 +24,19 @@ credentials or host mounts. This permits software downloads without exposing
 untrusted work to that network. Its generalized disk supplies new firm VMs, which
 boot behind the packet filter and egress proxy before any role runs.
 
+Installing packages in the reusable base keeps each firm's first boot independent
+of long package downloads through the role-traffic proxy. First boot performs local
+configuration; if it fails, Firm copies the guest's cloud-init logs to the host
+before powering the VM off.
+
+### Guest clock
+
+Lima plain mode provides no guest-agent clock synchronization, and the guest cannot
+reach an external time server. Each run launch therefore supplies the host time;
+the guest controller steps its clock when the difference exceeds two seconds. This
+keeps provider credential-expiry calculations aligned after host sleep. It is a
+launch-time correction, not continuous synchronization during an existing run.
+
 ## Roles on the Linux VM
 
 Each hired role is provisioned on the Linux VM in two phases (recording the identity in the guest ledger before creating the user so interrupted provisioning is idempotent):
@@ -96,6 +109,25 @@ Each VM's network interface is spliced through a host-owned userspace packet fil
    * **`"observe"` (Default):** Allows all public HTTP/HTTPS hosts while still blocking private/loopback/LAN IP ranges and recording per-role traffic in the proxy log.
    * **`"enforce"` (Stricter opt-in):** Allows `BASELINE_HOSTS` (Anthropic/Claude, OpenAI/ChatGPT, including provider-native **Web Search**, plus GitHub, GHCR, Docker Hub, PyPI, Astral/uv, npm, Node, Ubuntu/Debian apt, Homebrew, and Apple CDNs), `[network] allow_hosts`, and owner-granted domains in `hosts.json` (reloaded live on disk change; revoking a host immediately closes open tunnels).
 4. **Live Egress Cutoff (`firm network DIR off`):** Closes the proxy exception across all VMs while keeping the host's management SSH channels open so the owner can still inspect or shut down the firm.
+
+The traffic snapshot includes `dropped_frames.outbound` (guest to usernet) and
+`dropped_frames.inbound` (usernet to guest), each with `would_block`, `enobufs` and
+`truncated` frame counts since the network process started. These transport losses
+are separate from policy-blocked bytes. Allowed bytes describe policy decisions,
+not successful delivery. Truncated-frame byte lengths are unknown, so drops are
+counted as frames. Compare counter deltas alongside guest TCP retransmissions and
+paired host/guest workloads before attributing slow downloads to the filter;
+these counters do not detect losses elsewhere in usernet or the host network.
+Proxy request records use `relay_error` when a socket read or write fails during
+an exchange, including resets after a partial response. The proxy closes the
+exchange and does not replay requests; clients decide whether their operation is
+safe to retry. A policy revocation or cutoff reason takes precedence.
+After DNS resolution, connection attempts to validated public addresses share a
+15-second deadline. Alternatives start at most 250 milliseconds apart, with at
+most four pending sockets per request. Larger address lists divide the attempt
+timeout across batches so slow candidates do not exclude later addresses.
+Only the winning connection receives request bytes;
+the other attempts are canceled and any connections they opened are closed.
 
 ---
 

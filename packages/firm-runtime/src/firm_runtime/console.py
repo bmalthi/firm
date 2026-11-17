@@ -27,7 +27,7 @@ from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
 
 from . import guidance
-from .accounts import credentials_path, incident_resolution
+from .accounts import credentials_path, incident_recovery, incident_resolution
 from .analysis import SECTIONS, AnalysisNotFound, AnalysisQueryError, AnalysisReader
 from .errors import FirmError
 from .levels import level_of
@@ -380,7 +380,7 @@ def build_console_app(
             conditions = []
             parameters: list[Any] = []
             join = ""
-            columns = "m.*"
+            columns = "m.*,c.audience_json"
             if scope == "between_roles":
                 conditions.append(
                     "NOT EXISTS (SELECT 1 FROM message_deliveries owner_delivery "
@@ -404,7 +404,7 @@ def build_console_app(
                 db.execute(
                     "SELECT "
                     + columns
-                    + " FROM messages m"
+                    + " FROM messages m JOIN conversations c USING(conversation_id)"
                     + join
                     + (" WHERE " + " AND ".join(conditions) if conditions else "")
                     + " ORDER BY m.sequence DESC LIMIT ?",
@@ -416,6 +416,7 @@ def build_console_app(
             envelopes = []
             for row in shown:
                 envelope = runtime.messaging.envelope(row)
+                envelope["reply_audience"] = json.loads(row["audience_json"])
                 envelope["regarding"] = regarding_value(db, row, now)
                 if view is not None:
                     envelope["owner_delivery"] = {
@@ -465,7 +466,8 @@ def build_console_app(
     def results_value(limit: int) -> dict:
         with runtime.store.read() as db:
             rows = db.execute(
-                "SELECT m.*,a.value AS attachment FROM messages m "
+                "SELECT m.*,c.audience_json,a.value AS attachment FROM messages m "
+                "JOIN conversations c USING(conversation_id) "
                 "JOIN message_deliveries d USING(message_id) "
                 "JOIN json_each(m.attachments_json) a "
                 "WHERE d.employee_id=? ORDER BY m.sequence DESC,CAST(a.key AS INTEGER) "
@@ -479,6 +481,9 @@ def build_console_app(
                         "message_id": row["message_id"],
                         "conversation_id": row["conversation_id"],
                         "subject": row["subject"],
+                        **({"preview": " ".join(row["body"].split())[:80]}
+                           if row["subject"] is None else {}),
+                        "reply_audience": json.loads(row["audience_json"]),
                         "author": {
                             "employee_id": row["author_id"],
                             "address": row["author_address"],
@@ -518,6 +523,7 @@ def build_console_app(
                             {key: role[key] for key in ("employee_id", "address", "identity")}
                         )
             result = {}
+            configured = runtime.accounts.config(db).get("accounts", {})
             for name, predicate, order, parameters in (
                 (
                     "open",
@@ -536,6 +542,7 @@ def build_console_app(
                     {
                         **dict(row),
                         **incident_resolution(row, now),
+                        **incident_recovery(row, configured),
                         "blocked_roles": blocked.get(row["incident_id"], []),
                     }
                     for row in db.execute(
@@ -602,7 +609,7 @@ def build_console_app(
             return value
         try:
             result = await run(
-                runtime.messaging.dismiss, OWNER, value.get("message_ids"),
+                runtime.messaging.dismiss_exact, OWNER, value.get("message_ids"),
                 request_id=value["operation_id"],
             )
         except FirmError as exc:
@@ -656,12 +663,13 @@ def build_console_app(
             )
         try:
             result = await run(
-                runtime.messaging.send,
+                runtime.owner.send_mail,
                 OWNER,
                 recipients,
                 body,
                 subject=subject,
                 attachments=value.get("attachments"),
+                action_recipients=value.get("action_recipients"),
                 request_id=value["operation_id"],
             )
         except FirmError as exc:
@@ -687,11 +695,12 @@ def build_console_app(
             )
         try:
             result = await run(
-                runtime.messaging.reply,
+                runtime.owner.reply_mail,
                 OWNER,
                 message_id,
                 body,
                 attachments=value.get("attachments"),
+                action_recipients=value.get("action_recipients"),
                 request_id=value["operation_id"],
             )
         except FirmError as exc:
@@ -995,11 +1004,11 @@ def build_console_app(
             if host is None or host["infrastructure_state"] != "stopped":
                 return _error(409, "infrastructure_not_stopped", "VM shutdown is not confirmed.")
             try:
-                from .compatibility import validate_firm
+                from firm_sandbox.firm_paths import validate_firm_directories
 
-                await run(validate_firm, runtime.store.path.parent.parent)
+                await run(validate_firm_directories, runtime.store.path.parent.parent)
             except (FirmError, OSError, ValueError, RuntimeError) as exc:
-                return _error(409, "firm_incompatible", str(exc))
+                return _error(409, "unsafe_firm_directory", str(exc))
             result = await apply(
                 "console_control.resume",
                 payload,

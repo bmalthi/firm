@@ -25,14 +25,10 @@ def candidate(tmp_path, monkeypatch):
         for suffix in ("-py3-none-any.whl", ".tar.gz"):
             (dist / f"firm_{name}-0.1.0{suffix}").write_bytes(name.encode())
     hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in dist.iterdir()}
-    compatibility = root / "packages/firm-sandbox/src/firm_sandbox/compatibility.py"
-    compatibility.parent.mkdir(parents=True)
-    compatibility.write_text("COMPATIBILITY_GENERATION = 1\n")
     receipt = {
         "source_revision": "revision",
         "source_dirty": False,
         "release": "0.1.0",
-        "compatibility_generation": 1,
         "artifact_sha256": hashes,
         "checks": dict.fromkeys(verify_release.REQUIRED_CHECKS, "passed"),
     }
@@ -61,7 +57,6 @@ def test_exact_candidate_verifies(candidate):
         "extra",
         "checks",
         "missing_offline_workflow",
-        "generation",
     ],
 )
 def test_publication_refuses_changed_or_incomplete_candidate(candidate, fault):
@@ -87,8 +82,6 @@ def test_publication_refuses_changed_or_incomplete_candidate(candidate, fault):
         del receipt["checks"]["isolated_install"]
     elif fault == "missing_offline_workflow":
         del receipt["checks"]["offline_workflow"]
-    elif fault == "generation":
-        receipt["compatibility_generation"] = 2
     receipt_path.write_text(json.dumps(receipt))
     with pytest.raises(ValueError):
         verify_release.verify(root, dist, tag)

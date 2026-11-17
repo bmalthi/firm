@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from firm_sandbox import Config, Sandbox
-from firm_sandbox.compatibility import FIRM_RECORD, validate_firm_record
+from firm_sandbox.firm_paths import validate_firm_directories
 from firm_sandbox.locking import locked
 
 from .errors import FirmError
@@ -45,7 +45,7 @@ def write(directory: Path, firm_id: str, *, destination=None, homes=False, boot=
     config = Config.load(directory / "sandbox.toml")
     if config.root != directory.resolve():
         raise FirmError("sandbox configuration belongs to a different firm directory")
-    release_record = validate_firm_record(config.root)
+    validate_firm_directories(config.root)
     destination = Path(destination or directory / EXPORT).absolute()
     if destination.is_symlink() or (
         os.path.lexists(destination) and not (destination / MANIFEST).is_file()
@@ -69,8 +69,6 @@ def write(directory: Path, firm_id: str, *, destination=None, homes=False, boot=
             section["bytes"] += entry.get("bytes", 0)
         manifest = {
             "firm_id": firm_id,
-            "created_with_release": release_record["created_with_release"],
-            "compatibility_generation": release_record["compatibility_generation"],
             "exported_at": datetime.now(UTC).isoformat(),
             "homes": homes,
             "drive_missing": not os.path.lexists(staging / "drive"),
@@ -108,9 +106,6 @@ def verify(directory: Path, *, expected_firm_id: str | None = None) -> dict:
             or type(manifest["homes"]) is not bool
             # Exports from before this field always held the drive.
             or type(manifest.setdefault("drive_missing", False)) is not bool
-            or not isinstance(manifest.get("created_with_release"), str)
-            or type(manifest.get("compatibility_generation")) is not int
-            or manifest["compatibility_generation"] <= 0
         ):
             raise ValueError("invalid manifest fields")
     except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -134,16 +129,6 @@ def verify(directory: Path, *, expected_firm_id: str | None = None) -> dict:
         raise FirmError(f"exported database failed its integrity check: {check}")
     if firm is None or firm[0] != manifest["firm_id"]:
         raise FirmError("exported database does not match the manifest's firm id")
-    try:
-        release_record = json.loads((directory / FIRM_RECORD).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise FirmError("export does not contain a readable firm release record") from exc
-    if (
-        not isinstance(release_record, dict)
-        or release_record.get("created_with_release") != manifest["created_with_release"]
-        or release_record.get("compatibility_generation") != manifest["compatibility_generation"]
-    ):
-        raise FirmError("export release identity does not match its manifest")
     if expected_firm_id is not None and firm[0] != expected_firm_id:
         raise FirmError("export belongs to a different firm")
     return manifest
@@ -151,7 +136,6 @@ def verify(directory: Path, *, expected_firm_id: str | None = None) -> dict:
 
 def _copy_host_records(config: Config, staging: Path) -> None:
     durable = config.durable
-    shutil.copy2(config.root / FIRM_RECORD, staging / FIRM_RECORD)
     # The backup API copies one consistent snapshot, even while the firm runs.
     source = sqlite3.connect((durable / DATABASE).as_uri() + "?mode=ro", uri=True, timeout=10)
     target = sqlite3.connect(staging / DATABASE)

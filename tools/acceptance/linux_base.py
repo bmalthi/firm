@@ -10,7 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from firm_sandbox import Config, Sandbox
-from firm_sandbox.compatibility import initialize_firm_record, release_identifier
 
 
 def boot(root: Path, index: int) -> dict:
@@ -21,7 +20,6 @@ def boot(root: Path, index: int) -> dict:
         f'[firm]\nid = "base-test-{index}"\ncpus = 2\nmemory_gib = 4\ndisk_gib = 60\n'
         '[network]\negress = "enforce"\nallow_hosts = []\n'
     )
-    initialize_firm_record(firm, release_identifier())
     box = Sandbox(Config.load(definition))
     started = time.monotonic()
     result = {"firm": str(firm), "passed": False}

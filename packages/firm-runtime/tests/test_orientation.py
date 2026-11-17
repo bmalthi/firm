@@ -108,11 +108,8 @@ def test_retained_orientation_only_repeats_changed_facts_after_successful_begin(
     runtime.mark_started(birth.activation_id)
     runtime.finish(birth.activation_id)
 
-    runtime.messaging.send(
-        OWNER,
-        [actor["employee_id"]],
-        "Check unchanged orientation",
-        request_id="unchanged",
+    runtime.owner.send_mail(
+        OWNER, [actor["employee_id"]], "Check unchanged orientation", request_id="unchanged",
     )
     unchanged = runtime.admit()
     assert "orientation" not in unchanged.context
@@ -126,11 +123,8 @@ def test_retained_orientation_only_repeats_changed_facts_after_successful_begin(
             ("Delivery Director\nCurrent public profile.", manager["employee_id"]),
         )
         assert db.execute("SELECT COUNT(*) FROM scheduling_opportunities").fetchone()[0] == before
-    runtime.messaging.send(
-        OWNER,
-        [actor["employee_id"]],
-        "Check changed orientation",
-        request_id="changed",
+    runtime.owner.send_mail(
+        OWNER, [actor["employee_id"]], "Check changed orientation", request_id="changed",
     )
     changed_prelaunch = runtime.admit()
     assert changed_prelaunch.context["orientation"]["manager"]["identity"] == "Delivery Director"
@@ -142,11 +136,8 @@ def test_retained_orientation_only_repeats_changed_facts_after_successful_begin(
     runtime.mark_started(retried.activation_id)
     runtime.finish(retried.activation_id)
 
-    runtime.messaging.send(
-        OWNER,
-        [actor["employee_id"]],
-        "Check settled orientation",
-        request_id="unchanged-again",
+    runtime.owner.send_mail(
+        OWNER, [actor["employee_id"]], "Check settled orientation", request_id="unchanged-again",
     )
     after_success = runtime.admit()
     assert "orientation" not in after_success.context

@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS roles (
     guidance_reason TEXT,
     session_guidance TEXT,
     birth_delivered INTEGER NOT NULL DEFAULT 0,
+    last_offered_message_sequence INTEGER NOT NULL DEFAULT 0,
     handoff_notes TEXT,
     recovery_json TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -83,6 +84,7 @@ CREATE TABLE IF NOT EXISTS activations (
     created_at REAL NOT NULL,
     launch_attempted_at REAL,
     started_at REAL,
+    mcp_catalog_listed_at REAL,
     finished_at REAL,
     handoff_notes TEXT,
     next_intent TEXT CHECK(next_intent IN ('continue','wait')),
@@ -90,7 +92,6 @@ CREATE TABLE IF NOT EXISTS activations (
     drain_presented_at REAL,
     handoff_presented_compactions INTEGER,
     mail_presented_sequence INTEGER,
-    inbox_seen_sequence INTEGER,
     failure_category TEXT,
     failure TEXT
 );
@@ -234,14 +235,14 @@ class Store:
     ):
         absolute = Path(path).expanduser().absolute()
         # Firm databases live in durable/. Standalone runtime stores use their
-        # containing directory as the firm root. This read-only guard must run
+        # containing directory as the firm root. Ownership checks run
         # before mkdir, SQLite, WAL, schema, or secret writes below.
         firm_directory = (
             absolute.parent.parent if absolute.parent.name == "durable" else absolute.parent
         )
-        from .compatibility import validate_firm
+        from firm_sandbox.firm_paths import validate_firm_directories
 
-        validate_firm(firm_directory)
+        validate_firm_directories(firm_directory)
         self._require_regular_database_path(absolute)
         self._initialize(absolute, clock)
 
@@ -314,19 +315,8 @@ class Store:
     def scratch(
         cls, path: str | Path, *, clock: Callable[[], float] = time.time
     ) -> "Store":
-        """Open disposable standalone state without a firm release marker.
-
-        Use this for isolated tests and developer examples. Production firm
-        databases must use the checked constructor after explicit initialization.
-        """
+        """Open disposable standalone state for tests and developer examples."""
         absolute = Path(path).expanduser().absolute()
-        firm_directory = (
-            absolute.parent.parent if absolute.parent.name == "durable" else absolute.parent
-        )
-        from firm_sandbox.compatibility import FIRM_RECORD
-
-        if os.path.lexists(firm_directory / FIRM_RECORD):
-            raise ValueError("Store.scratch cannot open a marked firm database")
         cls._require_regular_database_path(absolute)
         store = cls.__new__(cls)
         store._initialize(absolute, clock)

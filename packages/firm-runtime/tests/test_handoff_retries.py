@@ -111,4 +111,4 @@ def test_saved_handoff_peek_reports_pressure_without_requesting_another_save(run
     assert render("controls", "saved") in rendered
     assert render("controls", "handoff_required") not in rendered
     assert "handoff_checklist" not in after["context_pressure"]
-    assert runtime.context.gate_claim(invocation.activation_id) is True
+    assert runtime.context.gate_read(invocation.activation_id) is True

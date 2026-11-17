@@ -28,7 +28,7 @@ Instructions for coding agents (Codex, Claude Code, Cursor, etc.) working in `bm
 
 ## Architectural Invariants
 
-* **Compatibility generation (`firm-release.json`):** `firm-runtime` and `firm-sandbox` share a single version and compatibility generation (`COMPATIBILITY_GENERATION` in `firm_sandbox/compatibility.py`). Do not add database migrations or fallback shims for old firm state; incompatible state is refused before mutation.
+* **Development compatibility:** Breaking changes are allowed until the owner says otherwise. Do not add compatibility gates, generation markers, database migrations, or fallback shims. Use fresh disposable state when development changes require it. Keep the runtime and sandbox package versions aligned.
 * **Inspection via `firm analyze`:** When inspecting a firm directory, use `firm analyze <dir> --section <name> --json` rather than hand-querying `durable/firm.sqlite3`.
 * **Non-interactive CLI usage:** Bare `firm start` (with no directory argument) requires an interactive TTY. When starting or operating a firm from an agent, follow **Path (A): For Coding Agents** in [`docs/installation.md`](docs/installation.md#path-a-for-coding-agents-recommended--non-interactive-cli-setup) (`firm check <dir>`, `firm init <dir>`, `firm start <dir>`).
 * **Public identity:** Use `bmalthi` (`4552227+bmalthi@users.noreply.github.com`) for commits and attribution. Never include personal legal names, emails, or credentials in code, docs, or commits.

@@ -40,7 +40,7 @@ def test_reminder_survives_restart_and_stop_releases_once_as_ordinary_mail(syste
     assert due.employee_id == first.employee_id
     with runtime.store.read() as db:
         mail = db.execute(
-            "SELECT * FROM messages WHERE subject='Scheduled self-reminder'"
+            "SELECT * FROM messages WHERE body LIKE 'Scheduled self-reminder\n\n%'"
         ).fetchall()
         assert len(mail) == 1
         assert "Check the customer response" in mail[0]["body"]
@@ -88,7 +88,7 @@ def test_cancel_is_owned_idempotent_and_does_not_create_work(system):
     with runtime.store.read() as db:
         assert (
             db.execute(
-                "SELECT COUNT(*) FROM messages WHERE subject='Scheduled self-reminder'"
+                "SELECT COUNT(*) FROM messages WHERE body LIKE 'Scheduled self-reminder\n\n%'"
             ).fetchone()[0]
             == 0
         )
@@ -107,7 +107,7 @@ def test_retired_identity_never_delivers_to_replacement(system):
         assert db.execute("SELECT state FROM reminders").fetchone()[0] == "cancelled"
         assert (
             db.execute(
-                "SELECT COUNT(*) FROM messages WHERE subject='Scheduled self-reminder'"
+                "SELECT COUNT(*) FROM messages WHERE body LIKE 'Scheduled self-reminder\n\n%'"
             ).fetchone()[0]
             == 0
         )

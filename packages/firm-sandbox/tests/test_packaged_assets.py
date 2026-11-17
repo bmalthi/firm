@@ -17,3 +17,12 @@ def test_packaged_guest_recipe_contains_vendor_verified_agy_pin():
     assert "export AGY_CLI_DISABLE_AUTO_UPDATE=true" in script
     assert 'install -o root -g root -m 0755 "$agy_stage/antigravity"' in script
     assert resources.files("firm_sandbox").joinpath("assets/linux-generalize.sh").is_file()
+
+
+def test_packaged_guest_recipe_installs_browsers_where_the_controller_links_them():
+    from firm_sandbox import linux_vm_guest
+
+    recipe = resources.files("firm_sandbox").joinpath("assets/linux-base.yaml").read_text()
+    script = yaml.safe_load(recipe)["provision"][0]["script"]
+    assert f"PLAYWRIGHT_BROWSERS_PATH={linux_vm_guest.SHARED_BROWSERS}" in script
+    assert "test -s /opt/firm/playwright-version" in script

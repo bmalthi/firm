@@ -15,6 +15,7 @@ from .commands import VMStateError
 from .egress_proxy import BASELINE_HOSTS
 from .events import Events
 from .file_grants import TREE
+from .firm_paths import validate_firm_directories
 from .guest_control import (
     MAX_FILE,
     ControlConnectionError,
@@ -70,6 +71,7 @@ class Sandbox:
         self.config = config
         self._events = Events(config)
         private_directory(config.root)
+        validate_firm_directories(config.root)
         ensure_runtime_id(config)
         self.linux = LinuxVM(
             VMSettings(
@@ -1189,6 +1191,7 @@ class Sandbox:
             run_id=run_id,
             argv=list(spec.argv),
             clean_up=spec.clean_up,
+            stateless=spec.stateless,
             env=env,
             stdin=base64.b64encode(spec.stdin).decode(),
             organization=spec.organization.address if spec.organization else None,

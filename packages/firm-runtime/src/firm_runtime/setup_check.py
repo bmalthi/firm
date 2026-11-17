@@ -16,7 +16,7 @@ import tomllib
 from pathlib import Path
 
 from firm_sandbox import Config, linux_base
-from firm_sandbox.compatibility import validate_firm_directories
+from firm_sandbox.firm_paths import validate_firm_directories
 from firm_sandbox.host_paths import read_text_file
 
 from .claude_auth import setup_token_warning
@@ -365,7 +365,7 @@ def _check_linux_base(directory: Path) -> dict:
         return _result(
             "linux_base",
             "good",
-            "No Linux base image yet; creating this firm's VM builds one (about 5 minutes).",
+            "No Linux base image yet; creating this firm's VM builds one (about 8 minutes).",
         )
     if age > linux_base.MAX_AGE_DAYS:
         return _result(
@@ -374,7 +374,7 @@ def _check_linux_base(directory: Path) -> dict:
             f"The Linux base image is {age:.0f} days old; this firm's VM will start from it.",
             action=(
                 f"To start from current updates instead, delete {linux_base.cache_directory()} "
-                "before starting the firm; it is rebuilt then (about 5 minutes)."
+                "before starting the firm; it is rebuilt then (about 8 minutes)."
             ),
         )
     return _result("linux_base", "good", f"The Linux base image is {age:.0f} days old.")

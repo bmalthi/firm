@@ -1,5 +1,6 @@
 import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 import httpx
@@ -61,11 +62,11 @@ def _result(result):
 
 def test_streamable_http_keeps_concurrent_roles_separate_and_exposes_no_owner_tools(tmp_path):
     runtime, founder, founder_run, analyst, analyst_run = _runtime(tmp_path)
-    runtime.messaging.send(
-        OWNER, [founder], "founder body", subject="Message only for founder", request_id="f"
+    runtime.owner.send_mail(
+        OWNER, [founder], "founder body", subject="Message only for founder", request_id="f",
     )
-    runtime.messaging.send(
-        OWNER, [analyst], "analyst body", subject="Message only for analyst", request_id="w"
+    runtime.owner.send_mail(
+        OWNER, [analyst], "analyst body", subject="Message only for analyst", request_id="w",
     )
     app = build_http_app(runtime, **ALLOWED)
 
@@ -114,6 +115,71 @@ def test_http_auth_is_checked_again_after_revocation_and_rejects_wrong_token(tmp
             assert revoked.headers["www-authenticate"].startswith("Bearer")
 
     asyncio.run(asyncio.wait_for(check(), timeout=20))
+
+
+def test_catalog_receipt_is_authenticated_durable_and_activation_scoped(tmp_path):
+    from firm_runtime.errors import FirmError
+
+    runtime, _, founder, _, analyst = _runtime(tmp_path)
+    app = build_http_app(runtime, **ALLOWED)
+
+    def receipt(activation_id):
+        with runtime.store.read() as db:
+            return runtime._activation(db, activation_id)["mcp_catalog_listed_at"]
+
+    async def check():
+        async with app.router.lifespan_context(app):
+            async with _session(app, founder.token) as session:
+                assert receipt(founder.activation_id) is None
+                await session.list_tools()
+                observed = receipt(founder.activation_id)
+                assert observed is not None
+                assert receipt(analyst.activation_id) is None
+                await session.list_tools()
+                assert receipt(founder.activation_id) == observed
+
+    asyncio.run(asyncio.wait_for(check(), timeout=20))
+    runtime.finish(founder.activation_id)
+    with pytest.raises(FirmError):
+        runtime.record_mcp_catalog(founder.token)
+    with pytest.raises(FirmError):
+        runtime.record_mcp_catalog("invalid-synthetic-bearer")
+    assert receipt(analyst.activation_id) is None
+
+
+@pytest.mark.parametrize("catalog_first", [True, False])
+def test_catalog_receipt_and_completion_serialize_without_late_success(tmp_path, catalog_first):
+    from firm_runtime.errors import FirmError
+
+    runtime, _, invocation, _, _ = _runtime(tmp_path)
+    entered = threading.Event()
+
+    def catalog():
+        runtime.record_mcp_catalog(invocation.token)
+
+    def finish():
+        runtime.finish(invocation.activation_id, require_mcp_catalog=True)
+
+    first, second = (catalog, finish) if catalog_first else (finish, catalog)
+
+    def competing():
+        entered.set()
+        second()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with runtime.store.transaction():
+            pending = executor.submit(competing)
+            assert entered.wait(2)
+            first()
+        if catalog_first:
+            pending.result(timeout=2)
+        else:
+            with pytest.raises(FirmError):
+                pending.result(timeout=2)
+    with runtime.store.read() as db:
+        result = runtime._activation(db, invocation.activation_id)
+    assert result["state"] == ("completed" if catalog_first else "failed")
+    assert (result["mcp_catalog_listed_at"] is not None) is catalog_first
 
 
 def test_host_origin_validation_and_explicit_allowlists(tmp_path):
@@ -259,6 +325,48 @@ def test_launch_gate_waiting_for_real_writer_keeps_http_loop_responsive(
         release.set()
         thread.join(timeout=2)
         assert not thread.is_alive()
+
+
+def test_credential_endpoint_auth_failure_opens_the_hold_with_its_code(tmp_path, monkeypatch):
+    from starlette.testclient import TestClient
+
+    from firm_runtime.credential_store import CredentialStore
+    from firm_runtime.provider_contract import ProviderSetupError
+
+    runtime = Runtime(Store.scratch(tmp_path / "firm.sqlite3"))
+    runtime.lifecycle.initialize(
+        "test",
+        "Work",
+        {
+            "max_active": 1,
+            "staffing": False,
+            "founder_profile": "p",
+            "profiles": {
+                "p": {"provider": "claude", "model": "opus", "effort": "high", "accounts": ["a"]}
+            },
+            "accounts": {
+                "a": {"provider": "claude", "auth_file": str(tmp_path / "a"), "max_active": 1}
+            },
+        },
+    )
+    runtime.start()
+    invocation = runtime.admit()
+    runtime.mark_started(invocation.activation_id)
+
+    def refuse(store):
+        raise ProviderSetupError(
+            category="auth", code="credential_refresh_rejected", message="safe"
+        )
+
+    monkeypatch.setattr(CredentialStore, "snapshot", refuse)
+    with TestClient(build_http_app(runtime, **ALLOWED), base_url=BASE_URL) as client:
+        response = client.get(
+            "/credentials", headers={"Authorization": f"Bearer {invocation.token}"}
+        )
+    assert response.status_code == 403
+    (incident,) = runtime.accounts.status()["incidents"]
+    assert (incident["dependency"], incident["kind"]) == ("a", "auth")
+    assert incident["code"] == "credential_refresh_rejected"
 
 
 @pytest.mark.parametrize("during_refresh", ["finish", "reconfigure", "reconfigure_error"])

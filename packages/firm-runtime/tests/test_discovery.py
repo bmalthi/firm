@@ -126,7 +126,7 @@ def test_paused_employee_accepts_mail_without_running_but_stays_visible(tmp_path
     runtime = _runtime(tmp_path)
     analyst = _hire(runtime, FOUNDER_ID, "ops")["employee_id"]
     runtime.owner.stop_role(OWNER, analyst, request_id="pause-ops")
-    sent = runtime.messaging.send(OWNER, [analyst], "Still reachable", request_id="mail-paused")
+    sent = runtime.owner.send_mail(OWNER, [analyst], "Still reachable", request_id="mail-paused")
     assert sent["message_id"]
     with runtime.store.read() as db:
         opportunities = db.execute(
@@ -342,7 +342,7 @@ def test_short_continuations_are_scoped_to_work_period_and_validate_original_vie
     runtime.finish(first.activation_id)
     with runtime.store.read() as db:
         assert db.execute("SELECT COUNT(*) FROM discovery_continuations").fetchone()[0] == 0
-    runtime.messaging.send("owner", [first.employee_id], "Continue work", request_id="wake-again")
+    runtime.owner.send_mail("owner", [first.employee_id], "Continue work", request_id="wake-again")
     resumed = runtime.admit()
     assert resumed.employee_id == first.employee_id
     runtime.mark_started(resumed.activation_id)

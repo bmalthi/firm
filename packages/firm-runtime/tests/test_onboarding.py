@@ -65,11 +65,10 @@ def test_resume_fills_only_missing_files_and_lists_initialized_or_incomplete(tmp
     empty.mkdir()
     database = root / "2026-10-28_ready"
     onboarding.create_firm_files(database, "codex", "Build a firm.")
-    from firm_runtime.compatibility import initialize_firm
+
     from firm_runtime.runtime import Runtime
     from firm_runtime.store import Store
 
-    initialize_firm(database)
     Runtime(Store(database / "durable" / "firm.sqlite3")).lifecycle.initialize(
         database.name,
         "Build a firm.\n",
@@ -87,7 +86,7 @@ def test_resume_fills_only_missing_files_and_lists_initialized_or_incomplete(tmp
     assert (incomplete / "mandate.md").read_text() == "Save me\n"
 
 
-def test_unmarked_database_is_listed_for_attention_not_as_a_resumable_firm(tmp_path):
+def test_empty_database_is_listed_as_incomplete(tmp_path):
     root = tmp_path / "firms"
     old = root / "legacy"
     old.mkdir(parents=True)
@@ -95,8 +94,8 @@ def test_unmarked_database_is_listed_for_attention_not_as_a_resumable_firm(tmp_p
     (old / "durable").mkdir()
     (old / "durable" / "firm.sqlite3").touch()
     listing = onboarding.list_firms(root)
-    assert listing[0]["state"] == "needs attention"
-    assert "no release compatibility record" in listing[0]["reason"].lower()
+    assert listing[0]["state"] == "incomplete"
+    assert listing[0]["reason"] is None
 
 
 def test_provider_login_saves_valid_credential_and_removes_temp_state(

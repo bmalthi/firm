@@ -1,4 +1,4 @@
-import {decisionStatus, incidentStatus, incidentTitle, inboxGroups, inboxWindow} from "./format.js";
+import {decisionStatus, incidentStatus, incidentTitle, inboxGroups, inboxWindow, recipientDesignation, mailTitle, mailText, ownerMailState} from "./format.js";
 import {attachmentChip} from "./results.js";
 
 export function createInbox({$, api, post, element, button, mutationButton, time, reply, refresh,
@@ -28,16 +28,16 @@ export function createInbox({$, api, post, element, button, mutationButton, time
       const state = element("span", "badge");
       const requestStatus = element("span", "request-status role-meta");
       const author = element("strong");
-      const recipients = element("span", "role-meta", `to ${message.recipients.map((r) => r.employee_id === "owner" ? "you" : who(r)).join(", ")}`);
+      const recipients = element("span", "role-meta", `to ${message.recipients.map((r) => (r.employee_id === "owner" ? "you" : who(r)) + (recipientDesignation(r) ? ` (${recipientDesignation(r)})` : "")).join(", ")}`);
       const stamp = element("time", "message-meta", time(message.created_at));
       stamp.dataset.timestamp = message.created_at;
       header.append(state, requestStatus, author, recipients, stamp);
       const body = element("p", "message-body");
-      const full = message.body || "";
+      const full = mailText(message);
       const long = full.length > 600 || full.split("\n").length > 8;
       const excerpt = full.slice(0, 600).split("\n").slice(0, 8).join("\n");
       body.textContent = long ? `${excerpt}…` : full;
-      card.append(header, element("h3", "", message.subject || "Message"), body);
+      card.append(header, element("h3", "", mailTitle(message)), body);
       if (long) {
         const toggle = button("Show full message", () => {
           const expanded = toggle.getAttribute("aria-expanded") !== "true";
@@ -63,7 +63,7 @@ export function createInbox({$, api, post, element, button, mutationButton, time
     row.message = message;
     row.author.textContent = who(message.author);
     const pending = message.owner_delivery?.disposition === "pending";
-    row.state.textContent = message.owner_delivery ? pending ? "New" : "Done" : message.author.employee_id === "owner" ? "Sent" : "Between roles";
+    row.state.textContent = ownerMailState(message);
     row.state.classList.toggle("new-mail", pending);
     const regarding = message.regarding;
     row.requestStatus.hidden = regarding?.kind !== "request";
@@ -121,7 +121,7 @@ export function createInbox({$, api, post, element, button, mutationButton, time
         row.status.classList.toggle("live", first.regarding.status === "resolved");
         row.caption.textContent = `${group.messages.length} runtime ${group.messages.length === 1 ? "notice" : "notices"} about this incident. Their text is shown unchanged; the status above is the incident's status now.`;
       } else {
-        row.title.textContent = first?.subject || "Conversation";
+        row.title.textContent = first ? mailTitle(first) : "No subject";
         row.caption.textContent = `${group.messages.length} ${group.messages.length === 1 ? "message" : "messages"}${group.decisions.length ? ` · ${group.decisions.length} decisions` : ""}`;
       }
       const entries = [

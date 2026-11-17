@@ -64,6 +64,7 @@
             <p id="send-address" class="role-meta"></p>
             <label class="new-message-field">Subject <input id="send-subject" placeholder="Optional"></label>
             <label>Message <textarea id="send-body" required rows="4"></textarea></label>
+            <fieldset id="reply-actions" hidden><legend>Who should act?</legend><p class="role-meta">Everyone receives this reply. None selected means all FYI.</p><div id="reply-action-options"></div></fieldset>
             <p id="send-attachment" class="attachment-chip" hidden></p>
             <div class="owner-controls"><button type="submit" data-mutation>Send message</button><button id="cancel-reply" type="button" hidden>Cancel</button><button id="new-message-draft" type="button" hidden>Start new draft (previous may have sent)</button></div><span id="send-status" class="role-meta" role="status"></span>
           </form>

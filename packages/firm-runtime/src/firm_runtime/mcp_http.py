@@ -84,7 +84,14 @@ def build_http_app(
         allowed_origins=list(allowed_origins),
     )
     security = TransportSecurityMiddleware(security_settings)
-    server = FastMCP(
+    class RoleMCP(FastMCP):
+        async def list_tools(self):
+            tools = await super().list_tools()
+            if tools:
+                await anyio.to_thread.run_sync(runtime.record_mcp_catalog, _request_token())
+            return tools
+
+    server = RoleMCP(
         "firm-role-tools",
         token_verifier=ActivationTokenVerifier(runtime),
         auth=AuthSettings(
@@ -187,7 +194,7 @@ def build_http_app(
             except FirmError:
                 return _auth_error()
             if exc.category == "auth":
-                runtime.accounts.pause(OWNER, "account", account_id, "auth")
+                runtime.accounts.pause(OWNER, "account", account_id, "auth", code=exc.code)
             return JSONResponse(
                 {
                     "error": "authentication_failed"

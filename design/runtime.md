@@ -132,8 +132,29 @@ Scheduling is a deterministic SQLite projection (`scheduling_opportunities`) com
 | **Ordinary** | `0` | Colleague mail, due reminders, and `handoff(next="continue")`. |
 
 * **Oldest-ready wins within a priority class:** Multiple pending triggers for the same role coalesce into a single activation at the role's highest due priority.
-* **No recurring wake from ignored mail:** Admission clears `scheduling_ready_at` on due deliveries when the work period starts. If a role leaves a message pending in its inbox without claiming or dismissing it, that old message will **not** endlessly re-wake the role after completion.
+* **Per-message action targets:** Every message states, for each recipient, whether it asks them to act (`to_action`, `action`) or is FYI (`to_fyi`). Queued recipients persist `action_required`; only designated role deliveries get `scheduling_ready_at`. Operations notices retain explicit internal wake control.
+* **No recurring wake from ignored mail:** Admission clears `scheduling_ready_at` on due deliveries when the work period starts. If a role leaves a message unread in its inbox without reading or dismissing it, that old message will **not** endlessly re-wake the role after completion.
 * **Reminders:** Roles can schedule future wakes with `set_reminder(due_at, note, request_id)` (up to 100 pending reminders per role). When due, a reminder becomes an ordinary Operations message and wake.
+
+When ordinary selection finds no admissible work and there are no admitted/running
+activations, a free global slot may admit one eligible role for `idle_inbox_review`.
+This conditional selection is outside `scheduling_opportunities` and reuses ordinary
+employment, hold, retry, guidance, appointment and account gates. Ordinary work wins,
+including actionable notices created by account selection. Future timers are unchanged.
+
+`roles.last_offered_message_sequence` is a role-lifetime conservative frontier. Admission
+and activation-authorized peek advance it only through the unread messages counted in
+thread entries actually returned after bounded rendering, stopping at the first unseen gap.
+SQLite `BEGIN IMMEDIATE` serializes allocation/insertion and frontier writes; deferred
+lower-sequence deliveries cannot appear after a frontier commit. No owner/analysis read,
+count, sender notice or derived summary advances it. An ordinary peek that cannot show
+every thread may leave holes; idle snapshots guarantee a nonempty chronological prefix,
+stopping before a future-scheduled delivery or the rendering budget.
+Finite fixed mail therefore permits finitely many reviews without requiring disposition.
+Previously shown mail above a hole may appear again. Admission stores the prior frontier
+and restores it on pre-start failure;
+`mark_started` establishes the committed scheduling offer, using existing recovery after
+that point. No per-delivery review registry or receipt protocol is needed.
 
 ### Handoff and the Next Work Period
 
@@ -174,7 +195,7 @@ Active roles parse results through their model-bound adapter instance, preservin
 
 `context_window` is a soft runtime token allowance (default `500,000` for Claude, `256,000` for Codex):
 * **Advisory (60% of window):** Surfaces a gentle context-usage note on tool responses.
-* **Handoff Gate (`context_window - handoff_reserve`, default reserve `10,000` tokens):** Blocks claiming *new* pending mail and returns the handoff checklist, while leaving exact message lookup, file saving, and `handoff()` open so the role can finish cleanly without being killed mid-thought.
+* **Handoff Gate (`context_window - handoff_reserve`, default reserve `10,000` tokens):** Blocks `read` so no new message bodies enter context and returns the handoff checklist, while leaving `peek`, `reply`, `send`, `dismiss`, `clear`, file saving, and `handoff()` open so the role can finish cleanly without being killed mid-thought.
 
 ### Key Design Trade-offs: Execution & Context
 * **Why wait on a quota-blocked warm session instead of migrating it to another account?** Neither Codex nor Claude supports transferring a server-side session across accounts or providers. Automatic migration would silently wipe the role's conversation memory; waiting preserves it (and the owner can explicitly `stop-role` -> `route --fresh` if they prefer a reset).
@@ -185,10 +206,10 @@ Active roles parse results through their model-bound adapter instance, preservin
 ## Tasks
 
 `task(instruction, request_id)` gives a role a bounded, single-turn text answer from a fresh worker session running in a child cgroup:
-* **No Firm authority:** Task workers have standard file, shell, and search tools in the caller's Linux account, but **no** Firm MCP tools, no mail access, no conversation history, and no sub-delegation.
+* **No Firm authority:** Task workers run in the caller's Linux account with provider-native file, shell and search capabilities, but receive **no** Firm MCP tools, mail access or parent conversation history. Native tool restrictions are configured by the provider adapter.
 * **Slot borrowing:** A role's first active task borrows the waiting caller's own execution slot; a second concurrent task (`max_concurrent = 2`) requires a free slot on the same account.
-* **Defaults:** Uses `[task.codex]` (`gpt-6.1-sol`, `medium`) or `[task.claude]` (`opus`, `medium`).
-* **Why `task()` instead of provider-native subagents?** Provider-native subagents can inherit parent instructions, Firm MCP authority, and delegation capabilities. Launching an isolated worker via the guest controller guarantees identical, tool-restricted behavior across both Codex and Claude.
+* **Defaults:** Uses `[task.codex]` (`gpt-6.1-sol`, `medium`), `[task.claude]` (`opus`, `medium`), or `[task.agy]` (`gemini-4-hydrogen`, `high`), as defined in `provider_definitions.py`.
+* **Why `task()` instead of provider-native subagents?** Provider-native subagents can inherit parent instructions and Firm MCP authority. Launching a fresh worker through the guest controller lets Firm control its lifecycle, slot accounting, credential projection and Firm-tool exposure. Native tool behavior remains provider-specific; the adapters do not establish identical native tool enforcement.
 
 ---
 
@@ -207,7 +228,7 @@ Every failure is classified from structured provider/sandbox evidence before cha
 | **Transient provider setup (named account, before launch)** | Retry on the same schedule; hold `attempts_exhausted` after the fourth failure. | Yes |
 
 ### Recovery Notice
-When a role restarts after an abnormal exit that actually ran, it receives a minimal recovery notice: the UTC detection time, whether session context was retained, the **last 5 claimed message IDs and subjects**, and a reminder to check workspace files before repeating side effects.
+When a role restarts after an abnormal exit that actually ran, it receives a minimal recovery notice: the UTC detection time, whether session context was retained, the **last 5 read message IDs** (with subject, or a body preview when there is none), and a reminder to check workspace files before repeating side effects.
 
 ---
 
@@ -254,7 +275,7 @@ When a role calls a tool that hits an owner-controlled gate, the tool opens a pe
 
 | Command | Behavior |
 | :--- | :--- |
-| `firm init <dir>` | Validate mandate and `firm.toml`, write `firm-release.json`, and create the stopped firm with its `founder`. |
+| `firm init <dir>` | Validate mandate and `firm.toml`, and create the stopped firm with its `founder`. |
 | `firm start [<dir>]` | Without `<dir>`: interactive setup wizard. With `<dir>`: launch or reconnect to the detached local host and open the Owner Console (`--foreground` attaches to terminal). |
 | `firm stop <dir> [--force]` | **Soft drain** (default): close admission, ask active roles to save a `handoff`, then shut down VMs. **`--force`**: terminate active runs immediately and shut down VMs. |
 | `firm status` / `firm analyze` | Read-only state summary or windowed JSON telemetry (`overview`, `inbox`, `readiness`, `timeline`, `usage`, `conversations`, `mac`, `resources`, `network`; omit `--section` for all sections). Works offline without booting VMs. |
@@ -266,9 +287,9 @@ When a role calls a tool that hits an owner-controlled gate, the tool opens a pe
 
 ### Analysis
 * `firm analyze` computes read-only telemetry over a time window (`--from` / `--until`) from SQLite records and guest run journals (`overview`, `inbox`, `readiness`, `conversations`, `timeline`, `usage`, `mac`, `resources`, `network`, or omit `--section` for the full report).
-* Telemetry reports objective execution facts (wake triggers, tool-call counts by name, token usage, message claim delays, and cgroup peak memory) without using an LLM to judge whether a deliverable meets the mandate.
+* Telemetry reports objective execution facts (wake triggers, tool-call counts by name, token usage, message read delays, and cgroup peak memory) without using an LLM to judge whether a deliverable meets the mandate.
 
 ### The Local Owner Console (`http://127.0.0.1:8766/`)
 * **Bookmarkable, owner-only auth:** Loopback is shared by local processes, so the console requires an `HttpOnly`, `SameSite=strict` session cookie initialized via `/unlock/<key>`. The key is generated once in `durable/console-key` (`0600`), keeping the console URL stable across restarts.
 * **Sandboxed file previews:** Untrusted message text renders via `textContent`. HTML deliverables render inside an opaque-origin `<iframe sandbox>` with no network, forms, or parent access; Markdown and text render in a script-free frame (`frame-ancestors` locked to the console).
-* **Refusal-only compatibility (`firm-release.json`):** Firms and VM images share a single compatibility generation integer. `Store(path)` validates the marker before opening SQLite and refuses mismatched generations rather than running schema migrations.
+* **Development state:** Breaking changes are allowed without compatibility gates or migrations. Use fresh disposable state when schema or guest-contract changes require it.

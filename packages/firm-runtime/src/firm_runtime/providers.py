@@ -6,7 +6,7 @@ from pathlib import Path
 from .accounts import validate_accounts
 from .errors import FirmError
 from .prompt_records import record_inputs
-from .provider_contract import ExecutionProvider, ProviderSetupError
+from .provider_contract import ExecutionProvider, ProviderSetupError, incident_code
 from .provider_registry import provider_implementation
 from .provider_support import activation_url
 from .store import OWNER
@@ -56,7 +56,9 @@ class Providers:
                     scope = "account" if exc.category == "auth" else "profile"
                     dependency = account_id if scope == "account" else name
                     if exc.category in {"auth", "config"}:
-                        self.runtime.accounts.pause(OWNER, scope, dependency, exc.category)
+                        self.runtime.accounts.pause(
+                            OWNER, scope, dependency, exc.category, code=exc.code
+                        )
                     result.append({"scope": scope, "dependency": dependency, "code": exc.code})
         return {"checked_accounts": sorted(checked), "failures": result}
 
@@ -93,7 +95,7 @@ class Providers:
                 account,
             )
             spec = adapter.build_summary_spec(
-                request, sandbox.layout(summary_role_id(request.run_id))
+                request, sandbox.layout(summary_role_id(request.run_id, request.stateless_slot))
             )
             record_inputs(
                 self.runtime.store.path.parent / "inputs",
@@ -181,13 +183,15 @@ class Providers:
         def parse(request, logs, exit_code, *, apply_holds):
             return record_task_output(
                 self.runtime, request.run_id, request.provider, request.account_id, logs, exit_code,
-                apply_holds=apply_holds,
+                apply_holds=apply_holds, model=request.model,
             )
 
         return GuestTaskRunner(self.runtime, sandbox, build_spec=build, parse_output=parse)
 
 
-def record_task_output(runtime, run_id, provider, account_id, logs, exit_code, *, apply_holds):
+def record_task_output(
+    runtime, run_id, provider, account_id, logs, exit_code, *, apply_holds, model=None
+):
     parser = provider_implementation(provider)
     result = parser.parse_result(logs, exit_code)
     observed = parser.parse_usage(logs)
@@ -224,7 +228,16 @@ def record_task_output(runtime, run_id, provider, account_id, logs, exit_code, *
              usage.get("native_compactions"), usage.get("resolved_model"), run_id),
         )
         error = result.error
-        if apply_holds and error and error.category in {"auth", "config", "quota"}:
+        # The task's own model or setup failed. A model whose allowance is spent counts:
+        # it is the task setting's problem, and the account's other models still run.
+        rejected_setup = bool(apply_holds and error and (
+            error.category == "config" or error.code == "model_quota_reached"
+        ))
+        if rejected_setup:
+            # This says nothing about the account or the role's profile: refuse the
+            # call, tell the owner once, hold nothing.
+            runtime.accounts.report_task_setup(db, provider, model, incident_code(error.code))
+        elif apply_holds and error and error.category in {"auth", "quota"}:
             limits = []
             if error.reset_at is not None:
                 limits.append(error.reset_at)
@@ -233,8 +246,8 @@ def record_task_output(runtime, run_id, provider, account_id, logs, exit_code, *
             until = max(limits) if limits else None
             runtime.accounts.hold(
                 db, "account", account_id, error.category,
-                until if error.category == "quota" else None,
+                until if error.category == "quota" else None, code=error.code,
             )
     if result.error:
-        raise TaskExecutionError("provider_failure")
+        raise TaskExecutionError("configuration" if rejected_setup else "provider_failure")
     return result.final_text

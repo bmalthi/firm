@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {age, bytes, clockTime, time, incidentTitle, vmState, runtimeState, decisionStatus, incidentStatus, inboxGroups, inboxWindow, machineName, needsYou, pageTitle, readinessPhrase, seconds, statusHeadline, statusSentence} from "../src/firm_runtime/web_console/format.js";
+import {age, authCause, authLabel, authRecovery, bytes, clockTime, time, incidentTitle, vmState, runtimeState, decisionStatus, incidentStatus, inboxGroups, inboxWindow, machineName, needsYou, pageTitle, readinessPhrase, seconds, statusHeadline, statusSentence} from "../src/firm_runtime/web_console/format.js";
 import {buildRoleForest} from "../src/firm_runtime/web_console/role_tree.js";
 import {filePreviewable, fileFolder, fileDeliveries, resultHref, firmMenuLabel, fileReplyMatches} from "../src/firm_runtime/web_console/format.js";
-import {subscriptionQuotaDetail} from "../src/firm_runtime/web_console/format.js";
+import {mailTitle, mailText, ownerMailState, subscriptionQuotaDetail} from "../src/firm_runtime/web_console/format.js";
 import {createSystem} from "../src/firm_runtime/web_console/system.js";
 
 test("empty execution allowance explains unavailability with its source and observation time", () => {
@@ -345,12 +345,13 @@ test("every other readiness reason has a phrase; unrecognized reasons remain vis
   const expected = {
     ready: "Starting soon", firm_capacity: "Queued for a slot", account_capacity: "Queued for an account slot",
     reminder_due: "Reminder due · starting soon", owner_paused: "Paused by you", idle_no_wake: "Idle · nothing scheduled",
-    pending_mail_no_wake: "Mail waiting, nothing scheduled", refusal: "Held · work refused",
+    pending_mail_no_wake: "Mail waiting, already offered", idle_inbox_review_available: "Mail waiting for idle review", refusal: "Held · work refused",
     attempts_exhausted: "Held · retry attempts exhausted", temporary_exhausted: "Held · temporary work periods exhausted",
     level_pending: "Waiting for role routing", guidance_pending: "Waiting for role guidance", exit_pending: "Finishing current work", retired: "Retired",
     firm_stopped: "Firm stopped", firm_draining: "Stopping after current work", firm_stopping: "Force stopping",
     infrastructure_not_ready: "Waiting for the VM", account_config_hold: "Paused · account configuration needs repair",
     profile_config_hold: "Paused · profile configuration needs repair", account_quota_hold: "Paused · account allowance exhausted",
+    profile_quota_hold: "Paused · model allowance exhausted",
     account_hold: "Paused · account hold", profile_hold: "Paused · profile hold", pinned_dependency: "Paused · execution dependency held", unknown: "unknown",
   };
   for (const [reason, phrase] of Object.entries(expected)) assert.equal(readinessPhrase(row(reason)), phrase);
@@ -429,6 +430,51 @@ test("incident titles describe both scopes and each cause in plain words", () =>
   }
 });
 
+test("an authentication hold says whether signing in can help", () => {
+  const cases = [
+    [undefined, "can't sign in", "Can't sign in"],
+    [null, "can't sign in", "Can't sign in"],
+    ["sign_in", "can't sign in", "Can't sign in"],
+    ["organization", "is blocked by its organization", "Blocked by its organization"],
+    ["account", "is on hold at the provider", "On hold at the provider"],
+  ];
+  for (const [repair, cause, label] of cases) {
+    const incident = {scope: "account", dependency: "main", kind: "auth", repair};
+    assert.equal(authCause(incident), cause);
+    assert.equal(authLabel(incident), label);
+    assert.equal(incidentTitle(incident), `Account main ${cause}`);
+    const value = blocked();
+    value.accounts.incidents[0].repair = repair;
+    assert.equal(readinessPhrase(value.readiness.rows[0], value), `Paused · codex-main ${cause}`);
+    assert.equal(statusSentence(value), "0 of 1 roles are working now. Founder is waiting on your decision.");
+  }
+  assert.equal(authCause(undefined), "can't sign in");
+  assert.equal(incidentTitle({scope: "account", dependency: "main", kind: "quota", repair: "organization"}), "Account main has an allowance hold");
+});
+
+test("an authentication card asks for sign-in only when that can repair the hold", () => {
+  const command = "firm login main --provider claude";
+  const guidance = "The provider's own sentence.";
+  for (const repair of [undefined, null, "sign_in"]) {
+    const card = authRecovery({kind: "auth", repair, guidance, login_command: command});
+    assert.deepEqual([card.guidance, card.command, card.button], [guidance, command, "I've signed in again · resume work"]);
+    assert.match(card.commandNote, /^Sign in with this command, then resume work\. /);
+  }
+  for (const repair of ["organization", "account"]) {
+    const card = authRecovery({kind: "auth", repair, guidance, login_command: command});
+    // The command stays available for switching accounts, but the card does not ask for it.
+    assert.deepEqual([card.guidance, card.command, card.button], [guidance, command, "Resume work"]);
+    assert.match(card.commandNote, /^This command signs in to the account\. /);
+    assert.doesNotMatch(card.commandNote, /then resume work/);
+  }
+  // A removed account has no command, and an older row may carry no guidance.
+  assert.deepEqual(authRecovery({kind: "auth"}), {
+    guidance: "Sign in again, then resume work.", command: null,
+    commandNote: "Sign in with this command, then resume work. Credentials stay on your computer and never pass through this page.",
+    button: "I've signed in again · resume work",
+  });
+});
+
 test("VM and runtime labels share state wording without hiding unknown states", () => {
   for (const [state, label] of Object.entries({running: "Running", stopped: "Stopped", starting: "Starting", stopping: "Stopping", failed: "Failed", unknown: "Unknown", not_configured: "Not configured"})) assert.equal(vmState(state), label);
   for (const [state, label] of Object.entries({running: "Accepting work", stopped: "Not accepting work", draining: "Stopping after current work", stopping: "Force stopping"})) assert.equal(runtimeState(state), label);
@@ -464,4 +510,52 @@ test("including role mail preserves the selected owner view and its fresh dispos
   assert.deepEqual(inboxWindow([pending], [done, between, mail("new", 4)]), [between, pending]);
   assert.deepEqual(inboxWindow([pending], [between], 1), [between]);
   assert.deepEqual(inboxWindow([]), []);
+});
+
+
+test("reply action selection is per-message and survives saved retry payloads", async () => {
+  const {replyActionSelection, recipientDesignation} = await import("../src/firm_runtime/web_console/format.js");
+  const owner = {employee_id: "owner"};
+  const alice = {employee_id: "e1", address: "founder/alice"};
+  const bob = {employee_id: "e2", address: "founder/bob"};
+  assert.deepEqual(replyActionSelection([owner, alice, alice]).selected, ["e1"]);
+  assert.deepEqual(replyActionSelection([owner, alice, bob]).selected, []);
+  const saved = JSON.parse(JSON.stringify({payload: {action_recipients: ["e2"]}, replyAudience: [alice, bob]}));
+  assert.deepEqual(replyActionSelection(saved.replyAudience, saved.payload.action_recipients),
+    {recipients: [alice, bob], selected: ["e2"]});
+  assert.deepEqual(replyActionSelection([owner, alice, bob]).selected, []);
+  assert.equal(recipientDesignation({action_required: true}), "Action");
+  assert.equal(recipientDesignation({action_required: false}), "FYI");
+});
+
+test("conditional idle mail review has a truthful readiness explanation", () => {
+  const value = sample([row("idle_inbox_review_available")]);
+  assert.equal(statusHeadline(value), "Mail awaiting idle review");
+  assert.match(statusSentence(value), /no ordinary work is runnable/);
+  value.readiness.rows[0].reasons.push("scheduled_wake");
+  value.readiness.rows[0].next_check_at = 9000;
+  assert.equal(statusHeadline(value), "Mail awaiting idle review");
+});
+
+test("mail titles use nullable thread subjects and separate one-line previews", () => {
+  assert.equal(mailTitle({subject: "Fixed", body: "Another title"}), "Fixed");
+  assert.equal(mailTitle({subject: null, body: "Access granted: example.com\n\nThe owner granted it."}), "Access granted: example.com");
+  assert.equal(mailTitle({subject: null, body: "\n  First\n  second"}), "First");
+  assert.equal(mailTitle({subject: null, preview: "Saved preview"}), "Saved preview");
+  assert.equal(mailTitle({subject: null, body: "x".repeat(100)}).length, 80);
+});
+test("generated context precedes the author's body with explicit attribution", () => {
+  const text = mailText({summary: "Earlier discussion.", body: "Please join."});
+  assert.ok(text.includes("generated by Operations at the sender’s request"));
+  assert.ok(text.includes("not an Operations instruction or the sender’s words"));
+  const closing = "End of generated context. The sender's introduction follows.";
+  assert.ok(text.indexOf("Earlier discussion.") < text.indexOf(closing));
+  assert.ok(text.indexOf(closing) < text.indexOf("Please join."));
+  assert.equal(mailText({body: "Exact body."}), "Exact body.");
+});
+
+test("owner mail labels distinguish read receipt from a dismissed message", () => {
+  assert.equal(ownerMailState({owner_delivery: {disposition: "read"}}), "Read");
+  assert.equal(ownerMailState({owner_delivery: {disposition: "pending"}}), "New");
+  assert.equal(ownerMailState({owner_delivery: {disposition: "dismissed"}}), "Done");
 });

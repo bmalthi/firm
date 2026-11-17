@@ -324,7 +324,7 @@ def test_parent_end_cancels_task_and_old_activation_still_counts_toward_cap(setu
     runtime.finish(caller.activation_id)
     assert pending.result(2)["reason"] == "cancelled_unconfirmed"
     assert occupancy(runtime) == 1
-    runtime.messaging.send(OWNER, ["founder"], "Continue", request_id="wake")
+    runtime.owner.send_mail(OWNER, ["founder"], "Continue", request_id="wake")
     fresh = start(runtime)
     with runtime.store.read() as db:
         config = runtime.accounts.config(db)
@@ -406,7 +406,7 @@ def test_task_completion_and_replay_deliver_current_parent_controls(setup):
         tools = runtime.tools(caller.token)
         pending = asyncio.create_task(tools.task("Work", "controls"))
         _, handle = await asyncio.to_thread(runner.started.get, True, 2)
-        runtime.messaging.send(OWNER, [caller.employee_id], "New work", request_id="during-task")
+        runtime.owner.send_mail(OWNER, [caller.employee_id], "New work", request_id="during-task")
         runtime.record_usage(
             caller.activation_id,
             ProviderUsage(current_context_tokens=255_000, provider_context_window=256_000),
@@ -421,7 +421,7 @@ def test_task_completion_and_replay_deliver_current_parent_controls(setup):
         rendered = render_tool_result("task", result)
         assert rendered.startswith(result["answer"] + "\n\nOperations:")
 
-        runtime.messaging.send(OWNER, [caller.employee_id], "Later work", request_id="after-task")
+        runtime.owner.send_mail(OWNER, [caller.employee_id], "Later work", request_id="after-task")
         replay = await tools.task("Work", "controls")
         assert replay["answer"] == result["answer"]
         assert replay["mail_waiting"]["senders"][0][1] == 1
@@ -437,7 +437,7 @@ def test_task_completion_and_replay_deliver_current_parent_controls(setup):
 
 def test_task_refusal_still_delivers_parent_mail(setup):
     runtime, caller, runner, _, _ = setup
-    runtime.messaging.send(OWNER, [caller.employee_id], "New work", request_id="before-refusal")
+    runtime.owner.send_mail(OWNER, [caller.employee_id], "New work", request_id="before-refusal")
     result = asyncio.run(runtime.tools(caller.token).task("", "empty"))
     assert result["status"] == "unavailable" and result["reason"] == "invalid_instruction"
     assert result["mail_waiting"]["senders"][0][1] == 1
@@ -502,7 +502,7 @@ def test_simultaneous_identical_requests_reserve_once_and_replay_in_later_period
     assert calls[0].result(2) == calls[1].result(2)
     assert len(runner.handles) == 1
     runtime.finish(caller.activation_id)
-    runtime.messaging.send(OWNER, ["founder"], "Continue", request_id="wake-replay")
+    runtime.owner.send_mail(OWNER, ["founder"], "Continue", request_id="wake-replay")
     later = start(runtime)
     assert runtime.task_service.call(later.token, "Same", "duplicate") == calls[0].result()
     assert len(runner.handles) == 1

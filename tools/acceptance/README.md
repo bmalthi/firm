@@ -9,6 +9,7 @@ summary checks require a firm never bound to another runtime database; provider
 `--resume` reuses its original firm and evidence.
 
 These scripts describe checks to run, not evidence that a release has passed them.
+
 Resource history still needs live validation of PSI and memory accounting under
 `user.slice`, OOM event reporting, per-VM attribution and Apple Silicon host CPU
 readings. GitHub access has no automated acceptance script: validate App registration,
@@ -43,9 +44,9 @@ home and drive work as on any Linux host.
 
 The request check creates the runtime database itself: prepare only a fresh
 `sandbox.toml`, then run `uv run firm-sandbox --config FIRM_DIR/sandbox.toml init`
-to create its compatibility marker before `requests.py`. Do not run `firm init`
+to validate the fixture before `requests.py`. Do not run `firm init`
 on that fixture. The network check instead requires an already initialized,
-stopped firm. Both validate the marker before touching sandbox state. Other
+stopped firm. Both check owner-controlled directories before touching sandbox state. Other
 dispatcher/provider checks keep their disposable runtime database in the evidence
 directory and require a sandbox that has not been bound to a different database.
 
@@ -57,12 +58,28 @@ directory and require a sandbox that has not been bound to a different database.
 | `cleanup.py` | Role disposal, scratch cleanup and identity retirement | `--root FIRM_DIR --evidence DIR [--keep-running]` |
 | `provider.py` | Configured provider execution, credentials, tools and resume | `--root FIRM_DIR --evidence DIR --provider-config PROVIDERS_TOML --profile PROFILE [--provider codex\|claude\|agy] [--resume]` |
 | `summary.py` | Isolated summarization and hiring assessment | `--root FIRM_DIR --evidence DIR --provider-config PROVIDERS_TOML --profile PROFILE [--provider codex\|claude\|agy]` |
+| `stateless.py` | Reusable tool-free account isolation, cleanup, cancellation and restart without inference | `--root FIRM_DIR --evidence DIR` |
 | `task.py` | Worker execution, concurrency, cancellation and isolation | `--root FIRM_DIR --evidence DIR --provider codex\|claude\|agy --provider-config PROVIDERS_TOML --profile PROFILE [--timeout 120]` |
 | `docker.py` | Containers, mounts, resource accounting and cleanup | `--root FIRM_DIR --evidence DIR [--role ROLE]` |
-| `browser.py` | Native or containerized browser rendering and exported artifacts | `--root FIRM_DIR --evidence DIR [--role ROLE] [--mode native\|docker] [--chromium-sandbox]` |
+| `browser.py` | Native or containerized browser rendering and exported artifacts | `--root FIRM_DIR --evidence DIR [--role ROLE] [--mode native\|docker] [--chromium-sandbox] [--offline-reuse]` |
 | `network.py` | Egress enforcement, revocation, restart retention and Mac proxy policy | `--root FIRM_DIR --evidence DIR [--station N]` |
 | `requests.py` | Owner access requests, grant, denial and revocation | `--root FIRM_DIR --evidence DIR` |
 | `recovery.py` | Runtime loss, adoption and settlement | `--root FIRM_DIR --evidence DIR` |
+
+For native browser setup, run `browser.py` with a new role and evidence directory,
+repeat with the same role and a new evidence directory for warm setup, then repeat
+with `--offline-reuse`. The offline check disables Linux egress for the run, skips
+installers and uses `uv run --offline --no-sync`; cleanup restores the earlier egress
+setting. It requires that role's successful prior installation. Results report
+`setup_steps` with SDK/browser installer timings and exit codes, `setup_failure`,
+`project_existed`, rendering time and traffic snapshots before/after the workload.
+On a base with shared browsers, native mode adds the recorded Playwright version
+(`shared_browser_version`) and fails `shared_browser_used` if the role downloaded a
+Chromium of its own (`own_browser_downloads`); on an older base it installs both itself.
+A new project alone does not prove empty package/browser caches: use a new role
+for fresh setup. Run these checks sequentially and retain separate evidence.
+The tool exercises trusted local HTML; it does not establish safety for arbitrary
+untrusted pages or prove that browser CDNs are allowed in enforce mode.
 
 To force a Linux base rebuild before `linux_base.py`, delete
 `~/Library/Caches/firm/linux-base/`.

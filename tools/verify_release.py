@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import hashlib
 import json
 import subprocess
@@ -22,20 +21,6 @@ REQUIRED_CHECKS = {
     "packaged_assets",
     "offline_workflow",
 }
-
-
-def expected_generation(root: Path) -> int:
-    path = root / "packages/firm-sandbox/src/firm_sandbox/compatibility.py"
-    tree = ast.parse(path.read_text())
-    for statement in tree.body:
-        if isinstance(statement, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == "COMPATIBILITY_GENERATION"
-            for target in statement.targets
-        ):
-            value = ast.literal_eval(statement.value)
-            if type(value) is int and value > 0:
-                return value
-    raise ValueError("The source compatibility generation is missing or invalid")
 
 
 def verify(root: Path, dist: Path, tag: str) -> None:
@@ -77,8 +62,6 @@ def verify(root: Path, dist: Path, tag: str) -> None:
         raise ValueError("Publishing requires evidence built from a clean checkout")
     if not REQUIRED_CHECKS <= release["checks"].keys():
         raise ValueError("The release evidence omits required checks")
-    if release.get("compatibility_generation") != expected_generation(root):
-        raise ValueError("The release evidence names a different compatibility generation")
     print(f"Verified {tag}: {revision}, {len(hashes)} matching artifacts and passing evidence")
 
 

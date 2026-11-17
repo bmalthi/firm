@@ -6,10 +6,15 @@ from firm_sandbox.file_server import FileServer, local_runner
 
 from firm_runtime.errors import FirmError
 from firm_runtime.lifecycle import Lifecycle
-from firm_runtime.messaging import MAX_BODY_BYTES, MAX_PEEK_BYTES, MAX_RESULT_BYTES, Messaging
+from firm_runtime.messaging import MAX_BODY_BYTES, Messaging
 from firm_runtime.role_output import render_tool_result
 from firm_runtime.store import OPERATIONS, OWNER, Store, encoded  # noqa: F401
-from firm_runtime.summaries import MAX_SUMMARY_TEXT_BYTES, SummaryOutput, SummaryService
+from firm_runtime.summaries import (
+    MAX_SUMMARY_TEXT_BYTES,
+    SUMMARY_TRUNCATION_MARKER,
+    SummaryOutput,
+    SummaryService,
+)
 from firm_runtime.workspaces import sandbox_role_id
 
 
@@ -42,6 +47,7 @@ def mailroom(tmp_path):
     ]
     with store.transaction() as db:
         db.execute("DELETE FROM execution_requests")
+        db.execute("UPDATE message_deliveries SET disposition='dismissed'")
     return store, messaging, founder, employees, now
 
 
@@ -78,25 +84,31 @@ def test_role_attachments_map_drive_paths_and_survive_receipts_and_agent_envelop
         {"path": "shared/reports", "name": "plan.md"},
         {"path": "org/founder/work", "name": "draft.txt"},
     ]
-    sent = messaging.send(founder, [alice], "Open these.", attachments=paths, request_id="files")
-    assert messaging.send(founder, [alice], "Open these.", attachments=paths,
-                          request_id="files") == sent
+    sent = messaging.send(
+        founder, [alice], [], "Open these.", attachments=paths, request_id="files",
+    )
+    assert messaging.send(
+        founder, [alice], [], "Open these.", attachments=paths, request_id="files",
+    ) == sent
     with pytest.raises(FirmError):
-        messaging.send(founder, [alice], "Open these.", attachments=paths[:1],
-                       request_id="files")
+        messaging.send(
+            founder, [alice], [], "Open these.", attachments=paths[:1], request_id="files",
+        )
     with store.read() as db:
         assert store.operation_result(db, founder, "files")["result"] == sent
         stored = db.execute("SELECT attachments_json FROM messages").fetchone()[0]
         assert json.loads(stored) == expected
-    assert messaging.messages(alice, [sent["message_id"]])["messages"][0]["attachments"] == expected
-    assert messaging.claim(alice, [sent["message_id"]], request_id="claim")["messages"][0][
+    assert messaging.read(alice, sent["message_id"])["messages"][0]["attachments"] == expected
+    assert messaging.read(alice, sent["message_id"])["messages"][0][
         "attachments"
     ] == expected
     reply_drive = Layout.for_role(sandbox_role_id(alice)).drive
     reply_path = f"{reply_drive}/org/founder/alice/work/review.md"
-    replied = messaging.reply(alice, sent["message_id"], "Reviewed.",
-                              attachments=[reply_path], request_id="reply-files")
-    assert messaging.messages(founder, [replied["message_id"]])["messages"][0][
+    replied = messaging.reply(
+        alice, sent["message_id"], [], "Reviewed.", attachments=[reply_path],
+        request_id="reply-files",
+    )
+    assert messaging.read(founder, replied["message_id"])["messages"][0][
         "attachments"
     ] == [{"path": "org/founder/alice/work", "name": "review.md"}]
 
@@ -104,17 +116,19 @@ def test_role_attachments_map_drive_paths_and_survive_receipts_and_agent_envelop
 def test_owner_can_attach_a_file_under_any_browse_root(mailroom, monkeypatch):
     _, messaging, founder, _, _ = mailroom
     attachment_files(messaging, monkeypatch)
-    target = messaging.send(founder, [OWNER], "See report", request_id="target")["message_id"]
+    target = messaging.send(founder, [OWNER], [], "See report", request_id="target")["message_id"]
     attachment = {"path": "org/founder/work/reports", "name": "result.md"}
-    sent = messaging.send(OWNER, [founder], "Review", attachments=[attachment],
-                          request_id="owner-file")
-    replied = messaging.reply(OWNER, target, "Here it is", attachments=[attachment],
-                              request_id="owner-reply-file")
+    sent = messaging.send(
+        OWNER, [founder], [], "Review", attachments=[attachment], request_id="owner-file",
+    )
+    replied = messaging.reply(
+        OWNER, target, [], "Here it is", attachments=[attachment], request_id="owner-reply-file",
+    )
     for message_id in (sent["message_id"], replied["message_id"]):
-        assert messaging.messages(OWNER, [message_id])["messages"][0]["attachments"] == [
+        assert messaging.read(OWNER, message_id)["messages"][0]["attachments"] == [
             attachment
         ]
-    assert messaging.messages(founder, [target])["messages"][0]["attachments"] == []
+    assert messaging.read(founder, target)["messages"][0]["attachments"] == []
 
 
 @pytest.mark.parametrize("operation", ["send", "reply"])
@@ -130,7 +144,9 @@ def test_role_attachments_follow_reporting_line_for_send_and_reply(
         (bob, "shared", True),
         (bob, "org/founder/alice/work", False),  # sibling
     ]:
-        target = messaging.send(OWNER, [actor], "Review", request_id=f"target-{actor}-{workspace}")
+        target = messaging.send(
+            OWNER, [actor], [], "Review", request_id=f"target-{actor}-{workspace}",
+        )
         drive = Layout.for_role(sandbox_role_id(actor)).drive
         # Neither the directory nor the file exists. Sending must not stat either.
         attachment = f"{drive}/{workspace}/not-created/yet.md"
@@ -138,12 +154,13 @@ def test_role_attachments_follow_reporting_line_for_send_and_reply(
 
         def send(actor=actor, target=target, kwargs=kwargs):
             if operation == "reply":
-                return messaging.reply(actor, target["message_id"], "File", **kwargs)
-            return messaging.send(actor, [OWNER], "File", **kwargs)
+                return messaging.reply(actor, target["message_id"], [], "File", **kwargs)
+            return messaging.send(actor, [OWNER], [], "File", **kwargs)
 
         if allowed:
             result = send()
-            envelope = messaging.messages(actor, [result["message_id"]])["messages"][0]
+            messaging.read(actor, target["message_id"])
+            envelope = messaging.read(actor, result["message_id"])["messages"][-1]
             assert envelope["attachments"] == [
                 {"path": workspace + "/not-created", "name": "yet.md"}
             ]
@@ -174,12 +191,16 @@ def test_attachments_use_ledger_permissions_for_vacated_workspaces(mailroom, mon
             f"{Layout.for_role(sandbox_role_id(actor)).drive}/{reference['path']}/{reference['name']}"
         )
         if actor in (founder, OWNER):
-            messaging.send(actor, [OWNER if actor == founder else founder], "File",
-                           attachments=[attachment], request_id=f"vacated-{actor}")
+            messaging.send(
+                actor, [OWNER if actor == founder else founder], [], "File",
+                attachments=[attachment], request_id=f"vacated-{actor}",
+            )
         else:
             with pytest.raises(FirmError, match="readable workspaces|no file access"):
-                messaging.send(actor, [OWNER], "File", attachments=[attachment],
-                               request_id=f"vacated-{actor}")
+                messaging.send(
+                    actor, [OWNER], [], "File", attachments=[attachment],
+                    request_id=f"vacated-{actor}",
+                )
 
 
 @pytest.mark.parametrize("suffix", [
@@ -191,8 +212,10 @@ def test_role_attachment_rejects_invalid_drive_path(mailroom, monkeypatch, suffi
     attachment_files(messaging, monkeypatch)
     drive = Layout.for_role(sandbox_role_id(founder)).drive
     with pytest.raises(FirmError):
-        messaging.send(founder, [OWNER], "File", attachments=[f"{drive}/{suffix}"],
-                       request_id="bad-file")
+        messaging.send(
+            founder, [OWNER], [], "File", attachments=[f"{drive}/{suffix}"],
+            request_id="bad-file",
+        )
     assert scalar(store, "SELECT COUNT(*) FROM messages") == 0
 
 
@@ -211,1010 +234,541 @@ def test_attachment_rejections_cover_outside_drive_invalid_owner_file_and_limit(
     ]
     for index, attachment in enumerate(bad_role[:2]):
         with pytest.raises(FirmError):
-            messaging.send(founder, [OWNER], "File", attachments=[attachment],
-                           request_id=f"outside-{index}")
+            messaging.send(
+                founder, [OWNER], [], "File", attachments=[attachment],
+                request_id=f"outside-{index}",
+            )
     with pytest.raises(FirmError, match="at most 10"):
-        messaging.send(founder, [OWNER], "File", attachments=bad_role,
-                       request_id="too-many")
+        messaging.send(founder, [OWNER], [], "File", attachments=bad_role, request_id="too-many")
     for index, attachment in enumerate(bad_owner):
         with pytest.raises(FirmError):
-            messaging.send(OWNER, [founder], "File", attachments=[attachment],
-                           request_id=f"owner-bad-{index}")
+            messaging.send(
+                OWNER, [founder], [], "File", attachments=[attachment],
+                request_id=f"owner-bad-{index}",
+            )
     assert scalar(store, "SELECT COUNT(*) FROM messages") == 0
 
 
-@pytest.mark.parametrize("already_dismissed", [False, True])
-def test_owner_reply_dismisses_once_with_its_receipt(mailroom, already_dismissed):
-    store, messaging, founder, _, now = mailroom
-    target = messaging.send(founder, [OWNER], "Question", request_id="question")["message_id"]
-    if already_dismissed:
-        messaging.dismiss(OWNER, [target], request_id="done")
-    now[0] += 10
-    result = messaging.reply(OWNER, target, "Answer", request_id="answer")
-    now[0] += 10
-    assert messaging.reply(OWNER, target, "Answer", request_id="answer") == result
+
+
+def message(messaging, actor, mid):
+    return messaging.read(actor, mid)["messages"][-1]
+
+
+def states(store, actor):
     with store.read() as db:
-        delivery = db.execute(
-            "SELECT disposition,disposition_at FROM message_deliveries "
-            "WHERE message_id=? AND employee_id=?",
-            (target, OWNER),
-        ).fetchone()
-        assert tuple(delivery) == ("dismissed", 1000 if already_dismissed else 1010)
-        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 2
-    with pytest.raises(FirmError, match="pending"):
-        messaging.dismiss(OWNER, [target], request_id="done-again")
+        return {r["message_id"]: r["disposition"] for r in db.execute(
+            "SELECT message_id,disposition FROM message_deliveries WHERE employee_id=?", (actor,)
+        )}
 
 
-def test_failed_owner_reply_rolls_back_delivery_message_and_receipt(mailroom, monkeypatch):
-    store, messaging, founder, _, _ = mailroom
-    target = messaging.send(founder, [OWNER], "Question", request_id="question")["message_id"]
-    write = messaging._write_disposition
-
-    def fail_after_dismiss(*args, **kwargs):
-        write(*args, **kwargs)
-        raise FirmError("injected reply failure")
-
-    monkeypatch.setattr(messaging, "_write_disposition", fail_after_dismiss)
-    with pytest.raises(FirmError, match="injected"):
-        messaging.reply(OWNER, target, "Answer", request_id="answer")
-    with store.read() as db:
-        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 1
-        assert (
-            db.execute(
-                "SELECT disposition FROM message_deliveries WHERE employee_id=?", (OWNER,)
-            ).fetchone()[0]
-            == "pending"
-        )
-        assert store.operation_result(db, OWNER, "answer") is None
-    monkeypatch.setattr(messaging, "_write_disposition", write)
-    assert messaging.reply(OWNER, target, "Answer", request_id="answer")["status"] == "sent"
-
-
-def test_role_reply_claims_target_and_notice_metadata_is_console_only(mailroom):
-    store, messaging, founder, (alice, *_), _ = mailroom
-    target = messaging.send(founder, [alice], "Question", request_id="question")["message_id"]
-    messaging.reply(alice, target, "Answer", request_id="answer")
-    with store.transaction() as db:
-        assert (
-            db.execute(
-                "SELECT disposition FROM message_deliveries WHERE message_id=? AND employee_id=?",
-                (target, alice),
-            ).fetchone()[0]
-            == "claimed"
-        )
-        notice = messaging.notice(
-            db, [alice], "Status", subject="Status", regarding={"kind": "request", "id": "q1"}
-        )
-        row = db.execute(
-            "SELECT * FROM messages WHERE message_id=?", (notice["message_id"],)
-        ).fetchone()
-        assert (row["regarding_kind"], row["regarding_id"]) == ("request", "q1")
-    assert "regarding" not in messaging.messages(alice, [notice["message_id"]])["messages"][0]
-
-
-@pytest.mark.parametrize("add", [False, True])
-def test_role_reply_claims_only_own_target_and_replay_preserves_time(mailroom, add):
-    store, messaging, founder, (alice, bob, carol, *_), now = mailroom
-    target = messaging.send(founder, [alice, bob], "Question", request_id="target")
-    sibling = messaging.send(founder, [alice, bob], "Also this", request_id="sibling")
-    messaging.messages(alice, [target["message_id"], sibling["message_id"]])
-    now[0] += 10
-    kwargs = {"add": [carol]} if add else {}
-    result = messaging.reply(alice, target["message_id"], "I will investigate.",
-                             request_id="answer", **kwargs)
-    now[0] += 10
-    assert messaging.reply(alice, target["message_id"], "I will investigate.",
-                           request_id="answer", **kwargs) == result
-    with store.read() as db:
-        rows = db.execute(
-            "SELECT message_id,employee_id,disposition,disposition_at "
-            "FROM message_deliveries WHERE message_id IN (?,?)",
-            (target["message_id"], sibling["message_id"]),
-        ).fetchall()
-    for row in rows:
-        claimed = row["message_id"] == target["message_id"] and row["employee_id"] == alice
-        assert row["disposition"] == ("claimed" if claimed else "pending")
-        assert row["disposition_at"] == (1010 if claimed else None)
-
-
-def test_failed_role_reply_rolls_back_claim_and_receipt(mailroom, monkeypatch):
-    store, messaging, founder, (alice, *_), _ = mailroom
-    target = messaging.send(founder, [alice], "Question", request_id="target")["message_id"]
-    write = messaging._write_disposition
-
-    def fail_after_claim(*args, **kwargs):
-        write(*args, **kwargs)
-        raise FirmError("injected reply failure")
-
-    monkeypatch.setattr(messaging, "_write_disposition", fail_after_claim)
-    with pytest.raises(FirmError, match="injected reply failure"):
-        messaging.reply(alice, target, "Answer", request_id="answer")
-    with store.read() as db:
-        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 1
-        assert db.execute(
-            "SELECT disposition FROM message_deliveries WHERE message_id=?", (target,),
-        ).fetchone()[0] == "pending"
-        assert store.operation_result(db, alice, "answer") is None
-
-
-def test_role_reply_with_no_deliverable_recipients_keeps_target_pending(mailroom):
-    store, messaging, founder, (alice, *_), _ = mailroom
-    target = messaging.send(alice, [founder], "Question", request_id="target")["message_id"]
-    with store.transaction() as db:
-        db.execute("UPDATE roles SET employment='retired' WHERE employee_id=?", (alice,))
-    result = messaging.reply(founder, target, "Answer", request_id="answer")
-    assert not result["queued"]
-    assert scalar(store, "SELECT disposition FROM message_deliveries WHERE message_id=?",
-                  (target,)) == "pending"
-
-
-@pytest.mark.parametrize(
-    ("reference", "employee_id"),
-    [("owner", "owner"), ("runtime", "runtime"), ("founder/alice", "e1"), ("e1", "e1")],
-)
-def test_send_uses_plain_references_for_all_recipients(mailroom, reference, employee_id):
-    _, messaging, founder, _, _ = mailroom
-    result = messaging.send(founder, [reference], "Review requested.", request_id="plain-address")
-    assert [person["employee_id"] for person in result["queued"]] == [employee_id]
-    assert result["failed"] == []
-
-    prefixed = messaging.send(
-        founder, [f"@{reference}"], "Review requested.", request_id="prefixed-address"
-    )
-    assert prefixed["queued"] == []
-    assert [person["reference"] for person in prefixed["failed"]] == [f"@{reference}"]
-
-
-def test_send_is_atomic_idempotent_and_preserves_intended_identity(mailroom):
-    store, messaging, founder, (alice, bob, *_), _ = mailroom
-    result = messaging.send(
-        founder,
-        [alice, "missing-role", alice],
-        "Please review the launch checklist.",
-        subject="Launch checklist review",
-        request_id="send-1",
-    )
-
-    assert result["message_id"] == "m1"
-    assert [item["employee_id"] for item in result["queued"]] == [alice]
-    assert result["failed"][0]["reference"] == "missing-role"
-    assert scalar(store, "SELECT COUNT(*) FROM scheduling_opportunities") == 1
-    retry = messaging.send(
-        founder,
-        [alice, "missing-role", alice],
-        "Please review the launch checklist.",
-        subject="Launch checklist review",
-        request_id="send-1",
-    )
-    assert retry == result
-    assert scalar(store, "SELECT COUNT(*) FROM messages") == 1
-    assert scalar(store, "SELECT COUNT(*) FROM scheduling_opportunities") == 1
-
-    with store.transaction() as db:
-        original = db.execute(
-            "SELECT address,identity FROM roles WHERE employee_id=?", (alice,)
-        ).fetchone()
-        db.execute(
-            "UPDATE roles SET address='renamed',identity='A new display name' WHERE employee_id=?",
-            (alice,),
-        )
-    envelope = messaging.messages(founder, ["m1"])["messages"][0]
-    queued = next(item for item in envelope["recipients"] if item["status"] == "queued")
-    assert (queued["address"], queued["identity"]) == tuple(original)
-    assert {participant.get("reference") for participant in envelope["participants"]} == {
-        None,
-        "missing-role",
-    }
-    with store.transaction() as db:
-        db.execute("UPDATE roles SET address='missing-role' WHERE employee_id=?", (bob,))
-    reply = messaging.reply(
-        founder,
-        result["message_id"],
-        "The unresolved reference must not become a recipient later.",
-        request_id="reply",
-    )
-    assert [item["employee_id"] for item in reply["queued"]] == [alice]
-
-
-def test_send_and_reply_results_render_queued_and_each_failed_recipient(mailroom):
-    store, messaging, founder, (alice, bob, carol, _), _ = mailroom
-    sent = messaging.send(
-        founder, [alice, bob, "founder/legal", "owner"], "Status?", request_id="render-send"
-    )
-    assert render_tool_result("send", sent) == (
-        "Message m1 queued for founder/alice, founder/bob and Owner.\n"
-        "Not delivered to founder/legal: no active or paused role at that address.\n"
-        "Use find_roles to find the intended recipient."
-    )
-
-    with store.transaction() as db:
-        db.execute("UPDATE roles SET employment='retired' WHERE employee_id=?", (bob,))
-    reply = messaging.reply(founder, "m1", "Following up.", request_id="render-reply")
-    rendered = render_tool_result("reply", reply)
-    assert rendered.startswith("Message m2 queued for founder/alice and Owner.\n")
-    assert "Not delivered to founder/bob: no active or paused role at that address." in rendered
-    assert rendered.endswith("Use find_roles to find the intended recipient.")
-
-    nobody = messaging.send(founder, ["founder/legal"], "Hello?", request_id="render-nobody")
-    assert render_tool_result("send", nobody).startswith("Message m3 was queued for no one.\n")
-    clean = messaging.send(founder, [carol], "Thanks.", request_id="render-clean")
-    assert render_tool_result("send", clean) == "Message m4 queued for founder/carol."
-
-
-def test_claim_and_dismiss_are_independent_atomic_and_read_only_lookup(mailroom):
-    store, messaging, founder, (alice, bob, *_), _ = mailroom
-    sent = messaging.send(founder, [alice, bob], "A shared request", request_id="send")
-    wakes = scalar(store, "SELECT COUNT(*) FROM scheduling_opportunities")
-    messaging.peek(alice)
-    assert scalar(store, "SELECT COUNT(*) FROM scheduling_opportunities") == wakes
-
-    claimed = messaging.claim(alice, [sent["message_id"]], request_id="claim")
-    assert claimed["messages"][0]["body"] == "A shared request"
-    assert messaging.claim(alice, [sent["message_id"]], request_id="claim") == claimed
-    assert messaging.dismiss(bob, [sent["message_id"]], request_id="dismiss") == {
-        "status": "dismissed",
-        "message_ids": [sent["message_id"]],
-    }
-    assert scalar(store, "SELECT COUNT(*) FROM scheduling_opportunities") == wakes - 2
-
-    exact = messaging.messages(bob, [sent["message_id"]])
-    assert exact["messages"][0]["body"] == "A shared request"
-    with store.read() as db:
-        states = db.execute(
-            "SELECT employee_id,disposition FROM message_deliveries ORDER BY employee_id"
-        ).fetchall()
-    assert {row["employee_id"]: row["disposition"] for row in states} == {
-        alice: "claimed",
-        bob: "dismissed",
-    }
-
-    second = messaging.send(founder, [alice], "Another request", request_id="send-2")
-    with pytest.raises(FirmError, match="every selected message"):
-        messaging.claim(alice, [second["message_id"], "m-does-not-exist"], request_id="bad")
-    assert (
-        scalar(
-            store,
-            "SELECT COUNT(*) FROM message_deliveries WHERE message_id=? AND disposition='pending'",
-            (second["message_id"],),
-        )
-        == 1
-    )
-
-
-def test_same_people_share_one_conversation_and_an_addition_starts_the_larger_one(mailroom):
-    store, messaging, founder, (alice, bob, carol, dave), _ = mailroom
-    opening = messaging.send(founder, [alice, bob], "Initial discussion", request_id="opening")
-    again = messaging.send(bob, [founder, alice], "Same people, new topic", request_id="again")
-    assert opening["conversation_id"] == again["conversation_id"] == "c1"
-
-    introduced = messaging.reply(
-        bob,
-        opening["message_id"],
-        "Bringing Carol into this discussion.",
-        add=[carol],
-        request_id="add-carol",
-    )
-    assert introduced["conversation_id"] == "c2" and introduced["continues"] == "c1"
-    assert {item["employee_id"] for item in introduced["queued"]} == {founder, alice, carol}
-    with store.read() as db:
-        row = db.execute("SELECT * FROM conversations WHERE conversation_id='c2'").fetchone()
-    assert row["continues"] == "c1"
-    assert {p["employee_id"] for p in json.loads(row["audience_json"])} == {
-        founder, alice, bob, carol
-    }
-
-    # The original three keep talking in c1; Carol never sees it.
-    findings = messaging.reply(
-        alice, opening["message_id"], "My findings.", request_id="findings"
-    )
-    assert findings["conversation_id"] == "c1" and "continues" not in findings
-    assert {item["employee_id"] for item in findings["queued"]} == {founder, bob}
-    assert messaging.peek(carol)["conversations"][0]["pending_count"] == 1
-
-    # Adding Carol again from c1 lands in the existing c2; adding Dave from c2 makes c3.
-    repeat = messaging.reply(
-        founder, again["message_id"], "Carol, see this too.", add=[carol], request_id="re-add"
-    )
-    assert repeat["conversation_id"] == "c2"
-    third = messaging.reply(
-        carol, introduced["message_id"], "And Dave.", add=[dave], request_id="add-dave"
-    )
-    assert third["conversation_id"] == "c3" and third["continues"] == "c2"
-    with pytest.raises(FirmError, match="member of this conversation"):
-        messaging.reply(dave, opening["message_id"], "I was never here.", request_id="outsider")
-    envelope = messaging.messages(dave, [third["message_id"]])["messages"][0]
-    assert envelope["conversation_id"] == "c3" and envelope["reply_to"] == introduced["message_id"]
-
-
-def test_peek_lists_conversations_with_waiting_headers_and_claims_nothing(mailroom):
-    store, messaging, founder, (alice, bob, *_), now = mailroom
-    first = messaging.send(alice, [bob], "Same topic", request_id="one")
-    now[0] += 5
-    second = messaging.send(alice, [bob], "Another topic", request_id="two")
-    owner = messaging.send(OWNER, [bob], "Owner request", request_id="owner")
-    with store.transaction() as db:
-        operations = messaging.notice(
-            db, [bob], "An informational runtime notice.", subject="Runtime information note"
-        )
-
-    overview = messaging.peek(bob)
-    assert overview["pending_count"] == 4
-    assert overview["seen_sequence"] == 4
-    rows = overview["conversations"]
-    # Operations first, then the owner, then the longest-waiting conversation.
-    assert [row["participants"][0]["employee_id"] for row in rows] == [OPERATIONS, OWNER, alice]
-    assert [h["message_id"] for h in rows[0]["waiting"]] == [operations["message_id"]]
-    assert [h["message_id"] for h in rows[1]["waiting"]] == [owner["message_id"]]
-    assert [h["message_id"] for h in rows[2]["waiting"]] == [
-        first["message_id"],
-        second["message_id"],
-    ]
-    assert [h["subject"] for h in rows[2]["waiting"]] == ["Same topic", "Another topic"]
-    assert rows[2]["pending_count"] == 2 and rows[2]["oldest_age_seconds"] == 5
-    assert rows[2]["participant_count"] == 2 and rows[2]["waiting_omitted"] == 0
-    rendered = render_tool_result("peek", overview)
-    assert f"- {rows[2]['conversation_id']} · with founder/alice ({alice}) · 2 waiting" in rendered
-    assert "seen_sequence" not in rendered
-    with pytest.raises(FirmError, match="invalid inbox cursor"):
-        messaging.peek(bob, cursor="999")
-    assert scalar(store, "SELECT COUNT(*) FROM message_deliveries WHERE disposition='pending'") == 4
-
-
-def test_peek_abbreviates_large_identity_metadata_and_keeps_exact_source(mailroom):
-    store, messaging, _, (alice, bob, *_), _ = mailroom
-    large = "😀" * 3_500
-    with store.transaction() as db:
-        db.execute(
-            "UPDATE roles SET address=?,identity=? WHERE employee_id=?",
-            (large, large, alice),
-        )
-    sent = messaging.send(alice, [bob], "bounded overview", request_id="large-identity")
-
-    overview = messaging.peek(bob)
-    conversation = overview["conversations"][0]
-    assert len(json.dumps(overview, ensure_ascii=False).encode()) <= 16 * 1024
-    assert conversation["waiting"][0]["message_id"] == sent["message_id"]
-    assert conversation["participant_count"] == 2
-    assert all(person["identity"].endswith("…") for person in conversation["participants"])
-    exact = messaging.messages(bob, [sent["message_id"]])["messages"][0]
-    assert any(person.get("identity") == large for person in exact["participants"])
-
-
-def test_byte_bounded_peek_pages_list_every_conversation_once(mailroom):
-    store, messaging, founder, (alice, bob, carol, dave), _ = mailroom
-    subject = "😀" * 80
-    others = [founder, alice, carol, dave]
-    expected = set()
-    for bits in range(1, 16):
-        members = [person for index, person in enumerate(others) if bits & (1 << index)]
-        for index in range(5):
-            result = messaging.send(
-                members[0],
-                [bob, *members[1:]],
-                f"Message {index}",
-                subject=subject,
-                request_id=f"send-{bits}-{index}",
-            )
-            expected.add(result["conversation_id"])
-    assert len(expected) == 15
-
-    cursor = None
-    seen = []
-    pages = 0
-    while True:
-        page = messaging.peek(bob, cursor=cursor)
-        assert len(encoded(page).encode()) <= MAX_PEEK_BYTES
-        seen.extend(row["conversation_id"] for row in page["conversations"])
-        assert all(row["pending_count"] == 5 for row in page["conversations"])
-        pages += 1
-        # Only the page that reaches the end fixes what a later clear may set aside.
-        assert (page["seen_sequence"] is None) == (page["next_cursor"] is not None)
-        if page["next_cursor"] is None:
-            break
-        assert len(page["next_cursor"]) <= 512
-        cursor = page["next_cursor"]
-    assert pages > 1
-    assert len(seen) == len(set(seen)) == 15 and set(seen) == expected
-
-
-def test_peek_cursor_keeps_coverage_across_claims_and_post_snapshot_arrivals(mailroom):
-    store, messaging, founder, (alice, bob, carol, dave), _ = mailroom
-    senders = [founder, alice, carol, dave]
-    sent = {}
-    first_original = None
-    for bits in range(1, 16):
-        members = [person for index, person in enumerate(senders) if bits & (1 << index)]
-        result = messaging.send(
-            members[0], [bob, *members[1:]], f"Message {bits}", request_id=f"original-{bits}"
-        )
-        sent[result["conversation_id"]] = result
-        if bits == 1:
-            first_original = result
-    activation(store, bob, "page-activation")
-    extra_old_message = messaging.send(
-        founder, [bob], "Same thread, second waiting message", request_id="same-thread-old"
-    )
-    assert extra_old_message["conversation_id"] == first_original["conversation_id"]
-
-    first = messaging.peek(bob, limit=1)
-    first_ids = [item["conversation_id"] for item in first["conversations"]]
-    claimed_id = first_ids[0]
-    claimed_message = sent[claimed_id]["message_id"]
-    messaging.claim(bob, [claimed_message], request_id="claim-before-next-page")
-    late = messaging.send(
-        founder,
-        [bob],
-        "Arrived after the first page",
-        request_id="after-snapshot",
-    )
-    assert late["conversation_id"] == claimed_id
-    late_owner = messaging.send(OWNER, [bob], "Owner priority arrival", request_id="owner-late")
-    with store.transaction() as db:
-        late_operations = messaging.notice(
-            db, [bob], "Operations priority arrival", subject="Operations late"
-        )
-
-    seen = list(first_ids)
-    cursor = first["next_cursor"]
-    while cursor is not None:
-        page = messaging.peek(bob, cursor=cursor, limit=1)
-        seen.extend(item["conversation_id"] for item in page["conversations"])
-        cursor = page["next_cursor"]
-        if cursor is None:
-            assert page["seen_sequence"] is not None
-            with store.transaction() as db:
-                db.execute(
-                    "UPDATE activations SET inbox_seen_sequence=? "
-                    "WHERE activation_id='page-activation'",
-                    (page["seen_sequence"],),
-                )
-
-    assert len(seen) > len(set(seen))  # Removing the oldest row may move a shown thread later.
-    assert set(seen) == set(sent)
-    cleared = messaging.clear(
-        bob, request_id="clear-after-traversal", activation_id="page-activation"
-    )
-    cleared_ids = {
-        message_id for row in cleared["conversations"] for message_id in row["message_ids"]
-    }
-    assert claimed_message not in cleared_ids
-    assert extra_old_message["message_id"] in cleared_ids
-    assert late["message_id"] not in cleared_ids
-    assert late_owner["message_id"] not in cleared_ids
-    assert late_operations["message_id"] not in cleared_ids
-    assert scalar(
-        store,
-        "SELECT disposition FROM message_deliveries WHERE employee_id=? AND message_id=?",
-        (bob, claimed_message),
-    ) == "claimed"
-    assert scalar(
-        store,
-        "SELECT disposition FROM message_deliveries WHERE employee_id=? AND message_id=?",
-        (bob, late["message_id"]),
-    ) == "pending"
-    assert scalar(
-        store,
-        "SELECT disposition FROM message_deliveries WHERE employee_id=? AND message_id=?",
-        (bob, late_owner["message_id"]),
-    ) == "pending"
-    assert scalar(
-        store,
-        "SELECT disposition FROM message_deliveries WHERE employee_id=? AND message_id=?",
-        (bob, late_operations["message_id"]),
-    ) == "pending"
-
-
-def test_inbox_cursor_is_actor_scoped_signed_and_replay_safe(mailroom):
-    store, messaging, founder, (alice, bob, carol, *_), _ = mailroom
-    for index, sender in enumerate((founder, alice, carol)):
-        messaging.send(sender, [bob], f"Mail {index}", request_id=f"cursor-mail-{index}")
-    page = messaging.peek(bob, limit=1)
-    cursor = page["next_cursor"]
-    assert cursor
-    replay_one = messaging.peek(bob, cursor=cursor, limit=1)
-    replay_two = messaging.peek(bob, cursor=cursor, limit=1)
-    assert replay_one == replay_two
-    with pytest.raises(FirmError, match="invalid inbox cursor"):
-        messaging.peek(alice, cursor=cursor)
-    tampered = cursor[:-1] + ("A" if cursor[-1] != "A" else "B")
-    with pytest.raises(FirmError, match="invalid inbox cursor"):
-        messaging.peek(bob, cursor=tampered)
-    with pytest.raises(FirmError, match="invalid inbox cursor"):
-        messaging.peek(bob, cursor="x" * 513)
-
-    activation(store, bob, "old-activation")
-    bound_page = messaging.peek(bob, activation_id="old-activation", limit=1)
-    bound_cursor = bound_page["next_cursor"]
-    assert bound_cursor
-    with store.transaction() as db:
-        db.execute("UPDATE activations SET state='completed' WHERE activation_id='old-activation'")
-    activation(store, bob, "new-activation")
-    with pytest.raises(FirmError, match="invalid inbox cursor"):
-        messaging.peek(bob, cursor=bound_cursor, activation_id="new-activation")
-
-
-def test_empty_peek_is_a_complete_single_page(mailroom):
-    _, messaging, _, (_, bob, *_), _ = mailroom
-    page = messaging.peek(bob)
-    assert page["conversations"] == []
-    assert page["pending_count"] == 0
-    assert page["next_cursor"] is None
-    assert page["seen_sequence"] == 0
-
-
-def test_claim_by_conversation_reads_what_fits_oldest_first_and_reports_the_rest(mailroom):
-    store, messaging, _, (alice, bob, *_), _ = mailroom
-    expected = [
-        messaging.send(alice, [bob], "x" * 6_000, request_id=f"big-{index}")["message_id"]
-        for index in range(120)
-    ]
-    conversation = expected and messaging.peek(bob)["conversations"][0]
-    assert conversation["waiting_omitted"] == 115
-    read = []
-    calls = 0
-    while True:
-        result = messaging.claim(
-            bob, conversation=conversation["conversation_id"], request_id=f"claim-{calls}"
-        )
-        calls += 1
-        if result["status"] != "claimed":
-            assert result == {"status": "nothing_claimed", "reason": "nothing_waiting"}
-            break
-        assert len(encoded(result).encode()) <= MAX_RESULT_BYTES
-        assert result["conversation_id"] == conversation["conversation_id"]
-        ids = [message["message_id"] for message in result["messages"]]
-        assert result["remaining"] == 120 - len(read) - len(ids)
-        read.extend(ids)
-    assert read == expected and calls > 2
-    with pytest.raises(FirmError, match="either message_ids or a conversation"):
-        messaging.claim(bob, [expected[0]], conversation="c1", request_id="both")
-    with pytest.raises(FirmError, match="unknown conversation"):
-        messaging.dismiss(bob, conversation="c99", request_id="missing")
-
-
-def test_conversation_claim_budget_includes_its_pagination_metadata(mailroom, monkeypatch):
-    import firm_runtime.messaging as messaging_module
-
-    _, messaging, founder, (alice, *_), _ = mailroom
-    sent = [
-        messaging.send(founder, [alice], f"Body {index}", request_id=f"send-{index}")
-        for index in range(2)
-    ]
-    ids = [item["message_id"] for item in sent]
-    conversation_id = sent[0]["conversation_id"]
-    envelopes = messaging.messages(alice, ids)["messages"]
-    envelope_only_size = len(encoded({"status": "claimed", "messages": envelopes}).encode())
-    monkeypatch.setattr(messaging_module, "MAX_RESULT_BYTES", envelope_only_size)
-
-    result = messaging.claim(alice, conversation=conversation_id, request_id="claim")
-
-    assert [item["message_id"] for item in result["messages"]] == ids[:1]
-    assert result["remaining"] == 1
-    assert len(encoded(result).encode()) <= envelope_only_size
-
-
-def activation(store, employee_id, activation_id, *, seen=None):
-    with store.transaction() as db:
-        db.execute(
-            "INSERT INTO activations(activation_id,employee_id,session_id,state,wake_snapshot,"
-            "context_json,created_at,inbox_seen_sequence) "
-            "VALUES(?,?,'s','running','[]','{}',1000,?)",
-            (activation_id, employee_id, seen),
-        )
-
-
-def test_clear_and_conversation_dismiss_cover_only_what_the_last_peek_could_show(mailroom):
-    store, messaging, founder, (alice, bob, *_), _ = mailroom
-    early = [
-        messaging.send(alice, [bob], f"early {index}", request_id=f"early-{index}")
-        for index in range(2)
-    ]
-    from_founder = messaging.send(founder, [bob], "also early", request_id="founder")
-    activation(store, bob, "a1")
-    assert messaging.clear(bob, request_id="too-soon", activation_id="a1") == {
-        "status": "nothing_cleared",
-        "reason": "no_peek",
-    }
-    # The peek's seen_sequence is what the runtime records on the activation.
-    seen = messaging.peek(bob)["seen_sequence"]
-    with store.transaction() as db:
-        db.execute("UPDATE activations SET inbox_seen_sequence=? WHERE activation_id='a1'", (seen,))
-    late = messaging.send(alice, [bob], "after the peek", request_id="late")
-
-    cleared = messaging.clear(bob, request_id="clear", activation_id="a1")
-    assert cleared == {
-        "status": "cleared",
-        "count": 3,
-        "conversations": [
-            {
-                "conversation_id": early[0]["conversation_id"],
-                "message_ids": [m["message_id"] for m in early],
-            },
-            {
-                "conversation_id": from_founder["conversation_id"],
-                "message_ids": [from_founder["message_id"]],
-            },
-        ],
-    }
-    assert messaging.clear(bob, request_id="clear", activation_id="a1") == cleared
-    pending = messaging.peek(bob)["conversations"]
-    assert [h["message_id"] for row in pending for h in row["waiting"]] == [late["message_id"]]
-    assert messaging.clear(bob, request_id="clear-2", activation_id="a1") == {
-        "status": "nothing_cleared",
-        "reason": "nothing_waiting",
-    }
-
-    # Dismissing a conversation is bounded the same way; claiming it is not.
-    dismissed = messaging.dismiss(
-        bob, conversation=late["conversation_id"], request_id="dismiss", activation_id="a1"
-    )
-    assert dismissed == {"status": "nothing_dismissed", "reason": "nothing_waiting"}
-    claimed = messaging.claim(
-        bob, conversation=late["conversation_id"], request_id="claim", activation_id="a1"
-    )
-    assert [m["message_id"] for m in claimed["messages"]] == [late["message_id"]]
-    assert claimed["remaining"] == 0
-    with pytest.raises(FirmError, match="does not authorize"):
-        messaging.clear(alice, request_id="wrong-role", activation_id="a1")
-    # The owner has no work period and no peek marker, so no bound applies.
-    to_owner = messaging.send(alice, [OWNER], "For the owner", request_id="to-owner")
-    assert messaging.dismiss(
-        OWNER, conversation=to_owner["conversation_id"], request_id="owner-dismiss"
-    ) == {
-        "status": "dismissed",
-        "message_ids": [to_owner["message_id"]],
-        "conversation_id": to_owner["conversation_id"],
-    }
-
-
-class RecordingSummaries:
-    def __init__(self, outcome):
-        self.outcome = outcome
-        self.snapshots = []
-
-    def summarize(self, snapshot, *, caller_session_id=None):
-        self.snapshots.append((snapshot, caller_session_id))
-        return dict(self.outcome)
-
-
-def test_cut_off_summary_reaches_new_participant_and_context_unchanged(mailroom):
-    store, messaging, founder, (alice, bob, carol, _), _ = mailroom
-
+def summary_provider(messaging, callback=None, text="Derived: the author asks for a decision."):
     class Runner:
         def start(self, request):
             return request
 
         def wait(self, handle, timeout):
-            return SummaryOutput("é界🙂" * 2000, output_tokens=1_000_000)
+            return SummaryOutput(text)
 
         def stop(self, handle):
             return True
 
-    messaging.summary_service = SummaryService(Runner(), store=store)
-    opening = messaging.send(founder, [alice, bob], "First ask", request_id="opening")
-    introduced = messaging.reply(
-        bob, opening["message_id"], "Carol, joining you in.", add=[carol],
-        summarize=True, request_id="intro",
-    )
-    assert introduced["summary"] == {"status": "attached", "truncated": True}
-    assert messaging.reply(
-        bob, opening["message_id"], "Carol, joining you in.", add=[carol],
-        summarize=True, request_id="intro",
-    ) == introduced
-    claimed = messaging.claim(carol, [introduced["message_id"]], request_id="read")
-    delivered = claimed["messages"][0]["summary"]
-    context = messaging.context(carol, introduced["conversation_id"])
-    assert context["status"] == "summarized"
-    assert context["truncated"] is True
-    assert context["summary"] == delivered
-    assert delivered.endswith(
-        "\n[THIS SUMMARY WAS CUT OFF at 16 KiB; the rest was not delivered.]"
-    )
-    assert len(delivered.encode("utf-8")) <= MAX_SUMMARY_TEXT_BYTES
-    assert delivered in render_tool_result("claim", claimed)
-    assert delivered in render_tool_result("context", context)
+    class Service(SummaryService):
+        def summarize(self, snapshot, **kwargs):
+            if callback:
+                callback(snapshot)
+            return super().summarize(snapshot, **kwargs)
+
+    messaging.summary_service = Service(provider=Runner())
+
+
+def test_thread_creation_and_immutable_subject(mailroom):
+    store, mail, founder, (alice, bob, *_), _ = mailroom
+    a = mail.send(founder, [alice], [], "First", request_id="a")
+    b = mail.send(alice, [], [founder], "Second", request_id="b")
+    assert a["conversation_id"] == b["conversation_id"]
+    named = [mail.send(founder, [alice], [], "Topic", subject="Fixed", request_id=f"n{i}")
+             for i in range(2)]
+    assert len({r["conversation_id"] for r in [a, *named]}) == 3
+    reply = mail.reply(alice, named[0]["message_id"], [], "Answer", request_id="r")
+    assert reply["conversation_id"] == named[0]["conversation_id"]
+    assert message(mail, founder, reply["message_id"])["subject"] == "Fixed"
+    assert message(mail, founder, a["message_id"])["subject"] is None
     with store.read() as db:
-        assert db.execute("SELECT summary FROM messages WHERE message_id=?", (
-            introduced["message_id"],
-        )).fetchone()[0] == delivered
-        runs = db.execute("SELECT state,output_tokens,reason FROM summary_runs").fetchall()
-    assert [tuple(run) for run in runs] == [("summarized", 1_000_000, None)] * 2
+        assert db.execute("SELECT COUNT(*) FROM conversations WHERE audience_key IN "
+                          "(SELECT audience_key FROM conversations WHERE conversation_id=?) "
+                          "AND subject IS NULL", (a["conversation_id"],)).fetchone()[0] == 1
 
 
-def test_introduction_carries_a_derived_summary_once_and_context_follows_continues(mailroom):
-    store, messaging, founder, (alice, bob, carol, _), _ = mailroom
-    summaries = RecordingSummaries({"status": "summarized", "summary": "Derived: two asks."})
-    messaging.summary_service = summaries
-    opening = messaging.send(founder, [alice, bob], "First ask", request_id="opening")
-    messaging.reply(alice, opening["message_id"], "Second ask", request_id="second")
-    with pytest.raises(FirmError, match="summarize applies only"):
-        messaging.reply(
-            bob, opening["message_id"], "No newcomer.", summarize=True, request_id="plain"
-        )
-    assert summaries.snapshots == []
-
-    introduced = messaging.reply(
-        bob,
-        opening["message_id"],
-        "Carol, joining you in.",
-        add=[carol],
-        summarize=True,
-        request_id="intro",
-        session_id="bob-session",
-    )
-    assert introduced["summary"] == {"status": "attached"}
-    assert introduced["continues"] == opening["conversation_id"]
-    snapshot, session = summaries.snapshots[0]
-    assert session == "bob-session"
-    assert snapshot.conversation_id == opening["conversation_id"]
-    assert snapshot.source_message_ids == ("m1", "m2")
-    retry = messaging.reply(
-        bob,
-        opening["message_id"],
-        "Carol, joining you in.",
-        add=[carol],
-        summarize=True,
-        request_id="intro",
-        session_id="bob-session",
-    )
-    assert retry == introduced and len(summaries.snapshots) == 1
-
-    received = messaging.claim(carol, [introduced["message_id"]], request_id="read")["messages"][0]
-    assert received["body"] == "Carol, joining you in."
-    assert received["summary"] == "Derived: two asks."
-    rendered = render_tool_result("reply", introduced)
-    assert "continues c1" in rendered and "derived summary" in rendered.lower()
-
-    # Context on the new conversation reaches back into the one it continues.
-    messaging.context(carol, introduced["conversation_id"])
-    snapshot, _ = summaries.snapshots[-1]
-    assert snapshot.conversation_id == introduced["conversation_id"]
-    assert snapshot.source_message_ids == ("m1", "m2", introduced["message_id"])
-    assert snapshot.matching_count == 3
-    # The conversation's own messages come before its history, however much newer the
-    # history is: the original three keep talking, and the introduction still makes the cut.
-    for index in range(60):
-        messaging.reply(founder, opening["message_id"], f"Later {index}", request_id=f"l{index}")
-    messaging.context(carol, introduced["conversation_id"])
-    snapshot, _ = summaries.snapshots[-1]
-    assert introduced["message_id"] in snapshot.source_message_ids
-    assert len(snapshot.source_message_ids) == 50 and snapshot.matching_count == 63
-    assert list(snapshot.source_message_ids) == sorted(
-        snapshot.source_message_ids, key=lambda m: int(m[1:], 36)
-    )
-    with pytest.raises(FirmError, match="unknown conversation"):
-        messaging.context(carol, "c9")
-
-    summaries.outcome = {"status": "unavailable", "reason": "busy"}
-    without = messaging.reply(
-        carol, introduced["message_id"], "Dave too.", add=["founder/dave"], summarize=True,
-        request_id="no-summary",
-    )
-    assert without["summary"] == {"status": "unavailable", "reason": "busy"}
-    assert "summary" not in messaging.messages(carol, [without["message_id"]])["messages"][0]
-    assert "unavailable (busy)" in render_tool_result("reply", without)
-
-
-def test_near_limit_envelope_is_accepted_and_claimable_alone(mailroom):
-    store, messaging, _, (alice, bob, *_), _ = mailroom
-    width = 7_100
-    with store.transaction() as db:
-        db.execute(
-            "UPDATE roles SET address=?,identity=? WHERE employee_id=?",
-            ("a" * width, "A" * width, alice),
-        )
-        db.execute(
-            "UPDATE roles SET address=?,identity=? WHERE employee_id=?",
-            ("b" * width, "B" * width, bob),
-        )
-    sent = messaging.send(alice, [bob], "near the envelope limit", request_id="near-limit")
-    claimed = messaging.claim(bob, [sent["message_id"]], request_id="claim-near-limit")
-    rendered = json.dumps(claimed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    assert MAX_RESULT_BYTES - 3 * 1024 < len(rendered.encode()) <= MAX_RESULT_BYTES
-
-
-def test_retirement_marks_only_pending_delivery_and_emits_one_bounce(mailroom):
-    store, messaging, founder, (alice, bob, *_), _ = mailroom
-    sent = messaging.send(founder, [alice, bob], "Please coordinate", request_id="send")
-    with store.transaction() as db:
-        db.execute("UPDATE roles SET employment='retired' WHERE employee_id=?", (alice,))
-        db.execute("DELETE FROM execution_requests WHERE employee_id=?", (alice,))
-        result = messaging.retire(db, alice)
-        repeated = messaging.retire(db, alice)
-    assert result["undeliverable"] == 1
-    assert repeated["undeliverable"] == 0
-    assert len(result["bounces"]) == 1
-    assert scalar(store, "SELECT COUNT(*) FROM delivery_bounces") == 1
+def test_send_lists_are_explicit_disjoint_by_person_and_schedule_only_action(mailroom):
+    store, mail, founder, (alice, bob, *_), _ = mailroom
+    with pytest.raises(TypeError):
+        mail.send(founder, [alice], "Missing FYI", request_id="missing")
+    for actions, fyi in [([], []), ([alice], ["founder/alice"]), (None, [alice])]:
+        with pytest.raises(FirmError):
+            mail.send(founder, actions, fyi, "Invalid", request_id=str(actions))
+    action = mail.send(founder, [alice, "founder/alice", alice], [bob], "Act", request_id="act")
+    quiet = mail.send(founder, [], [alice], "FYI", request_id="quiet")
     with store.read() as db:
-        states = db.execute(
-            "SELECT employee_id,disposition FROM message_deliveries WHERE message_id=?",
-            (sent["message_id"],),
-        ).fetchall()
-        bounce = db.execute(
-            "SELECT author_id,body FROM messages WHERE message_id=?", (result["bounces"][0],)
-        ).fetchone()
-    assert {row["employee_id"]: row["disposition"] for row in states} == {
-        alice: "undeliverable",
-        bob: "pending",
+        rows = db.execute("SELECT employee_id,scheduling_ready_at FROM message_deliveries "
+                          "WHERE message_id=?", (action["message_id"],)).fetchall()
+        assert {r["employee_id"]: r["scheduling_ready_at"] is not None for r in rows} == {
+            alice: True, bob: False,
+        }
+        assert db.execute("SELECT scheduling_ready_at FROM message_deliveries WHERE message_id=?",
+                          (quiet["message_id"],)).fetchone()[0] is None
+    assert len(action["queued"]) == 2
+
+
+def test_reply_inherits_audience_fresh_action_and_does_not_read(mailroom):
+    store, mail, founder, (alice, bob, carol, *_), _ = mailroom
+    target = mail.send(founder, [alice], [bob], "Question", subject="Topic", request_id="target")
+    with pytest.raises(TypeError):
+        mail.reply(alice, target["message_id"], body="Missing action", request_id="missing")
+    with pytest.raises(FirmError, match="recipient"):
+        mail.reply(alice, target["message_id"], [carol], "Bad", request_id="bad")
+    reply = mail.reply(alice, target["message_id"], [bob], "Answer", request_id="reply")
+    assert states(store, alice)[target["message_id"]] == "pending"
+    assert {r["employee_id"]: r["action_required"] for r in reply["queued"]} == {
+        founder: False, bob: True,
     }
-    assert bounce["author_id"] == OPERATIONS
-    assert sent["message_id"] in bounce["body"]
+    assert message(mail, founder, reply["message_id"])["subject"] == "Topic"
+    assert reply["conversation_id"] == target["conversation_id"]
 
 
-def test_recent_claims_uses_claim_order_at_equal_timestamps(mailroom):
-    store, messaging, founder, (alice, *_), _ = mailroom
-    first = messaging.send(founder, [alice], "First sent", request_id="send-1")
-    second = messaging.send(founder, [alice], "Second sent", request_id="send-2")
-    with store.transaction() as db:
-        db.execute(
-            "INSERT INTO activations(activation_id,employee_id,session_id,state,wake_snapshot,"
-            "context_json,created_at) VALUES('a1',?,?,'running','[]','{}',1000)",
-            (alice, "session"),
-        )
-    messaging.claim(alice, [second["message_id"]], request_id="claim-2", activation_id="a1")
-    with store.transaction() as db:
-        db.execute("UPDATE activations SET state='completed' WHERE activation_id='a1'")
-        db.execute(
-            "INSERT INTO activations(activation_id,employee_id,session_id,state,wake_snapshot,"
-            "context_json,created_at) VALUES('a2',?,?,'running','[]','{}',1000)",
-            (alice, "session"),
-        )
-    messaging.claim(alice, [first["message_id"]], request_id="claim-1", activation_id="a2")
-
-    with store.read() as db:
-        recent = messaging.recent_claims(db, alice, "session")
-    assert [item["message_id"] for item in recent] == [
-        first["message_id"],
-        second["message_id"],
-    ]
-    assert all(set(item) == {"message_id", "subject", "claimed_at"} for item in recent)
-
-
-@pytest.mark.parametrize("operation", ["claim", "reply"])
-def test_claim_retry_from_a_later_activation_keeps_original_claim_record(mailroom, operation):
-    store, messaging, founder, (alice, *_), _ = mailroom
-    sent = messaging.send(founder, [alice], "Retry this claim", request_id="send")
-    with store.transaction() as db:
-        db.execute(
-            "INSERT INTO activations(activation_id,employee_id,session_id,state,wake_snapshot,"
-            "context_json,created_at) VALUES('a1',?,?,'running','[]','{}',1000)",
-            (alice, "first-session"),
-        )
-    def act(activation_id):
+@pytest.mark.parametrize("operation", ["read", "dismiss", "clear", "reply", "introduce"])
+def test_thread_operations_share_participant_authorization(mailroom, operation):
+    _, mail, founder, (alice, bob, carol, *_), _ = mailroom
+    target = mail.send(founder, [alice], [], "Private", request_id="private")
+    def call(mid):
         if operation == "reply":
-            return messaging.reply(
-                alice, sent["message_id"], "Acknowledged, still working.",
-                request_id="same-reply", activation_id=activation_id,
-            )
-        return messaging.claim(
-            alice, [sent["message_id"]], request_id="same-claim", activation_id=activation_id,
-        )
+            return mail.reply(bob, mid, [], "No", request_id="reply")
+        if operation == "introduce":
+            return mail.introduce(bob, mid, [carol], [], False, "No", request_id="intro")
+        return getattr(mail, operation)(bob, mid)
+    with pytest.raises(FirmError, match="not a participant in that message's thread"):
+        call(target["message_id"])
+    with pytest.raises(FirmError, match="unknown message ID"):
+        call("munknown")
 
-    original = act("a1")
+
+@pytest.mark.parametrize("subject", [None, "Named"])
+def test_introduce_expands_group_and_leaves_source_unread(mailroom, subject):
+    store, mail, founder, (alice, bob, *_), _ = mailroom
+    source = mail.send(founder, [alice], [], "Source", subject=subject, request_id="source")
+    expanded = mail.send(founder, [], [alice, bob], "Earlier", request_id="expanded")
+    result = mail.introduce(alice, source["message_id"], [bob], [bob], False,
+                            "Join us", request_id="intro")
+    if subject is None:
+        assert result["conversation_id"] == expanded["conversation_id"]
+        assert result["continues"] is None
+    else:
+        assert result["conversation_id"] != expanded["conversation_id"]
+        assert result["continues"] == source["conversation_id"]
+    assert states(store, alice)[source["message_id"]] == "pending"
+    assert message(mail, bob, result["message_id"])["subject"] == subject
+    with pytest.raises(FirmError, match="participant"):
+        mail.read(bob, source["message_id"])
+
+
+def test_introduce_new_no_subject_group_records_continues_once(mailroom):
+    store, mail, founder, (alice, bob, *_), _ = mailroom
+    source = mail.send(founder, [alice], [], "Source", request_id="source")
+    a = mail.introduce(alice, source["message_id"], [bob], [], False, "Join", request_id="a")
+    b = mail.introduce(alice, source["message_id"], [bob], [], False, "Again", request_id="b")
+    assert a["conversation_id"] == b["conversation_id"]
+    assert a["continues"] == b["continues"] == source["conversation_id"]
+
+
+@pytest.mark.parametrize("add,reason", [
+    (["founder"], "use reply"), (["missing"], "unknown or retired"), ([], "nonempty"),
+])
+def test_introduce_requires_someone_new(mailroom, add, reason):
+    store, mail, founder, (alice, *_), _ = mailroom
+    source = mail.send(founder, [alice], [], "Source", request_id="source")
+    count = scalar(store, "SELECT COUNT(*) FROM messages")
+    with pytest.raises(FirmError, match=reason):
+        mail.introduce(alice, source["message_id"], add, [], False, "No", request_id="intro")
+    assert scalar(store, "SELECT COUNT(*) FROM messages") == count
+
+
+def test_introduction_summary_outside_transaction_attributed_before_body_and_replayed(mailroom):
+    store, mail, founder, (alice, bob, *_), _ = mailroom
+    source = mail.send(founder, [alice], [], "Source", subject="Topic", request_id="source")
+    calls = []
+    def check(snapshot):
+        with store.transaction() as db:
+            db.execute("UPDATE firm SET initial_mandate=initial_mandate")
+        calls.append(snapshot.source_message_ids)
+    summary_provider(mail, check)
+    result = mail.introduce(alice, source["message_id"], [bob], [], True,
+                            "Introduction body", request_id="intro")
+    assert mail.introduce(alice, source["message_id"], [bob], [], True,
+                          "Introduction body", request_id="intro") == result
+    assert calls == [(source["message_id"],)]
+    read = mail.read(bob, result["message_id"])
+    text = render_tool_result("read", read)
+    assert text.index("generated by Operations at the sender") < text.index("Introduction body")
+    assert "not an Operations instruction" in text
+    assert read["messages"][0]["summary"].startswith("Derived:")
+    assert states(store, alice)[source["message_id"]] == "pending"
+
+
+def test_unavailable_introduction_sends_nothing_and_can_retry(mailroom):
+    store, mail, founder, (alice, bob, *_), _ = mailroom
+    source = mail.send(founder, [alice], [], "Source", request_id="source")
+    count = scalar(store, "SELECT COUNT(*) FROM messages")
+    with pytest.raises(FirmError, match="Call again.*summarize=False"):
+        mail.introduce(alice, source["message_id"], [bob], [], True, "Join", request_id="intro")
+    assert scalar(store, "SELECT COUNT(*) FROM messages") == count
+    assert scalar(store, "SELECT COUNT(*) FROM requests WHERE request_id='intro'") == 0
+    summary_provider(mail)
+    assert mail.introduce(alice, source["message_id"], [bob], [], True,
+                          "Join", request_id="intro")["status"] == "sent"
+
+
+def test_cut_off_introduction_summary_is_available(mailroom):
+    _, mail, founder, (alice, bob, *_), _ = mailroom
+    source = mail.send(founder, [alice], [], "Source", request_id="source")
+    summary_provider(mail, text="界" * MAX_SUMMARY_TEXT_BYTES)
+    result = mail.introduce(alice, source["message_id"], [bob], [], True,
+                            "Join", request_id="intro")
+    assert result["summary"]["truncated"]
+    assert message(mail, bob, result["message_id"])["summary"].endswith(SUMMARY_TRUNCATION_MARKER)
+
+
+def test_peek_groups_threads_aggregates_action_and_advances_offered_prefix(mailroom):
+    store, mail, founder, (alice, bob, *_), _ = mailroom
+    first = mail.send(founder, [alice], [], "Act", request_id="act")
+    latest = mail.send(founder, [], [alice], "Latest\npreview", request_id="fyi")
+    named = mail.send(founder, [], [alice], "Hidden body", subject="Topic", request_id="named")
+    result = mail.peek(alice)
+    assert result["unread_count"] == 3 and result["thread_count"] == 2
+    entry, topic = result["threads"]
+    assert entry["message_id"] == latest["message_id"]
+    assert entry["unread_count"] == 2 and entry["action_required"]
+    assert entry["preview"] == "Latest preview"
+    assert entry["last_author"]["employee_id"] == founder
+    assert "preview" not in topic
+    assert topic["message_id"] == named["message_id"]
+    assert topic["last_author"]["employee_id"] == founder
+    assert result["newest_message_id"] == named["message_id"]
+    assert states(store, alice)[first["message_id"]] == "pending"
+    assert scalar(store, "SELECT last_offered_message_sequence FROM roles WHERE employee_id=?",
+                  (alice,)) == scalar(store, "SELECT sequence FROM messages WHERE message_id=?",
+                                    (named["message_id"],))
+    text = render_tool_result("peek", result)
+    assert "2 threads · 3 unread messages" in text
+    assert "No subject · Action · 2 unread" in text
+    assert "Last message: founder: Latest preview" in text
+    assert f"newest {named['message_id']}." in text
+    assert "conversation" not in text and first["conversation_id"] not in text
+
+
+def test_peek_budget_omits_threads_and_offers_only_shown(mailroom, monkeypatch):
+    import firm_runtime.messaging as module
+    store, mail, founder, (alice, *_), _ = mailroom
+    sent = [mail.send(founder, [], [alice], str(i), subject="Topic", request_id=f"s{i}")
+            for i in range(20)]
+    monkeypatch.setattr(module, "MAX_PEEK_BYTES", 1500)
+    result = mail.peek(alice)
+    assert 0 < len(result["threads"]) < 20
+    assert result["omitted_threads"] == 20 - len(result["threads"])
+    assert result["unread_count"] == 20
+    assert result["newest_message_id"] == sent[-1]["message_id"]
+    assert result["newest_message_id"] not in [t["message_id"] for t in result["threads"]]
+    assert f"newest {sent[-1]['message_id']}." in render_tool_result("peek", result)
+    assert "appear as the listed ones are read or dismissed" in render_tool_result("peek", result)
+    last = result["threads"][-1]["message_id"]
+    assert scalar(store, "SELECT last_offered_message_sequence FROM roles WHERE employee_id=?",
+                  (alice,)) == scalar(
+                      store, "SELECT sequence FROM messages WHERE message_id=?", (last,),
+                  )
+    for thread in result["threads"]:
+        mail.dismiss(alice, thread["message_id"])
+    next_id = sent[len(result["threads"])]["message_id"]
+    assert mail.peek(alice)["threads"][0]["message_id"] == next_id
+
+
+@pytest.mark.parametrize("subject", [None, "Topic"])
+def test_peek_last_author_is_the_latest_unread_sender(mailroom, subject):
+    _, mail, founder, (alice, bob, *_), _ = mailroom
+    source = mail.send(founder, [alice], [bob], "Start", subject=subject, request_id="source")
+    latest = mail.reply(bob, source["message_id"], [], "Latest body", request_id="latest")
+    result = mail.peek(alice)
+    assert result["threads"][0]["last_author"]["employee_id"] == bob
+    assert result["threads"][0]["message_id"] == latest["message_id"]
+    text = render_tool_result("peek", result)
+    label = f"Last message: founder/bob ({bob})"
+    assert "      " + label + (": Latest body" if subject is None else "") in text.splitlines()
+
+
+def test_peek_ranks_operations_then_owner_then_oldest(mailroom):
+    store, mail, founder, (alice, *_), _ = mailroom
+    ordinary = mail.send(founder, [alice], [], "Oldest", request_id="old")
+    owner = mail.send(OWNER, [alice], [], "Owner", request_id="owner")
     with store.transaction() as db:
-        db.execute("UPDATE activations SET state='completed' WHERE activation_id='a1'")
-        db.execute(
-            "INSERT INTO activations(activation_id,employee_id,session_id,state,wake_snapshot,"
-            "context_json,created_at) VALUES('a2',?,?,'running','[]','{}',1000)",
-            (alice, "second-session"),
-        )
-    retry = act("a2")
-    assert retry == original
-    with store.read() as db:
-        recorded = db.execute(
-            "SELECT claimed_activation_id,claim_sequence FROM message_deliveries "
-            "WHERE message_id=? AND employee_id=?",
-            (sent["message_id"], alice),
-        ).fetchone()
-    assert dict(recorded) == {"claimed_activation_id": "a1", "claim_sequence": 1}
-
-
-@pytest.mark.parametrize("same_session", [False, True])
-@pytest.mark.parametrize("add_person", [False, True])
-def test_reply_claims_only_full_read_predecessors_in_retained_session(
-    mailroom, same_session, add_person
-):
-    store, messaging, founder, (alice, bob, carol, *_), _ = mailroom
-    ids = [
-        messaging.send(founder, [alice, bob], body, request_id=body)["message_id"]
-        for body in ("read earlier", "unread earlier", "target", "read later")
+        operations = mail.notice(db, [alice], "Control", subject="Control")
+    assert [t["message_id"] for t in mail.peek(alice)["threads"]] == [
+        operations["message_id"], owner["message_id"], ordinary["message_id"],
     ]
-    other = messaging.send(founder, [alice], "Other thread", request_id="other")["message_id"]
-    with store.transaction() as db:
-        db.execute(
-            "INSERT INTO activations(activation_id,employee_id,session_id,state,wake_snapshot,"
-            "context_json,created_at) VALUES('read',?,'session','running','[]','{}',1000)",
-            (alice,),
-        )
-    messaging.peek(alice)
-    messaging.messages(alice, [ids[0], ids[3], other], activation_id="read")
-    with store.transaction() as db:
-        db.execute("UPDATE activations SET state='completed' WHERE activation_id='read'")
-        db.execute(
-            "INSERT INTO activations(activation_id,employee_id,session_id,state,wake_snapshot,"
-            "context_json,created_at) VALUES('reply',?,?,'running','[]','{}',1000)",
-            (alice, "session" if same_session else "fresh-session"),
-        )
-    messaging.reply(
-        alice, ids[2], "Acknowledged", request_id="reply", activation_id="reply",
-        add=[carol] if add_person else None,
+
+
+def test_read_boundaries_batch_continuation_reread_and_other_threads(mailroom, monkeypatch):
+    import firm_runtime.messaging as module
+    store, mail, founder, (alice, *_), _ = mailroom
+    sent = [mail.send(founder, [alice], [], f"Body {i}", request_id=f"s{i}") for i in range(4)]
+    other = mail.send(founder, [alice], [], "Other", subject="Other", request_id="other")
+    monkeypatch.setattr(module, "MAX_SELECTION", 1)
+    boundary = sent[2]["message_id"]
+    for index in range(3):
+        result = mail.read(alice, boundary)
+        assert result["marked_read"] == [sent[index]["message_id"]]
+        assert result["remaining"] == 2 - index
+        assert result["messages"][0]["body"] == f"Body {index}"
+        if result["remaining"]:
+            assert f'Continue: read(message_id="{boundary}")' in render_tool_result("read", result)
+    assert states(store, alice)[sent[3]["message_id"]] == "pending"
+    assert states(store, alice)[other["message_id"]] == "pending"
+    again = mail.read(alice, boundary)
+    assert again["reread"] and again["marked_read"] == []
+    assert "Already read." in render_tool_result("read", again)
+    assert "Sent by you." in render_tool_result("read", mail.read(founder, boundary))
+
+
+def test_full_read_uses_detail_byte_budget(mailroom, monkeypatch):
+    import firm_runtime.messaging as module
+    _, mail, founder, (alice, *_), _ = mailroom
+    sent = [mail.send(founder, [alice], [], "x" * 1000, request_id=f"s{i}") for i in range(3)]
+    monkeypatch.setattr(module, "MAX_RESULT_BYTES", 2800)
+    result = mail.read(alice, sent[-1]["message_id"])
+    assert len(result["marked_read"]) == 1 and result["remaining"] == 2
+    assert len(encoded(result).encode()) <= 2800
+
+
+def test_summary_reads_only_covered_messages_and_reread_is_newest_first(mailroom, monkeypatch):
+    import firm_runtime.messaging as module
+    store, mail, founder, (alice, *_), _ = mailroom
+    sent = [mail.send(founder, [alice], [], f"Body {i}", request_id=f"s{i}") for i in range(5)]
+    snapshots = []
+    summary_provider(mail, lambda s: snapshots.append(s))
+    monkeypatch.setattr(module, "MAX_CONTEXT_MESSAGES", 2)
+    boundary = sent[3]["message_id"]
+    for expected in [sent[:2], sent[2:4]]:
+        result = mail.read(alice, boundary, summarize=True)
+        assert result["marked_read"] == [r["message_id"] for r in expected]
+        assert result["covered_ids"] == result["marked_read"]
+    assert states(store, alice)[sent[4]["message_id"]] == "pending"
+    reread = mail.read(alice, boundary, summarize=True)
+    assert reread["marked_read"] == [] and reread["reread"]
+    assert reread["covered_ids"] == [r["message_id"] for r in sent[2:4]]
+    assert all(len(s.messages) == 2 for s in snapshots)
+
+
+def test_summary_byte_limit_complete_envelopes_and_failure_changes_nothing(mailroom, monkeypatch):
+    import firm_runtime.messaging as module
+    store, mail, founder, (alice, *_), _ = mailroom
+    sent = [mail.send(founder, [alice], [], "x" * 1000, request_id=f"s{i}") for i in range(3)]
+    boundary = sent[-1]["message_id"]
+    with pytest.raises(FirmError, match="nothing was marked read.*returns the full messages"):
+        mail.read(alice, boundary, summarize=True)
+    assert all(states(store, alice)[r["message_id"]] == "pending" for r in sent)
+    snapshots = []
+    summary_provider(mail, lambda s: snapshots.append(s))
+    monkeypatch.setattr(module, "MAX_CONTEXT_BYTES", 2500)
+    result = mail.read(alice, boundary, summarize=True)
+    assert result["marked_read"] == [sent[0]["message_id"]]
+    assert result["remaining"] == 2
+    assert snapshots[0].messages[0]["body"] == "x" * 1000
+
+
+def test_dismiss_boundary_requires_no_peek_and_is_idempotent(mailroom):
+    store, mail, founder, (alice, *_), _ = mailroom
+    sent = [mail.send(founder, [alice], [], str(i), request_id=f"s{i}") for i in range(3)]
+    result = mail.dismiss(alice, sent[1]["message_id"])
+    assert result["message_ids"] == [r["message_id"] for r in sent[:2]]
+    assert states(store, alice)[sent[-1]["message_id"]] == "pending"
+    assert mail.dismiss(alice, sent[1]["message_id"])["message_ids"] == []
+    assert "No unread mail" in render_tool_result(
+        "dismiss", mail.dismiss(alice, sent[1]["message_id"]),
     )
-    with store.read() as db:
-        dispositions = {
-            (r["employee_id"], r["message_id"]): r["disposition"]
-            for r in db.execute("SELECT * FROM message_deliveries")
-        }
-    assert [dispositions[alice, mid] for mid in ids] == [
-        "claimed" if same_session else "pending", "pending", "claimed", "pending"
+
+
+def test_owner_reply_and_exact_dismiss_touch_only_target_with_receipts(mailroom):
+    store, mail, founder, (alice, *_), _ = mailroom
+    sent = [mail.send(founder, [OWNER], [], str(i), request_id=f"s{i}") for i in range(3)]
+    result = mail.reply(OWNER, sent[1]["message_id"], [founder], "Answer", request_id="reply")
+    assert mail.reply(
+        OWNER, sent[1]["message_id"], [founder], "Answer", request_id="reply",
+    ) == result
+    assert [states(store, OWNER)[r["message_id"]] for r in sent] == [
+        "pending", "dismissed", "pending",
     ]
-    assert dispositions[alice, other] == "pending"
-    assert all(dispositions[bob, mid] == "pending" for mid in ids)
+    dismissed = mail.dismiss_exact(OWNER, [sent[-1]["message_id"]], request_id="done")
+    assert mail.dismiss_exact(OWNER, [sent[-1]["message_id"]], request_id="done") == dismissed
+    assert states(store, OWNER)[sent[0]["message_id"]] == "pending"
 
 
-def test_failed_full_lookup_does_not_record_reads(mailroom, monkeypatch):
-    store, messaging, founder, (alice, *_), _ = mailroom
-    sent = messaging.send(founder, [alice], "Body", request_id="body")["message_id"]
+def test_retirement_only_bounces_unread_and_notifies_with_preview(mailroom, monkeypatch):
+    store, mail, founder, (alice, *_), _ = mailroom
+    notified = []
+    monkeypatch.setattr(mail, "notify_owner", lambda db, title, body, **kw: notified.append(body))
+    mail.send(founder, [], [OWNER], "Body\npreview", request_id="owner")
+    assert notified == ["Body preview"]
+    read = mail.send(founder, [alice], [], "Read", request_id="read")
+    mail.read(alice, read["message_id"])
+    unread = mail.send(founder, [alice], [], "Unread", request_id="unread")
     with store.transaction() as db:
-        db.execute(
-            "INSERT INTO activations(activation_id,employee_id,session_id,state,wake_snapshot,"
-            "context_json,created_at) VALUES('read',?,'session','running','[]','{}',1000)",
-            (alice,),
-        )
-    monkeypatch.setattr("firm_runtime.messaging.MAX_RESULT_BYTES", 1)
-    with pytest.raises(FirmError):
-        messaging.messages(alice, [sent], activation_id="read")
-    assert scalar(store, "SELECT COUNT(*) FROM message_reads") == 0
+        retired = mail.retire(db, alice)
+        assert len(retired["bounces"]) == 1
+        assert mail.retire(db, alice)["bounces"] == []
+    assert states(store, alice)[read["message_id"]] == "read"
+    assert states(store, alice)[unread["message_id"]] == "undeliverable"
 
 
-def test_bounds_validation_and_base36_ids(mailroom):
-    _, messaging, founder, (alice, *_), _ = mailroom
-    ids = [
-        messaging.send(founder, [alice], f"body {index}", request_id=f"send-{index}")["message_id"]
-        for index in range(36)
+def test_validation_and_failed_recipients_remain_inline(mailroom):
+    store, mail, founder, (alice, *_), _ = mailroom
+    for body, subject in [("", None), ("x" * (MAX_BODY_BYTES + 1), None), ("X", ""),
+                          ("X", "x" * 81)]:
+        with pytest.raises(FirmError):
+            mail.send(
+                founder, [alice], [], body, subject=subject,
+                request_id=repr((body, subject))[:80],
+            )
+    result = mail.send(founder, [alice, "unknown"], [], "Work", request_id="partial")
+    assert result["failed"][0]["reference"] == "unknown"
+    text = render_tool_result("send", result)
+    assert "Not delivered to unknown" in text
+    assert "find_roles" in text
+
+
+def test_summary_marks_only_sources_still_unread_after_provider_returns(mailroom, monkeypatch):
+    store, mail, founder, (alice, *_), _ = mailroom
+    sent = [mail.send(founder, [alice], [], str(i), request_id=f"s{i}") for i in range(3)]
+    later = []
+
+    def summarize(snapshot, session_id):
+        mail.dismiss(alice, sent[0]["message_id"])
+        later.append(mail.send(founder, [alice], [], "Later", request_id="later"))
+        return {"status": "summarized", "summary": "Derived summary."}
+
+    monkeypatch.setattr(mail, "_summarize", summarize)
+    result = mail.read(alice, sent[-1]["message_id"], summarize=True)
+    assert result["covered_ids"] == [r["message_id"] for r in sent]
+    assert result["marked_read"] == [r["message_id"] for r in sent[1:]]
+    assert states(store, alice)[sent[0]["message_id"]] == "dismissed"
+    assert states(store, alice)[later[0]["message_id"]] == "pending"
+
+
+def test_operations_notices_share_no_subject_conversation_and_read_together(mailroom):
+    store, mail, founder, *_ = mailroom
+    with store.transaction() as db:
+        a = mail.notice(db, [founder], "First notice", subject="First title")
+        b = mail.notice(db, [founder], "Second notice", subject="Second title")
+    assert a["conversation_id"] == b["conversation_id"]
+    peek = mail.peek(founder)
+    assert peek["thread_count"] == 1
+    assert peek["threads"][0]["unread_count"] == 2
+    assert peek["threads"][0]["subject"] is None
+    assert peek["threads"][0]["last_author"]["employee_id"] == OPERATIONS
+    assert "Last message: Operations: Second title Second notice" in render_tool_result(
+        "peek", peek,
+    )
+    read = mail.read(founder, b["message_id"])
+    assert read["marked_read"] == [a["message_id"], b["message_id"]]
+    assert [m["body"] for m in read["messages"]] == [
+        "First title\n\nFirst notice", "Second title\n\nSecond notice",
     ]
-    assert ids[34:] == ["mz", "m10"]
-    with pytest.raises(FirmError, match="1–80"):
-        messaging.send(founder, [alice], "body", subject="", request_id="empty-subject")
-    with pytest.raises(FirmError, match="1–80"):
-        messaging.send(founder, [alice], "body", subject="s" * 81, request_id="long-subject")
-    short = messaging.send(founder, [alice], "body", subject="Push again", request_id="short")
-    sent = messaging.messages(founder, [short["message_id"]])["messages"][0]
-    assert sent["subject"] == "Push again"
-    with pytest.raises(FirmError, match=str(MAX_BODY_BYTES)):
-        messaging.send(founder, [alice], "x" * (MAX_BODY_BYTES + 1), request_id="large")
-    with pytest.raises(FirmError, match="unique"):
-        messaging.messages(founder, [ids[0], ids[0]])
-    assert len(encoded(messaging.peek(alice)).encode()) <= MAX_PEEK_BYTES
+    assert all(m["subject"] is None for m in read["messages"])
 
 
-@pytest.mark.parametrize("operation", ["claim", "dismiss"])
-def test_disposition_clears_only_matching_recipient_message_wakes(mailroom, operation):
-    store, messaging, founder, (alice, bob, *_), _ = mailroom
-    first = messaging.send(founder, [alice, bob], "Shared", request_id="shared")
-    second = messaging.send(founder, [alice], "Other", request_id="other")
+def test_notice_combined_body_limit_and_owner_notification_title(mailroom, monkeypatch):
+    store, mail, founder, *_ = mailroom
+    notified = []
+    monkeypatch.setattr(mail, "notify_owner", lambda db, title, body, **kw: notified.append(body))
     with store.transaction() as db:
-        store.request_execution(db, alice, "handoff", source_id=first["message_id"])
-    getattr(messaging, operation)(alice, [first["message_id"]], request_id="dispose")
+        mail.notice(db, [OWNER], "Notice body", subject="Notice title", wake=False)
+        with pytest.raises(FirmError, match="message body exceeds"):
+            mail.notice(db, [founder], "x" * (MAX_BODY_BYTES - 2), subject="Title")
+    assert notified == ["Notice title"]
+
+
+def test_clear_across_threads_without_peek_preserves_later_and_other_readers(mailroom):
+    store, mail, founder, (alice, bob, *_), _ = mailroom
+    sent = [mail.send(founder, [alice, bob], [], str(i),
+                      subject="Topic" if i % 2 else None, request_id=f"clear-{i}")
+            for i in range(40)]
+    mail.read(alice, sent[0]["message_id"])
+    boundary = sent[36]["message_id"]
+    result = mail.clear(alice, boundary)
+    assert result == {"status": "cleared", "message_id": boundary,
+                      "cleared_count": 36, "thread_count": 19, "remaining": 3}
+    assert render_tool_result("clear", result) == (
+        f"Cleared 36 unread messages in 19 threads through {boundary}.\nUnread remaining: 3"
+    )
+    assert [states(store, alice)[m["message_id"]] for m in sent] == (
+        ["read"] + ["dismissed"] * 36 + ["pending"] * 3
+    )
+    assert all(states(store, bob)[m["message_id"]] == "pending" for m in sent)
+    empty = mail.clear(alice, boundary)
+    assert empty["cleared_count"] == empty["thread_count"] == 0
+    assert empty["remaining"] == 3
+    assert render_tool_result("clear", empty) == f"Nothing unread through {boundary}."
+
+
+def test_clear_accepts_a_boundary_authored_by_caller(mailroom):
+    store, mail, founder, (alice, *_), _ = mailroom
+    first = mail.send(founder, [alice], [], "Question", request_id="question")
+    boundary = mail.reply(alice, first["message_id"], [], "Answer", request_id="answer")
+    later = mail.send(founder, [], [alice], "Later", request_id="later")
+    result = mail.clear(alice, boundary["message_id"])
+    assert result["cleared_count"] == result["thread_count"] == result["remaining"] == 1
+    assert render_tool_result("clear", result) == (
+        f"Cleared 1 unread message in 1 thread through {boundary['message_id']}.\n"
+        "Unread remaining: 1"
+    )
+    assert states(store, alice)[first["message_id"]] == "dismissed"
+    assert states(store, alice)[later["message_id"]] == "pending"
+
+
+def test_idle_entries_include_older_unread_through_offered_boundary_in_offer_order(mailroom):
+    store, mail, founder, (alice, *_), now = mailroom
+    old = mail.send(founder, [alice], [], "Older action", subject="Topic", request_id="old")
+    hidden = mail.send(OWNER, [], [alice], "Already offered", request_id="hidden")
+    mail.peek(alice)
+    ordinary = mail.send(founder, [], [alice], "Oldest new", request_id="new")
+    latest = mail.reply(founder, old["message_id"], [], "New FYI", request_id="fyi")
+    with store.transaction() as db:
+        later = mail.notice(db, [alice], "Future", subject="Scheduled", ready_at=now[0] + 60)
     with store.read() as db:
-        remaining = {
-            tuple(row)
-            for row in db.execute(
-                "SELECT employee_id,reason,source_id FROM scheduling_opportunities"
-            )
-        }
-    assert remaining == {
-        (bob, "message", first["message_id"]),
-        (alice, "message", second["message_id"]),
-        (alice, "handoff", first["message_id"]),
-    }
-    with pytest.raises(FirmError):
-        getattr(messaging, operation)(
-            alice, [second["message_id"], "missing"], request_id="invalid"
-        )
-    with store.read() as db:
-        assert {
-            tuple(row)
-            for row in db.execute(
-                "SELECT employee_id,reason,source_id FROM scheduling_opportunities"
-            )
-        } == remaining
+        result = mail.idle_snapshot(db, alice, now[0])
+    assert [t["message_id"] for t in result["threads"]] == [
+        ordinary["message_id"], latest["message_id"],
+    ]
+    assert result["unread_count"] == 3
+    assert result["threads"][1]["unread_count"] == 2
+    assert result["threads"][1]["action_required"]
+    assert result["threads"][1]["last_author"]["employee_id"] == founder
+    text = render_tool_result("peek", result)
+    assert "newest" not in text
+    assert "Last message: founder" in text
+    assert "Topic · Action · 2 unread" in text
+    assert hidden["message_id"] not in [t["message_id"] for t in result["threads"]]
+    assert later["message_id"] not in [t["message_id"] for t in result["threads"]]
+    assert len(mail.read(alice, latest["message_id"])["marked_read"]) == 2
+
+
+def test_summary_programming_errors_propagate_without_marking_read(mailroom, monkeypatch):
+    store, mail, founder, (alice, bob, *_), _ = mailroom
+    source = mail.send(founder, [alice], [], "Source", request_id="source")
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("programming error")
+
+    monkeypatch.setattr(mail.summary_service, "summarize", broken)
+    with pytest.raises(RuntimeError, match="programming error"):
+        mail.read(alice, source["message_id"], summarize=True)
+    with pytest.raises(RuntimeError, match="programming error"):
+        mail.introduce(alice, source["message_id"], [bob], [], True, "Join", request_id="intro")
+    assert states(store, alice)[source["message_id"]] == "pending"
+    assert scalar(store, "SELECT COUNT(*) FROM messages") == 1

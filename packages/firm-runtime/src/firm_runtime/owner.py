@@ -12,6 +12,39 @@ class OwnerControls:
     def __init__(self, runtime):
         self.runtime, self.store = runtime, runtime.store
 
+    def send_mail(self, actor, recipients, body, *, subject=None, attachments=None,
+                  action_recipients=None, request_id):
+        self._require_owner(actor)
+        mail = self.runtime.messaging
+        payload = dict(recipients=recipients, body=body, subject=subject,
+                       attachments=attachments, action_recipients=action_recipients)
+        with self.store.transaction() as db:
+            def send():
+                intended = mail._intended_recipients(db, recipients)
+                actions = action_recipients
+                if actions is None:
+                    actions = recipients if len(intended) == 1 else []
+                keys = mail._normalize_actions(db, actions, intended)
+                return mail._send(db, actor, recipients, body, subject,
+                                  attachments=attachments, action_keys=keys)
+            return self.store.request(db, actor, request_id, "send", payload, send)
+
+    def reply_mail(self, actor, message_id, body, *, attachments=None,
+                   action_recipients=None, request_id):
+        self._require_owner(actor)
+        mail = self.runtime.messaging
+        payload = dict(message_id=message_id, body=body, attachments=attachments,
+                       action_recipients=action_recipients)
+        with self.store.transaction() as db:
+            def reply():
+                _, _, audience = mail._thread(db, actor, message_id)
+                others = [p for p in audience if p["employee_id"] != actor]
+                actions = action_recipients
+                if actions is None:
+                    actions = [p["employee_id"] for p in others] if len(others) == 1 else []
+                return mail._reply(db, actor, message_id, actions, body, attachments)
+            return self.store.request(db, actor, request_id, "reply", payload, reply)
+
     @staticmethod
     def _require_owner(actor):
         if actor != OWNER:

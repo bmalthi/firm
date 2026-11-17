@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -29,7 +30,6 @@ from .commands import (
     parse_lima_list,
     resize_instance,
 )
-from .compatibility import validate_image_manifest, validate_retained_vm
 from .guest_control import GuestControl, lifecycle, private_directory, read_record, save
 from .host_network import HostNetwork
 from .models import VMSettings
@@ -45,6 +45,14 @@ BOOT_DONE = "/var/run/lima-boot-done"
 BOOT_POLL = 2
 BOOT_GRACE = 10
 logger = logging.getLogger(__name__)
+
+
+def require_image_identity(record):
+    """An image identifier protects clone identity, independently of code versions."""
+    identity = record.get("image_id") if isinstance(record, dict) else None
+    if not isinstance(identity, str) or not re.fullmatch(r"[0-9a-f]{32}", identity):
+        raise ValueError("Mac image record has no valid image identity")
+    return record
 
 
 class MacVM(GuestControl):
@@ -210,7 +218,7 @@ class MacVM(GuestControl):
 
     def _image_base(self, image):
         private_directory(image)
-        metadata = validate_image_manifest(read_record(image / "image.json"))
+        metadata = require_image_identity(read_record(image / "image.json"))
         self._image_stations(image)
         if metadata.get("control_user") != CONTROL_USER:
             raise ValueError("Unsupported macOS VM image")
@@ -225,7 +233,7 @@ class MacVM(GuestControl):
         return base
 
     def _clone(self, image):
-        metadata = validate_image_manifest(read_record(image / "image.json"))
+        metadata = require_image_identity(read_record(image / "image.json"))
         count = self._image_stations(image)
         base = self._image_base(image)
         private_directory(self.home)
@@ -290,7 +298,6 @@ class MacVM(GuestControl):
                 "firm_id": self.settings.firm_id,
                 "image": str(image),
                 "created_with_release": metadata["created_with_release"],
-                "compatibility_generation": metadata["compatibility_generation"],
                 "image_id": metadata["image_id"],
                 "stations": count,
                 "enrolled": bool(count),
@@ -465,20 +472,18 @@ printf '%s\\n' 'firmvm ALL=(root) NOPASSWD: {" ".join(CONTROLLER_COMMAND)}' > /e
         its filter are powered off first.
         """
         checkpoint()
-        # Check compatibility before projecting Lima files or creating guest state.
+        # Preserve the identity of an existing clone.
         if self.record.exists():
-            state = validate_retained_vm(self._state())
+            state = require_image_identity(self._state())
             if self.image is not None:
-                metadata = validate_image_manifest(read_record(self.image / "image.json"))
+                metadata = require_image_identity(read_record(self.image / "image.json"))
                 if state.get("image_id") != metadata["image_id"]:
                     raise ValueError("Retained VM image identity changed; use mac-replace")
-        elif self.image is not None:
-            validate_image_manifest(read_record(self.image / "image.json"))
         private_directory(self.root)
         private_directory(self.network.paths["scratch"])
         self.paths.prepare()
         if self.record.exists():
-            state = validate_retained_vm(self._state())
+            state = require_image_identity(self._state())
             if state.get("firm_id") != self.settings.firm_id:
                 raise ValueError("VM record belongs to another firm identity")
             if self.image is not None and self.image != Path(state["image"]):
@@ -543,7 +548,7 @@ printf '%s\\n' 'firmvm ALL=(root) NOPASSWD: {" ".join(CONTROLLER_COMMAND)}' > /e
             # A fresh clone gets its own control password; SSH password login stays
             # disabled and no owner key enters the VM. Journaled: a retry finishes it.
             self._rpc("rotate-control-password", timeout=400)
-        state = self._state()
+        state = require_image_identity(self._state())
         state["ready"] = True
         save(self.record, state)
         return self.info()

@@ -1,5 +1,5 @@
 // Owner console application shell and polling loop.
-import {age, time, firmMenuLabel, needsYou, pageTitle, resultHref, fileReplyMatches} from "./format.js";
+import {age, time, firmMenuLabel, needsYou, pageTitle, resultHref, fileReplyMatches, replyActionSelection} from "./format.js";
 import {createOverview} from "./overview.js";
 import {createInbox} from "./inbox.js";
 import {createTeam} from "./team.js";
@@ -16,6 +16,7 @@ let firmStorageScope = null;
 let hostStorageScope = null;
 let replyTarget = null;
 let replyAttachments = [];
+let replyAudience = [];
 let sending = false;
 let control = null;
 let pendingControl = null;
@@ -75,7 +76,7 @@ async function post(path, body, storageKey) {
   try { saved = JSON.parse(sessionStorage.getItem(storageKey) || "null"); } catch { saved = null; }
   const payload = saved?.payload || body;
   const operation_id = saved?.operation_id || operationKey();
-  if (!saved) sessionStorage.setItem(storageKey, JSON.stringify({operation_id, payload}));
+  if (!saved) sessionStorage.setItem(storageKey, JSON.stringify({operation_id, payload, ...(path === "/api/messages/reply" ? {replyAudience} : {})}));
   const response = await fetch(path, {
     method: "POST",
     headers: {
@@ -159,7 +160,7 @@ async function refreshControl(signal) {
 const controls = {
   stop: ["Stop after current work", "The firm stops accepting new work. Current work can finish, then the VMs shut down."],
   "force-stop": ["Force stop now", "Active work may be interrupted and the VMs will be powered off."],
-  resume: ["Resume Firm", "Start the VMs and let the firm accept work again. Idle roles still need a message or scheduled wake."],
+  resume: ["Resume Firm", "Start the VMs and let the firm accept work again. Previously unoffered mail may receive an idle review."],
   close: ["Close Firm", "Close this firm's local host. You can reopen it later with firm start."],
 };
 function confirmControl(action) {
@@ -208,10 +209,27 @@ function populateRecipients(data) {
   }
   recipientLabel();
 }
+function setReplyActions(audience, selected = null) {
+  const selection = replyActionSelection(audience, selected);
+  replyAudience = selection.recipients;
+  const defaults = selection.selected;
+  $("#reply-action-options").replaceChildren(...replyAudience.map((person) => {
+    const label = element("label", "switch-label");
+    const input = document.createElement("input"); input.type = "checkbox";
+    input.value = person.employee_id || person.reference; input.checked = defaults.includes(input.value);
+    label.append(input, document.createTextNode(person.identity || person.address || person.reference || person.employee_id));
+    return label;
+  }));
+  $("#reply-actions").hidden = false;
+}
+function selectedReplyActions() {
+  return [...$("#reply-action-options").querySelectorAll("input:checked")].map((input) => input.value);
+}
 async function reply(message, attachment = null) {
   if ($("#send-form").dataset.pendingKey) { notice("Resolve the saved send before starting a reply."); return; }
   replyTarget = message.message_id;
   replyAttachments = attachment ? [attachment] : [];
+  setReplyActions(message.reply_audience);
   $("#send-form").classList.add("reply-mode");
   $("#send-recipients").disabled = true;
   $("#send-subject").disabled = true;
@@ -240,6 +258,7 @@ function placeComposer() {
   $("#cancel-reply").disabled = Boolean(form.dataset.pendingKey) || sending;
   form.querySelector("button[type=submit]").textContent = replyTarget ? "Send reply" : "Send message";
   if (!replyTarget) $("#ask-title").textContent = "Ask or instruct";
+  $("#reply-actions").hidden = !replyTarget;
   $("#reader-follow-up").hidden = Boolean(inReader);
   $("#send-attachment").hidden = !replyAttachments.length;
   $("#send-attachment").textContent = replyAttachments.length ? `Attached: ${replyAttachments.map((item) => item.name).join(", ")}` : "";
@@ -281,6 +300,8 @@ function restoreComposer() {
     const isReply = saved.operation === "reply" || Boolean(payload.message_id);
     if (isReply) {
       replyTarget = payload.message_id;
+      setReplyActions(saved.replyAudience || (payload.action_recipients || []).map((id) => ({employee_id: id})), payload.action_recipients || []);
+      $("#reply-actions").disabled = true;
       $("#send-form").classList.add("reply-mode");
       $("#send-recipients").disabled = true;
       $("#send-subject").disabled = true;
@@ -324,6 +345,8 @@ function unlockComposer() {
   $("#send-recipients").disabled = false;
   $("#send-subject").disabled = false;
   $("#send-body").disabled = false;
+  $("#reply-actions").disabled = false;
+  if (!replyTarget) { replyAudience = []; $("#reply-action-options").replaceChildren(); }
   $("#new-message-draft").hidden = true;
 }
 function beginNewDraft() {
@@ -343,7 +366,7 @@ async function sendComposer() {
   const key = pendingKey || replyKey || sendKey;
   const saved = pendingKey ? JSON.parse(sessionStorage.getItem(pendingKey) || "null") : null;
   const payload = saved?.payload || (replyTarget
-    ? {message_id: replyTarget, body: $("#send-body").value, attachments: replyAttachments}
+    ? {message_id: replyTarget, body: $("#send-body").value, attachments: replyAttachments, action_recipients: selectedReplyActions()}
     : {
       recipients: [$("#send-recipients").value],
       subject: $("#send-subject").value.trim() || null,

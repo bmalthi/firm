@@ -164,6 +164,115 @@ def _announce_first_run(provider: str, *, directory: Path | None = None) -> None
     )
 
 
+def _confirm(question: str, *, default: bool) -> bool:
+    while True:
+        answer = _ask(f"{question} {'[Y/n]' if default else '[y/N]'}: ").lower()
+        if not answer:
+            return default
+        if answer in {"y", "yes"}:
+            return True
+        if answer in {"n", "no"}:
+            return False
+        print("Answer y or n.", file=sys.stderr)
+
+
+def _account_hold(runtime, account_id: str) -> dict | None:
+    """The open hold on one account, as `firm accounts` reports it. There is at most one."""
+    if runtime is None:
+        return None
+    return next(
+        (
+            incident
+            for incident in runtime.accounts.status()["incidents"]
+            if incident["scope"] == "account" and incident["dependency"] == account_id
+        ),
+        None,
+    )
+
+
+def _auth_hold(runtime, account_id: str) -> dict | None:
+    hold = _account_hold(runtime, account_id)
+    return hold if hold is not None and hold["kind"] == "auth" else None
+
+
+def _explain_auth_hold(account_id: str, hold: dict) -> None:
+    code = f" ({hold['code']})" if hold["code"] else ""
+    print(f"Account {account_id} is paused{code}. {hold['guidance']}", file=sys.stderr)
+
+
+def _repair_accounts(directory: Path, config: dict, runtime) -> None:
+    """Sign in where a saved login is unusable or held, then offer to resume held accounts.
+
+    Every account a profile routes work to is covered, not only the founder's. Signing
+    in is asked for, not forced, when the hold's cause says it cannot help. Resuming is
+    the owner's decision: nothing here proves remote access, the next work period does.
+    """
+    from .providers import provider_adapter
+
+    profiles: dict[str, dict] = {}
+    for profile in config["profiles"].values():
+        for account_id in profile["accounts"]:
+            profiles.setdefault(account_id, profile)
+    for account_id, profile in profiles.items():
+        account = config["accounts"][account_id]
+        provider = account["provider"]
+        hold = _auth_hold(runtime, account_id)
+        if hold is None:
+            try:
+                provider_adapter(profile, account).validate_credentials()
+                continue
+            except ProviderSetupError:
+                print(
+                    f"Account {account_id} needs a {provider.title()} sign-in before the firm "
+                    "can start.",
+                    file=sys.stderr,
+                )
+            sign_in = True
+        else:
+            _explain_auth_hold(account_id, hold)
+            sign_in = _confirm(
+                f"Sign in to {account_id} now?"
+                if hold["repair"] == "sign_in"
+                else f"Sign in to {account_id} with a different account now?",
+                default=hold["repair"] == "sign_in",
+            )
+        explained = (hold["incident_id"], hold["code"]) if hold is not None else None
+        if sign_in:
+            login_provider(
+                provider,
+                account_id,
+                state_directory=directory / ".setup-login" / account_id,
+                target_credentials_path=Path(account["auth_file"]).expanduser(),
+                force_login=hold is not None,
+            )
+        # Sign-in can take minutes: act on the hold as it stands now, by its exact ID.
+        hold = _auth_hold(runtime, account_id)
+        if hold is None:
+            continue
+        resume_by_default = sign_in
+        if (hold["incident_id"], hold["code"]) != explained:
+            # A newer failure replaced the hold meanwhile, or gave it a cause it lacked:
+            # show that cause before asking, and do not assume the sign-in above answered it.
+            _explain_auth_hold(account_id, hold)
+            resume_by_default = False
+        if _confirm(f"Resume work on {account_id} now?", default=resume_by_default):
+            runtime.accounts.clear(OWNER, hold["incident_id"])
+            # Any hold left on the account, of any kind, means it is not running.
+            hold = _account_hold(runtime, account_id)
+            if hold is None:
+                print(
+                    f"Resumed {account_id}. Its next work period shows whether the provider "
+                    "accepts the account; if the same failure returns, so does the pause.",
+                    file=sys.stderr,
+                )
+                continue
+        print(
+            f"Account {account_id} stays paused. Resume it from the console, or run "
+            f"`firm clear-hold {shlex.quote(str(directory))} {hold['incident_id']}`.",
+            file=sys.stderr,
+        )
+
+
 def _run_guided_start(args) -> None:
     """Create or resume one firm, then enter the same host start path."""
     if not sys.stdin.isatty():
@@ -201,7 +310,6 @@ def _run_guided_start(args) -> None:
 
     initialized = False
     runtime = None
-    auth_incidents = []
     if selected is None:
         provider = _choose_provider(input_fn=input)
         _announce_first_run(provider)
@@ -220,30 +328,22 @@ def _run_guided_start(args) -> None:
             )
         initialized = selected_info["state"] == "initialized"
         if initialized:
-            provider, _profile, _account_id = _provider_for_directory(selected)
-            from .compatibility import validate_firm
+            _provider_for_directory(selected)
+            from firm_sandbox.firm_paths import validate_firm_directories
 
-            validate_firm(selected)
+            validate_firm_directories(selected)
             runtime = Runtime(Store(selected / "durable" / "firm.sqlite3"))
-            auth_incidents = [
-                incident
-                for incident in runtime.accounts.status()["incidents"]
-                if incident["scope"] == "account"
-                and incident["dependency"] == _account_id
-                and incident["kind"] == "auth"
-            ]
             print(
-                f"Resuming {selected.name}; Firm will check its provider account and local VM, "
+                f"Resuming {selected.name}; Firm will check its provider accounts and local VM, "
                 "then reconnect to its console.",
                 file=sys.stderr,
             )
             task_label = "resume existing firm"
         else:
             if (selected / "firm.toml").is_file():
-                provider, _profile, account_id = _provider_for_directory(selected)
+                provider = _provider_for_directory(selected)[0]
             else:
                 provider = _choose_provider(input_fn=input)
-                account_id = f"{provider}-personal"
             _announce_first_run(provider, directory=selected)
             if (selected / "mandate.md").is_file():
                 mandate = read_text_file(selected / "mandate.md")
@@ -255,28 +355,7 @@ def _run_guided_start(args) -> None:
 
     if selected is None:
         raise FirmError("no firm selected")
-    _provider, profile, account_id = _provider_for_directory(selected)
     config = _owner_config(selected / "firm.toml")
-    account = config["accounts"][account_id]
-    auth_file = Path(account["auth_file"]).expanduser()
-    from .providers import provider_adapter
-
-    credential_ok = False
-    if auth_file.is_file() and not auth_incidents:
-        try:
-            provider_adapter(profile, account).validate_credentials()
-            credential_ok = True
-        except ProviderSetupError:
-            print(
-                f"The saved {provider.title()} credential needs sign-in again.",
-                file=sys.stderr,
-            )
-    elif auth_incidents:
-        print(
-            f"The saved {provider.title()} credential was rejected by the provider. "
-            "Sign in again to clear this account's authentication hold.",
-            file=sys.stderr,
-        )
 
     from .setup_check import check_setup
 
@@ -296,20 +375,7 @@ def _run_guided_start(args) -> None:
         raise FirmError(
             f"setup is saved at {selected}; fix the listed prerequisites and rerun `firm start`."
         )
-    if not credential_ok:
-        print("Authenticate with your provider before provisioning the Linux VM.", file=sys.stderr)
-        login_provider(
-            provider,
-            account_id,
-            state_directory=selected / ".setup-login" / provider,
-            target_credentials_path=auth_file,
-            force_login=bool(auth_incidents),
-        )
-        if auth_incidents:
-            if runtime is None:
-                raise FirmError("cannot clear the provider hold without the initialized firm")
-            for incident in auth_incidents:
-                runtime.accounts.clear(OWNER, incident["incident_id"])
+    _repair_accounts(selected, config, runtime)
 
     report = check_setup(
         selected,
@@ -360,9 +426,9 @@ def _initialize_firm(
     if database_info is not None:
         if not stat.S_ISREG(database_info.st_mode):
             raise FirmError("a non-regular firm database path already exists")
-        from .compatibility import validate_firm
+        from firm_sandbox.firm_paths import validate_firm_directories
 
-        validate_firm(directory)
+        validate_firm_directories(directory)
         from .setup_check import database_initialization_state
 
         if database_initialization_state(database) == "invalid":
@@ -370,19 +436,15 @@ def _initialize_firm(
                 "the database is neither a safely resumable first initialization "
                 "nor a valid initialized firm; no database changes were made"
             )
-    else:
-        from .compatibility import initialize_firm
-
-        initialize_firm(directory)
     runtime = Runtime(Store(database))
     github.ensure_app(config, terminal)
     return runtime.lifecycle.initialize(firm_id or directory.resolve().name, mandate, config)
 
 
 def _start_selected(args, directory: Path, *, guided: bool = False) -> None:
-    from .compatibility import validate_firm
+    from firm_sandbox.firm_paths import validate_firm_directories
 
-    validate_firm(directory)
+    validate_firm_directories(directory)
     database = directory / "durable" / "firm.sqlite3"
     runtime = Runtime(Store(database))
     sandbox_config = args.sandbox_config or directory / "sandbox.toml"
@@ -510,6 +572,9 @@ def main(argv=None):
     send.add_argument("recipients", nargs="+")
     send.add_argument("--body", required=True)
     send.add_argument("--subject")
+    actions = send.add_mutually_exclusive_group()
+    actions.add_argument("--action-to", action="append", dest="action_recipients")
+    actions.add_argument("--fyi", action="store_true")
     send.add_argument("--request-id", required=True)
     configure = commands.add_parser(
         "configure", help="Apply execution settings; retained conversations keep their settings"
@@ -557,6 +622,10 @@ def main(argv=None):
             command.add_argument("--fresh", action="store_true", required=True)
         if name == "retry":
             command.add_argument("--episode", required=True)
+            command.add_argument(
+                "--immediate", action="store_true",
+                help="Skip timed backoff without resetting attempts or shared holds",
+            )
     guidance_command = commands.add_parser(
         "guidance", help="Set or automatically choose role guidance"
     )
@@ -636,6 +705,12 @@ def main(argv=None):
         elif args.command == "login":
             path = login_provider(args.provider, args.account,
                                   target_credentials_path=args.auth_file, force_login=True)
+            print(
+                "Saved. A firm that paused this account stays paused until you resume it from "
+                "its console or with `firm clear-hold DIRECTORY INCIDENT_ID`; "
+                "`firm accounts DIRECTORY` lists the incident.",
+                file=sys.stderr,
+            )
             result = {"account": args.account, "provider": args.provider, "auth_file": str(path)}
         elif args.command == "save-credentials":
             from .accounts import credentials_path
@@ -680,10 +755,9 @@ def main(argv=None):
                 database = args.directory / exports.DATABASE
             if not database.is_file():
                 raise FirmError("firm database does not exist")
-            from .compatibility import validate_firm
+            from firm_sandbox.firm_paths import validate_firm_directories
 
-            # Read-only analysis also requires this release's schema, including exports.
-            validate_firm(args.directory)
+            validate_firm_directories(args.directory)
             if args.command == "analyze":
 
                 def timestamp(value):
@@ -751,11 +825,12 @@ def main(argv=None):
                     except RuntimeError as exc:
                         raise FirmError(str(exc)) from exc
             elif args.command == "send":
-                result = runtime.messaging.send(
+                result = runtime.owner.send_mail(
                     OWNER,
                     args.recipients,
                     args.body,
                     subject=args.subject,
+                    action_recipients=[] if args.fyi else args.action_recipients,
                     request_id=args.request_id,
                 )
             elif args.command == "stop":
@@ -810,7 +885,10 @@ def main(argv=None):
                         OWNER, args.employee_id, args.scope, args.function, args.request_id
                     )
             elif args.command == "retry":
-                result = runtime.retry(OWNER, args.employee_id, args.episode, args.request_id)
+                result = runtime.retry(
+                    OWNER, args.employee_id, args.episode, args.request_id,
+                    immediate=args.immediate,
+                )
             elif args.command == "export":
                 result = fleet.export(
                     args.directory, runtime, destination=args.destination, homes=args.homes

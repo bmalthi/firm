@@ -33,9 +33,9 @@ Every provider receives the same assembled standing text. Codex receives it via 
    * Then `guidance-introduction.md` and selected bodies from `guidance/`, scope first and functions in catalog order; omit the introduction when no guides apply. `standing-limits.md` comes last for every role. Physics describes the environment; good-worker and role guides describe craft and yield to the mandate. Limits hold firm-wide rules that no mandate, profile, mail, guide or tool result changes.
    * Contains no timestamps, inbox counts, or token counters so provider prompt caches stay warm. The common resources are fixed for a running host; the assembled text changes only when the role's identity, mandate, paths, capabilities or effective guidance change. Prompt resource edits load only after restarting the host.
 2. **Layer 2 — Transition Context (`stdin`):**
-   * First-day birth orientation (`founder_birth.md` or `birth.md`—injected once on the birth activation, never via claimable mail), post-handoff continuation notes, or a crash recovery notice.
+   * First-day birth orientation (`founder_birth.md` or `birth.md`—injected once on the birth activation, never via mail), post-handoff continuation notes, or a crash recovery notice.
 3. **Layer 3 — Wake Update (`stdin`):**
-   * Any newly revised mandate, a short guidance-change notice on a retained native session, changed org neighborhood delta, remaining temporary work periods, and the current inbox `peek` overview (plus any context-pressure notice).
+   * Any newly revised mandate, a short guidance-change notice on a retained native session, changed org neighborhood delta, remaining temporary work periods, and the current inbox overview in `peek` format (plus any context-pressure notice).
 
 | Occasion | System Prompt (Standing) | Wake & Transition Input (`stdin`) |
 | :--- | :--- | :--- |
@@ -43,7 +43,7 @@ Every provider receives the same assembled standing text. Codex receives it via 
 | **Employee birth** | Delegated mandate, pointer to Founder mandate, workplace rules | `birth.md` (first-day setup), manager/neighborhood facts, and inbox |
 | **Normal resume** | Retained session context + current standing instructions | New mandate revision (if any), org delta (if changed), and current inbox |
 | **Wake after `handoff`** | Fresh session + rebuilt standing instructions | Saved handoff continuation notes + current inbox |
-| **Fresh start after crash** | Fresh session + rebuilt standing instructions | Minimal recovery notice + last 5 claimed message IDs/subjects + current inbox |
+| **Fresh start after crash** | Fresh session + rebuilt standing instructions | Minimal recovery notice + last 5 read message IDs (subject, or a body preview when there is none) + current inbox |
 
 ---
 
@@ -63,7 +63,7 @@ Prompt resource files live in `packages/firm-runtime/src/firm_runtime/prompts/`:
 | `mac-acquired.md` | Detailed macOS/Xcode/Device Hub workflow notes delivered when `mac_acquire` succeeds. |
 | `tools.json`, `results.json`, `references.json` | MCP tool schemas, return-state explanations, and actionable error messages. |
 | `notices.json` | Templates for attributed Operations messages (bounces, request grants/denials, mandate updates). |
-| `runtime_summary.md`, `runtime_level-choice.md` | Isolated infrastructure prompts for correspondence summarization (`context`) and level and guidance selection (`[staffing]`). Never shown to employees. |
+| `runtime_summary.md`, `runtime_level-choice.md`, `runtime_task.md` | Isolated infrastructure prompts for thread summarization (`read` with `summarize`, `introduce` with `summarize`), level and guidance selection (`[staffing]`), and bounded `task` workers. Never shown to employees. |
 | `tracking.md` | Maintainer reference mapping how standing and activation prompt layers are ordered across the four activation occasions (not injected at runtime). |
 
 The founder automatically receives `firm-leader`; every other role with non-retired direct reports receives
@@ -73,6 +73,16 @@ The org-chart scope takes precedence over a chooser scope. Selection runs at ini
 revision; ordinary wakes reuse it. Level and guidance validation and retries are independent. A role's first
 period waits for pending guidance when a selector is available, bounded by three attempts. With `staffing = false`,
 no chooser runs and only the org-chart scope applies unless the owner sets an override.
+
+Scope guidance follows responsibility, while function guidance follows the work in
+the mandate; neither changes permissions or the model route. The catalog contains
+four scopes and sixteen functions, including copywriting. Founder and team-leader
+scopes come from the org chart rather than a model judgment. The chooser sees the
+remaining scopes and functions, so it cannot override those reporting facts.
+
+If no isolated runner is available, pending selections default without a chooser
+call or owner notice; the reason is recorded in guidance state and history. This
+path does not keep first work periods waiting for a selector that cannot run.
 
 `firm guidance DIR EMPLOYEE_ID --set [--scope ID] [--function ID]... --request-id R` sets exactly that selection,
 including an empty selection or an org-chart scope. `--automatic` clears the stored selection and requests a

@@ -8,15 +8,17 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from firm_runtime import mcp_server
-from firm_runtime.compatibility import initialize_firm
 from firm_runtime.mcp_server import build_server
 from firm_runtime.runtime import Runtime
 from firm_runtime.store import OWNER, Store
 
 
-def test_stdio_server_checks_release_marker_before_opening_store(tmp_path, monkeypatch, capsys):
+def test_stdio_server_checks_directory_ownership_before_opening_store(
+    tmp_path, monkeypatch, capsys
+):
     database = tmp_path / "firm" / "durable" / "firm.sqlite3"
     database.parent.parent.mkdir(mode=0o700)
+    database.parent.symlink_to(tmp_path / "external")
     monkeypatch.setattr(sys, "argv", ["firm-role-tools", str(database)])
     monkeypatch.setenv("FIRM_ACTIVATION_TOKEN", "synthetic-token")
     monkeypatch.setattr(
@@ -29,13 +31,12 @@ def test_stdio_server_checks_release_marker_before_opening_store(tmp_path, monke
     except SystemExit as exc:
         assert exc.code == 2
     else:
-        raise AssertionError("unmarked firm was accepted")
-    assert "no release compatibility record" in capsys.readouterr().err
+        raise AssertionError("unsafe durable directory was accepted")
+    assert "owner-controlled" in capsys.readouterr().err
     assert not database.exists()
 
 
 def test_mcp_stdio_authentication_and_real_tool_call(tmp_path, monkeypatch):
-    initialize_firm(tmp_path)
     runtime = Runtime(Store(tmp_path / "durable" / "firm.sqlite3"))
     founder = runtime.lifecycle.initialize(
         "test",
@@ -50,7 +51,7 @@ def test_mcp_stdio_authentication_and_real_tool_call(tmp_path, monkeypatch):
     files = FileServer.__new__(FileServer)
     monkeypatch.setattr(files, "browse_roots", lambda: [{"path": "shared"}])
     runtime.messaging.files = files
-    mail = runtime.messaging.send(
+    mail = runtime.owner.send_mail(
         OWNER, [founder], "Real MCP envelope", request_id="mail",
         attachments=[{"path": "shared/reports", "name": "findings.md"}],
     )
@@ -63,8 +64,12 @@ def test_mcp_stdio_authentication_and_real_tool_call(tmp_path, monkeypatch):
         definitions = await server.list_tools()
         assert {
             "send",
-            "claim",
-            "context",
+            "reply",
+            "introduce",
+            "peek",
+            "read",
+            "dismiss",
+            "clear",
             "handoff",
             "hire",
             "retry",
@@ -77,6 +82,26 @@ def test_mcp_stdio_authentication_and_real_tool_call(tmp_path, monkeypatch):
                 tool.inputSchema.get("properties", {})
             )
         by_name = {tool.name: tool for tool in definitions}
+        mail_names = {"send", "reply", "introduce", "peek", "read", "dismiss", "clear"}
+        assert not {"claim", "messages", "context"} & by_name.keys()
+        expected = {
+            "send": {"to_action", "to_fyi", "body", "subject", "attachments"},
+            "reply": {"message_id", "action", "body", "attachments"},
+            "introduce": {"message_id", "add", "action", "summarize", "body"},
+            "peek": set(),
+            "read": {"message_id", "summarize"},
+            "dismiss": {"message_id"},
+            "clear": {"message_id"},
+        }
+        for name in mail_names:
+            assert set(by_name[name].inputSchema["properties"]) == expected[name]
+            assert by_name[name].annotations.readOnlyHint == (name == "peek")
+            assert "request_id" not in by_name[name].inputSchema["properties"]
+        assert by_name["clear"].inputSchema["required"] == ["message_id"]
+        for name in ("read", "introduce"):
+            assert "summarize" not in by_name[name].inputSchema["required"]
+            assert by_name[name].inputSchema["properties"]["summarize"]["default"] is False
+        assert by_name["clear"].annotations.idempotentHint is True
         hiring_schema = by_name["hire"].inputSchema
         assert set(hiring_schema["properties"]) == {
             "slug",
@@ -85,6 +110,9 @@ def test_mcp_stdio_authentication_and_real_tool_call(tmp_path, monkeypatch):
             "temporary_periods",
         }
         assert hiring_schema["additionalProperties"] is False
+        for name in ("send", "reply", "introduce"):
+            assert "wake" not in by_name[name].inputSchema["properties"]
+            assert "request_id" not in by_name[name].inputSchema["properties"]
         for name in ("send", "reply"):
             attachment_schema = by_name[name].inputSchema["properties"]["attachments"]
             variants = attachment_schema.get("anyOf", [attachment_schema])
@@ -130,17 +158,20 @@ def test_mcp_stdio_authentication_and_real_tool_call(tmp_path, monkeypatch):
             assert "No kickoff message is needed" in hired.content[0].text
             assert "execution_profile" not in hired.content[0].text
             result = await session.call_tool(
-                "claim", {"message_ids": [mail["message_id"]], "request_id": "mcp-claim"}
+                "read", {"message_id": mail["message_id"]}
             )
             assert not result.isError
             assert result.structuredContent is None
             assert len(result.content) == 1
-            assert result.content[0].text.startswith("Messages claimed.")
+            assert "Reading unread messages through" in result.content[0].text
             assert "Real MCP envelope" in json.dumps(result.model_dump())
             assert "Attachments (relative to your drive; prepend its path to open):" in (
                 result.content[0].text
             )
             assert "shared/reports/findings.md" in result.content[0].text
+            cleared = await session.call_tool("clear", {"message_id": mail["message_id"]})
+            assert not cleared.isError
+            assert cleared.content[0].text == f"Nothing unread through {mail['message_id']}."
             directory = await session.call_tool("org_tree", {"depth": 0})
             assert not directory.isError
             assert founder in directory.content[0].text

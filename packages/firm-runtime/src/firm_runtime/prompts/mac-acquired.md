@@ -37,6 +37,7 @@ or make two-finger gestures, and a tap sequence cannot be observed between taps.
 Tap-sequence offsets report when input was posted, not when the app received it.
 Use SSH, UI tests or `simctl` when the work needs those capabilities.
 
-Use a screenshot's returned `drive_path` when citing its saved file. A capture image
-can still be returned if saving fails; without `drive_path` there is no confirmed
-saved screenshot.
+Use a screenshot's returned `drive_path` when citing its saved file in text, and
+prepend your Linux drive path when passing it in attachments. A capture image can
+still be returned if saving fails; without `drive_path` there is no confirmed saved
+screenshot.

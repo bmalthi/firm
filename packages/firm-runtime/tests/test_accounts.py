@@ -7,6 +7,7 @@ import pytest
 
 from firm_runtime import accounts, owner
 from firm_runtime.errors import FirmError
+from firm_runtime.prompt_resources import render
 from firm_runtime.runtime import Runtime
 from firm_runtime.store import ORDINARY_PRIORITY, OWNER, Store
 
@@ -113,13 +114,93 @@ def test_hold_and_manager_notices_reference_the_same_incident(system):
         assert [tuple(row) for row in notices] == [("incident", incident)] * 2
 
 
+def open_incidents(runtime):
+    return {item["incident_id"]: item for item in runtime.accounts.status()["incidents"]}
+
+
+@pytest.mark.parametrize("code,repair", [
+    ("oauth_org_not_allowed", "organization"),
+    ("account_on_hold", "account"),
+    ("credential_refresh_rejected", "sign_in"),
+    (None, "sign_in"),
+])
+def test_hold_stores_code_and_status_carries_recovery(system, code, repair):
+    runtime, _ = system
+    incident = runtime.accounts.pause(OWNER, "account", "a", "auth", code=code)["incident_id"]
+    row = open_incidents(runtime)[incident]
+    assert row["code"] == code and row["repair"] == repair
+    assert row["guidance"] == render("notices", f"auth_repair_{repair}")
+    assert row["login_command"] == "firm login a --provider codex --auth-file /missing/a"
+
+
+def test_login_command_omits_auth_file_for_the_default_path(system, monkeypatch):
+    runtime, _ = system
+    monkeypatch.setattr(accounts, "CREDENTIALS_DIR", Path("~/creds"))
+    config = configuration()
+    del config["accounts"]["c"]["auth_file"]
+    runtime.owner.configure(OWNER, config)
+    default = runtime.accounts.pause(OWNER, "account", "c", "auth")["incident_id"]
+    assert open_incidents(runtime)[default]["login_command"] == "firm login c --provider claude"
+    config["accounts"]["a"]["auth_file"] = "/tmp/my creds/a.json"
+    runtime.owner.configure(OWNER, config)
+    custom = runtime.accounts.pause(OWNER, "account", "a", "auth")["incident_id"]
+    assert open_incidents(runtime)[custom]["login_command"] == (
+        "firm login a --provider codex --auth-file '/tmp/my creds/a.json'"
+    )
+
+
+def test_non_auth_incidents_carry_no_sign_in_advice(system):
+    runtime, _ = system
+    incident = runtime.accounts.pause(OWNER, "profile", "primary", "config")["incident_id"]
+    row = open_incidents(runtime)[incident]
+    assert row["repair"] is None and "guidance" not in row and "login_command" not in row
+
+
+def test_same_kind_repeat_keeps_first_code_and_fills_a_missing_one(system):
+    runtime, _ = system
+    first = runtime.accounts.pause(OWNER, "account", "a", "auth")["incident_id"]
+    assert open_incidents(runtime)[first]["code"] is None
+    again = runtime.accounts.pause(OWNER, "account", "a", "auth", code="account_on_hold")
+    assert again["incident_id"] == first
+    assert open_incidents(runtime)[first]["code"] == "account_on_hold"
+    runtime.accounts.pause(OWNER, "account", "a", "auth", code="oauth_org_not_allowed")
+    assert open_incidents(runtime)[first]["code"] == "account_on_hold"
+
+
+def test_timed_hold_does_not_replace_an_open_owner_hold_of_another_kind(system):
+    runtime, now = system
+    auth = runtime.accounts.pause(OWNER, "account", "a", "auth", code="invalid_api_key")
+    quota = runtime.accounts.pause(OWNER, "account", "a", "quota", now[0] + 100)
+    assert quota["incident_id"] == auth["incident_id"]
+    assert [i["kind"] for i in runtime.accounts.status()["incidents"]] == ["auth"]
+
+
+def test_untimed_hold_still_supersedes_a_timed_one(system):
+    runtime, now = system
+    quota = runtime.accounts.pause(OWNER, "account", "a", "quota", now[0] + 100)["incident_id"]
+    auth = runtime.accounts.pause(OWNER, "account", "a", "auth")["incident_id"]
+    assert auth != quota and list(open_incidents(runtime)) == [auth]
+
+
+@pytest.mark.parametrize("first,second,kept", [(4000, 100, 4000), (100, 4000, 4000)])
+def test_of_two_timed_holds_of_different_kinds_the_later_end_stands(system, first, second, kept):
+    runtime, now = system
+    outage = runtime.accounts.pause(OWNER, "profile", "primary", "outage", now[0] + first)
+    quota = runtime.accounts.pause(OWNER, "profile", "primary", "quota", now[0] + second)
+    (incident,) = runtime.accounts.status()["incidents"]
+    # The newer cause is the one shown, but a short pause cannot cut a long one.
+    assert quota["incident_id"] != outage["incident_id"]
+    assert (incident["incident_id"], incident["kind"]) == (quota["incident_id"], "quota")
+    assert incident["until_at"] == now[0] + kept
+
+
 def role(runtime, employee="founder"):
     with runtime.store.read() as db:
         return runtime.store.role(db, employee)
 
 
 def wake(runtime, employee="founder", request="wake"):
-    runtime.messaging.send(OWNER, [employee], "Continue work", request_id=request)
+    runtime.owner.send_mail(OWNER, [employee], "Continue work", request_id=request)
 
 
 def start(runtime):
@@ -426,7 +507,7 @@ def test_subscription_warning_is_notified_once_per_window(system):
             (accounts.OPERATIONS,),
         ).fetchone()[0] == 1
         assert db.execute(
-            "SELECT COUNT(*) FROM messages WHERE subject LIKE '%subscription limit%'"
+            "SELECT COUNT(*) FROM messages WHERE body LIKE '%subscription limit%\n\n%'"
         ).fetchone()[0] == 1
 
 
@@ -575,7 +656,7 @@ def test_dependency_failures_preserve_generic_budget_and_session(
         assert (
             db.execute(
                 "SELECT COUNT(*) FROM messages "
-                "WHERE subject='Employee execution requires manager action'"
+                "WHERE body LIKE 'Employee execution requires manager action\n\n%'"
             ).fetchone()[0]
             == 0
         )
@@ -605,6 +686,191 @@ def test_fresh_profile_hold_uses_fallback_but_retained_session_waits(system, kin
         assert [row[0] for row in notices] == [first.employee_id]
 
 
+def two_profiles_one_account_configuration():
+    return {
+        "max_active": 6,
+        "staffing": False,
+        "founder_profile": "first",
+        "default_profile": "second",
+        "accounts": {
+            "a": {"provider": "codex", "auth_file": "/missing/a", "max_active": 3},
+        },
+        "profiles": {
+            "first": {"provider": "codex", "model": "one", "effort": "low", "accounts": ["a"]},
+            "second": {"provider": "codex", "model": "two", "effort": "low", "accounts": ["a"]},
+        },
+    }
+
+
+def test_model_quota_refusal_pauses_only_the_profile_and_spends_no_attempt(tmp_path):
+    now = [1000.0]
+    runtime = Runtime(Store.scratch(tmp_path / "firm.sqlite3", clock=lambda: now[0]))
+    runtime.lifecycle.initialize(
+        "test", "Build useful things.", two_profiles_one_account_configuration()
+    )
+    runtime.start()
+    founder = start(runtime)
+    assert binding(runtime, founder)["profile"] == "first"
+    child = runtime.tools(founder.token).hire("child", "Own tasks", "hire")["employee_id"]
+    runtime.finish(
+        founder.activation_id,
+        "failed",
+        category="quota",
+        retry_after=now[0] + 500,
+        failure_code="model_quota_reached",
+    )
+    incidents = runtime.accounts.status()["incidents"]
+    assert [(i["scope"], i["dependency"], i["kind"], i["until_at"]) for i in incidents] == [
+        ("profile", "first", "quota", 1500)
+    ]
+    assert incidents[0]["code"] == "model_quota_reached"
+    with runtime.store.read() as db:
+        pinned = db.execute(
+            "SELECT COUNT(*) FROM role_dependencies WHERE employee_id=?", ("founder",)
+        ).fetchone()[0]
+    assert pinned == 0
+    assert role(runtime)["attempt_count"] == 0
+    assert role(runtime)["hold_reason"] is None
+    with runtime.store.read() as db:
+        selected = runtime.accounts.select(db, runtime.store.role(db, child))
+    assert selected is not None and selected["profile"] == "second"
+    assert selected["account_id"] == "a"
+
+
+def agy_two_profiles(model, effort):
+    """The first profile on an AGY account, where effort xhigh always selects Argon."""
+    config = two_profiles_one_account_configuration()
+    config["accounts"]["a"]["provider"] = "agy"
+    config["profiles"]["first"].update(provider="agy", model=model, effort=effort)
+    config["profiles"]["second"].update(provider="agy", model="gemini-4-hydrogen", effort="low")
+    return config
+
+
+def model_quota_system(tmp_path, effort=None, config=None):
+    now = [1000.0]
+    runtime = Runtime(Store.scratch(tmp_path / "firm.sqlite3", clock=lambda: now[0]))
+    runtime.lifecycle.initialize(
+        "test", "Build useful things.", config or two_profiles_one_account_configuration()
+    )
+    runtime.start()
+    if effort:
+        with runtime.store.transaction() as db:
+            db.execute("UPDATE roles SET effort=? WHERE employee_id='founder'", (effort,))
+    return runtime, now
+
+
+def activation_row(runtime, activation_id):
+    with runtime.store.read() as db:
+        row = db.execute("SELECT * FROM activations WHERE activation_id=?", (activation_id,))
+        return dict(row.fetchone())
+
+
+def test_model_quota_on_the_profiles_own_settings_is_timed_and_refunds_the_attempt(tmp_path):
+    runtime, now = model_quota_system(tmp_path)
+    founder = start(runtime)
+    runtime.finish(
+        founder.activation_id, "failed", category="quota",
+        failure_code="model_quota_reached", retry_after=now[0] + 500,
+    )
+    assert activation_row(runtime, founder.activation_id)["failure_category"] == "quota"
+    assert [(i["scope"], i["dependency"]) for i in runtime.accounts.status()["incidents"]] == [
+        ("profile", "first")
+    ]
+    assert role(runtime)["attempt_count"] == 0
+    assert role(runtime)["retry_at"] is None
+
+
+@pytest.mark.parametrize("model,profile_effort,role_effort", [
+    ("one", "low", "high"),  # effort alone does not change the model
+    ("gemini-4-argon", "medium", "high"),
+    ("gemini-4-argon", "high", "xhigh"),  # xhigh selects Argon, which the profile names
+])
+def test_model_quota_on_an_override_that_keeps_the_model_still_holds_the_profile(
+    tmp_path, model, profile_effort, role_effort
+):
+    config = (
+        agy_two_profiles(model, profile_effort) if model.startswith("gemini") else None
+    )
+    runtime, now = model_quota_system(tmp_path, effort=role_effort, config=config)
+    founder = start(runtime)
+    assert json.loads(binding(runtime, founder)["settings_json"])["effort"] == role_effort
+    runtime.finish(
+        founder.activation_id, "failed", category="quota",
+        failure_code="model_quota_reached", retry_after=now[0] + 500,
+    )
+    assert activation_row(runtime, founder.activation_id)["failure_category"] == "quota"
+    assert [(i["scope"], i["dependency"]) for i in runtime.accounts.status()["incidents"]] == [
+        ("profile", "first")
+    ]
+    assert role(runtime)["attempt_count"] == 0 and role(runtime)["retry_at"] is None
+
+
+def test_model_quota_on_an_override_that_selects_another_model_is_the_roles_own_failure(
+    tmp_path
+):
+    # The profile names Hydrogen, but this role's xhigh effort ran Argon: holding the
+    # profile would pause Hydrogen roles for a refusal that was never about Hydrogen.
+    runtime, now = model_quota_system(
+        tmp_path, effort="xhigh", config=agy_two_profiles("gemini-4-hydrogen", "medium")
+    )
+    founder = start(runtime)
+    assert json.loads(binding(runtime, founder)["settings_json"])["effort"] == "xhigh"
+    runtime.finish(
+        founder.activation_id, "failed", category="quota",
+        failure_code="model_quota_reached", retry_after=now[0] + 500000,
+    )
+    assert runtime.accounts.status()["incidents"] == []
+    assert activation_row(runtime, founder.activation_id)["failure_category"] == "unknown"
+    assert role(runtime)["attempt_count"] == 1
+    assert role(runtime)["hold_reason"] is None
+    assert now[0] < role(runtime)["retry_at"] < now[0] + 3600
+    for attempt in (2, 3, 4):
+        now[0] = role(runtime)["retry_at"]
+        again = start(runtime)
+        runtime.finish(
+            again.activation_id, "failed", category="quota",
+            failure_code="model_quota_reached", retry_after=now[0] + 500000,
+        )
+        assert role(runtime)["attempt_count"] == attempt
+    assert role(runtime)["hold_reason"] == "attempts_exhausted"
+    assert runtime.accounts.status()["incidents"] == []
+
+
+def test_quota_failure_without_a_binding_or_model_code_still_needs_an_adapter(tmp_path):
+    runtime, now = model_quota_system(tmp_path)
+    founder = start(runtime)
+    with runtime.store.transaction() as db:
+        db.execute("DELETE FROM execution_bindings WHERE session_id=?", (founder.session_id,))
+    with pytest.raises(FirmError, match="requires a provider/account adapter"):
+        runtime.finish(
+            founder.activation_id, "failed", category="quota", failure_code="quota_exceeded",
+            retry_after=now[0] + 60,
+        )
+
+
+def test_report_task_setup_notifies_once_per_model_and_code(system):
+    runtime, _ = system
+
+    def notices():
+        with runtime.store.read() as db:
+            return db.execute(
+                "SELECT COUNT(*) FROM messages WHERE body LIKE ?",
+                (render("notices", "task_setup_rejected_subject", provider="codex") + "\n\n%",),
+            ).fetchone()[0]
+
+    for _ in range(2):
+        with runtime.store.transaction() as db:
+            runtime.accounts.report_task_setup(db, "codex", "m1", "model_rejected")
+    assert notices() == 1
+    with runtime.store.transaction() as db:
+        runtime.accounts.report_task_setup(db, "codex", "m2", "model_rejected")
+    assert notices() == 2
+    with runtime.store.transaction() as db:
+        runtime.accounts.report_task_setup(db, "codex", "m2", "other_code")
+    assert notices() == 3
+    assert runtime.accounts.status()["incidents"] == []
+
+
 def test_account_auth_hold_does_not_block_other_roles(system):
     runtime, _ = system
     first = start(runtime)
@@ -631,6 +897,84 @@ def test_retry_does_not_clear_shared_hold_or_newer_incident(system):
     assert runtime.accounts.status()["incidents"][0]["incident_id"] == current
 
 
+def test_immediate_owner_retry_preserves_budget_and_cancels_future_wake(system):
+    runtime, now = system
+    invocation = start(runtime)
+    runtime.finish(invocation.activation_id, "failed", category="transient")
+    before = role(runtime)
+    old_deadline = before["retry_at"]
+    assert old_deadline > now[0]
+    with pytest.raises(FirmError, match="only the owner"):
+        runtime.retry("founder", "founder", before["recovery_episode"], "manager",
+                      immediate=True)
+    with pytest.raises(FirmError, match="not held"):
+        runtime.retry(OWNER, "founder", before["recovery_episode"], "ordinary")
+    result = runtime.retry(OWNER, "founder", before["recovery_episode"], "now", immediate=True)
+    assert runtime.retry(OWNER, "founder", before["recovery_episode"], "now",
+                         immediate=True) == result
+    assert role(runtime)["attempt_count"] == before["attempt_count"]
+    assert role(runtime)["retry_at"] is None
+    with runtime.store.read() as db:
+        assert not db.execute(
+            "SELECT 1 FROM execution_requests WHERE employee_id='founder' AND reason='recovery'"
+        ).fetchone()
+    # Competing scheduler admission cannot create two activations from the retry.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        admissions = list(executor.map(lambda _: runtime.admit(), range(2)))
+    admitted = [item for item in admissions if item is not None]
+    assert len(admitted) == 1
+    runtime.mark_started(admitted[0].activation_id)
+    runtime.finish(admitted[0].activation_id)
+    now[0] = old_deadline + 1
+    assert runtime.admit() is None
+    with pytest.raises(FirmError, match="stale recovery"):
+        runtime.retry(OWNER, "founder", before["recovery_episode"], "stale", immediate=True)
+
+
+@pytest.mark.parametrize("kind", ["auth", "config", "quota"])
+def test_immediate_retry_does_not_clear_dependency_holds(system, kind):
+    runtime, _ = system
+    invocation = start(runtime)
+    runtime.finish(invocation.activation_id, "failed", category="transient")
+    before = role(runtime)
+    scope, dependency = ("profile", "primary") if kind == "config" else ("account", "a")
+    incident = runtime.accounts.pause(OWNER, scope, dependency, kind)["incident_id"]
+    result = runtime.retry(OWNER, "founder", before["recovery_episode"], "now", immediate=True)
+    assert result["execution_dependency_blocked"]
+    assert runtime.admit() is None
+    assert role(runtime)["attempt_count"] == before["attempt_count"]
+    assert incident in {item["incident_id"] for item in runtime.accounts.status()["incidents"]}
+
+
+@pytest.mark.parametrize("code,remedy", [
+    ("oauth_org_not_allowed", "organization does not allow subscription access"),
+    ("account_on_hold", "provider has put this account on hold"),
+    ("invalid_api_key", "saved login was rejected"),
+    ("unsafe private /path", "saved login was rejected"),
+    ("synthetic-secret-token-looks-like-code", "saved login was rejected"),
+])
+def test_account_hold_notice_names_safe_code_exact_incident_and_remedy(system, code, remedy):
+    runtime, _ = system
+    invocation = start(runtime)
+    runtime.finish(invocation.activation_id, "failed", category="auth", failure_code=code)
+    incident = runtime.accounts.status()["incidents"][0]
+    with runtime.store.read() as db:
+        notices = db.execute(
+            "SELECT body FROM messages WHERE body LIKE 'Shared execution dependency paused\n\n%'"
+        ).fetchall()
+    assert len(notices) == 1
+    body = notices[0][0]
+    assert "Shared account a" in body and incident["incident_id"] in body
+    assert remedy in body and "clear this exact incident" in body
+    assert "unsafe private" not in body
+    assert "To sign in, run `firm login a --provider codex --auth-file /missing/a`." in body
+    if code not in {"unsafe private /path", "synthetic-secret-token-looks-like-code"}:
+        assert f"Code: {code}." in body
+    else:
+        assert "Code: not reported." in body
+        assert code not in body
+
+
 def test_shared_incident_manager_copy_has_ordinary_priority(system):
     runtime, _ = system
     founder = start(runtime)
@@ -646,7 +990,7 @@ def test_shared_incident_manager_copy_has_ordinary_priority(system):
         incident_notice = db.execute(
             "SELECT m.message_id FROM messages m JOIN message_deliveries d USING(message_id) "
             "WHERE d.employee_id='founder' "
-            "AND m.subject='Employee waiting for shared capacity'"
+            "AND m.body LIKE 'Employee waiting for shared capacity\n\n%'"
         ).fetchone()
         assert incident_notice is not None
         wake = db.execute(
@@ -684,7 +1028,7 @@ def test_owner_fresh_routing_requires_exit_preserves_budget_mail_and_holds(syste
     runtime.owner.resume_role(OWNER, "founder", "resume")
     third = start(runtime)
     assert third.session_id == second.session_id
-    assert third.context["inbox"]["conversations"]
+    assert third.context["inbox"]["threads"]
     assert runtime.accounts.status()["incidents"][0]["incident_id"] == incident
 
 
@@ -806,11 +1150,21 @@ def test_invalid_configuration_value_types_raise_firm_errors(system, edit, messa
         runtime.owner.configure(OWNER, config)
 
 
-@pytest.mark.parametrize("kind", ["auth", "quota"])
-def test_account_specific_holds_cannot_be_mislabelled_as_profile_holds(system, kind):
+def test_account_specific_holds_cannot_be_mislabelled_as_profile_holds(system):
     runtime, _ = system
     with pytest.raises(FirmError, match="scoped to an account"):
-        runtime.accounts.pause(OWNER, "profile", "primary", kind)
+        runtime.accounts.pause(OWNER, "profile", "primary", "auth")
+
+
+def test_profile_scoped_quota_hold_is_accepted(system):
+    runtime, now = system
+    runtime.accounts.pause(OWNER, "profile", "primary", "quota", until=now[0] + 60)
+    incident = runtime.accounts.status()["incidents"][0]
+    assert (incident["scope"], incident["dependency"], incident["kind"]) == (
+        "profile",
+        "primary",
+        "quota",
+    )
 
 
 @pytest.mark.parametrize("kind", ["auth", "config"])
@@ -888,8 +1242,8 @@ def test_transient_setup_failures_use_bounded_existing_budget_and_notice(system)
     assert role(runtime)["hold_reason"] == "attempts_exhausted"
     assert runtime.admit() is None
     with runtime.store.read() as db:
-        notices = db.execute("SELECT body FROM messages WHERE subject=?",
-                             ("Employee work requires manager action",)).fetchall()
+        notices = db.execute("SELECT body FROM messages WHERE body LIKE ?",
+                             ("Employee work requires manager action\n\n%",)).fetchall()
     assert len(notices) == 1 and "firm route --fresh" in notices[0][0]
     episode = role(runtime)["recovery_episode"]
     runtime.owner.route(OWNER, "founder", "primary", "fresh")
@@ -908,7 +1262,7 @@ def test_guidance_change_keeps_native_session_binding_and_execution_profile(syst
         profile = runtime.store.role(db, "founder")["execution_profile"]
     runtime.finish(first.activation_id)
     runtime.owner.set_guidance(OWNER, "founder", "specialist-adviser", ["legal"], "guides")
-    runtime.messaging.send(OWNER, ["founder"], "Continue", request_id="wake")
+    runtime.owner.send_mail(OWNER, ["founder"], "Continue", request_id="wake")
     next_run = runtime.admit()
     assert next_run.context["guidance_changed"] is True
     assert next_run.session_id == first.session_id

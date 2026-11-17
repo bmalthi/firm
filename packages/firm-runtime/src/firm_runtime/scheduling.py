@@ -17,7 +17,7 @@ def acknowledge_opportunities(db, employee_id: str, now: float) -> None:
     """Use inside the admission transaction, after saving its reason snapshot.
 
     NULL ready time means the delivery no longer asks for an opportunity. Its
-    inbox disposition is independent: admission never claims or dismisses mail.
+    inbox disposition is independent: admission never reads or dismisses mail.
     New arrivals after this transaction retain their own scheduling ready time.
     """
     db.execute(

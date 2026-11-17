@@ -1056,11 +1056,17 @@ def test_compaction_without_metadata_clears_current_until_next_request():
 
 
 @pytest.mark.parametrize("terminal", [True, False])
-def test_claude_assistant_auth_failure_is_classified_without_retaining_text(terminal):
+@pytest.mark.parametrize("code,category", [
+    ("authentication_failed", "auth"), ("oauth_org_not_allowed", "auth"),
+    ("account_on_hold", "auth"), ("server_error", "transient"),
+])
+def test_claude_assistant_auth_failure_is_classified_without_retaining_text(
+    terminal, code, category,
+):
     events = [
         {
             "type": "assistant",
-            "error": "authentication_failed",
+            "error": code,
             "message": {"content": [{"type": "text", "text": "private credential detail"}]},
         }
     ]
@@ -1068,16 +1074,19 @@ def test_claude_assistant_auth_failure_is_classified_without_retaining_text(term
         events.append({"type": "result", "is_error": True, "result": "private detail"})
     result = parse_result("\n".join(json.dumps(e) for e in events), 1)
     assert not result.success
-    assert result.error.category == "auth"
-    assert result.error.code == "authentication_failed"
+    assert result.error.category == category
+    assert result.error.code == code
     assert "private" not in repr(result)
 
 
-def test_authentication_words_in_assistant_content_do_not_classify_failure():
+@pytest.mark.parametrize("code", [
+    "authentication_failed", "oauth_org_not_allowed", "account_on_hold", "server_error",
+])
+def test_authentication_words_in_assistant_content_do_not_classify_failure(code):
     events = [
         {
             "type": "assistant",
-            "message": {"content": [{"type": "text", "text": "authentication_failed"}]},
+            "message": {"content": [{"type": "text", "text": code}]},
         },
         {"type": "result", "is_error": True},
     ]

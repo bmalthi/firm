@@ -1,8 +1,10 @@
 """Validate a web backend inspected by a headless browser inside a Linux role.
 
 Run with uv against an explicitly selected disposable firm. The default native
-mode installs Playwright and Chromium in an ordinary role's home, without sudo or
-Docker, and exercises the base image's browser libraries with trusted local HTML.
+mode adds the Playwright matching the base image's shared Chromium to a project in
+an ordinary role's home, without sudo or Docker, and requires that the role launches
+that browser without downloading its own; on an older base without shared browsers it
+installs Playwright and Chromium itself. It renders trusted local HTML.
 It uses Playwright's default disabled Chromium sandbox; --chromium-sandbox tests
 the stricter launch, which stock Ubuntu AppArmor user-namespace policy may deny.
 Optional --mode docker
@@ -12,6 +14,8 @@ text and logs a console message; the browser waits for the title, reads the text
 collects the console and produces a full-page screenshot and PDF. The host checks
 the values, PNG dimensions, PDF framing, the run's settlement with an
 empty slice and that the VMs stop. No [mac] is needed.
+Native setup reports separate SDK and browser-install timings; repeat with the
+same role for warm setup, or --offline-reuse to skip installers and reuse it.
 """
 
 import argparse
@@ -23,8 +27,9 @@ from pathlib import Path
 
 from firm_sandbox import Config, Organization, RunSpec, Sandbox
 
-# Official Playwright Python image and its matching PyPI release
+# Docker mode: an official Playwright Python image and its matching PyPI release
 # (mcr.microsoft.com/v2/playwright/python/tags/list, pypi.org/project/playwright).
+# Native mode uses the version the base image recorded instead.
 PLAYWRIGHT_VERSION = "1.63.0"
 PLAYWRIGHT_IMAGE = f"mcr.microsoft.com/playwright/python:v{PLAYWRIGHT_VERSION}-noble"
 WEB_IMAGE = "python:3.13-slim"
@@ -193,19 +198,54 @@ if sudo -n true; then echo 'Role unexpectedly has sudo'; exit 1; fi
 project="$HOME/browser-probe-native"
 mkdir -p "$project/site" "$project/probe" "$project/out"
 cd "$project"
+rm -f out/result.json out/page.png out/page.pdf
 cp "$FIRM_CREDENTIALS_DIR/page" site/index.html
 cp "$FIRM_CREDENTIALS_DIR/data" site/data.json
 cp "$FIRM_CREDENTIALS_DIR/probe" probe/probe.py
-if [ ! -f pyproject.toml ]; then
-    uv init --bare --name firm-browser-probe --no-workspace --no-managed-python
+now() { local t; t=$(date +%s%N); echo $(( t / 1000000 )); }
+step() {
+    local name="$1" start code
+    shift
+    start=$(now)
+    set +e
+    "$@"
+    code=$?
+    set -e
+    printf '\nBROWSER_STEP %s %s %s\n' "$name" "$code" "$(( $(now) - start ))"
+    if [ "$code" -ne 0 ]; then exit "$code"; fi
+}
+if [ -f pyproject.toml ]; then
+    printf '\nBROWSER_PROJECT_EXISTED true\n'
+else
+    printf '\nBROWSER_PROJECT_EXISTED false\n'
 fi
-uv add 'playwright==PLAYWRIGHT_VERSION'
-uv run playwright install chromium
+# Braces are avoided: systemd expands braced shell variables.
+shared_version=none
+if [ -s /opt/firm/playwright-version ]; then
+    shared_version=$(cat /opt/firm/playwright-version)
+fi
+printf '\nBROWSER_SHARED_VERSION %s\n' "$shared_version"
+if [ "$FIRM_BROWSER_OFFLINE" != 1 ]; then
+    if [ ! -f pyproject.toml ]; then
+        step project uv init --bare --name firm-browser-probe --no-workspace --no-managed-python
+    fi
+    if [ "$shared_version" = none ]; then
+        step sdk uv add playwright
+    else
+        step sdk uv add "playwright~=$shared_version"
+    fi
+    # With the shared browser linked, this must find it rather than download.
+    step browser_install uv run playwright install chromium
+fi
 set +e
-FIRM_BROWSER_NATIVE=1 uv run probe/probe.py "$@"
+FIRM_BROWSER_NATIVE=1 uv run --offline --no-sync probe/probe.py "$@"
 code=$?
 set -e
-""".replace("PLAYWRIGHT_VERSION", PLAYWRIGHT_VERSION) + ARTIFACTS + 'exit "$code"\n'
+# Links to the shared browsers are not directories to find; downloads are.
+own=$(find "$HOME/.cache/ms-playwright" -mindepth 1 -maxdepth 1 -type d -name 'chromium*' \
+    2>/dev/null | wc -l)
+printf '\nBROWSER_OWN_DOWNLOADS %s\n' "$own"
+""" + ARTIFACTS + 'exit "$code"\n'
 
 DOCKER_SCRIPT = r"""set -eux
 command -v docker
@@ -255,6 +295,16 @@ def marker(lines, name):
     return values[-1] if values else None
 
 
+def setup_steps(lines):
+    """Completed native setup stages, including failed installers and their elapsed time."""
+    steps = {}
+    for line in lines:
+        if line.startswith("BROWSER_STEP "):
+            _, name, code, milliseconds = line.split()
+            steps[name] = {"exit_code": int(code), "milliseconds": int(milliseconds)}
+    return steps
+
+
 def artifact(lines, name):
     try:
         begin = lines.index(f"BROWSER_{name}_BEGIN")
@@ -287,29 +337,42 @@ def main():
     parser.add_argument("--mode", choices=("native", "docker"), default="native")
     parser.add_argument("--chromium-sandbox", action="store_true",
                         help="Require Chromium's sandbox (native only; stock AppArmor may deny it)")
+    parser.add_argument("--offline-reuse", action="store_true",
+                        help="Reuse native installation with Linux egress off and no installers")
     args = parser.parse_args()
     if args.chromium_sandbox and args.mode != "native":
         parser.error("--chromium-sandbox requires --mode native")
+    if args.offline_reuse and args.mode != "native":
+        parser.error("--offline-reuse requires --mode native")
     args.evidence.mkdir(mode=0o700, parents=True, exist_ok=False)
     box = Sandbox(Config.load(args.root / "sandbox.toml"))
     record = {
         "role": args.role,
         "mode": args.mode,
         "chromium_sandbox": args.chromium_sandbox,
+        "offline_reuse": args.offline_reuse,
+        "egress_mode": box.config.egress_mode,
         "mac": "not used" if not box.mac else "configured but not used",
         "images": {"browser": PLAYWRIGHT_IMAGE, "web": WEB_IMAGE} if args.mode == "docker" else {},
-        "playwright_package": PLAYWRIGHT_VERSION,
+        "playwright_package": PLAYWRIGHT_VERSION if args.mode == "docker" else None,
         "passed": False,
     }
+    restore_egress = None
     try:
         started = time.monotonic()
         box.up()
         record["up_seconds"] = round(time.monotonic() - started, 1)
+        record["traffic_before"] = box.linux.network.traffic()
+        if args.offline_reuse:
+            restore_egress = box.linux.network.saved_egress()
+            record["offline_egress"] = box.linux.network.set_egress(False)["egress"]
         organization = Organization(args.role)
         box.file_server.provision(args.role, organization)
         started = time.monotonic()
         script = NATIVE_SCRIPT if args.mode == "native" else DOCKER_SCRIPT
         command = ("/bin/bash", "-lc", script, "browser-probe")
+        if args.mode == "native":
+            command = ("/usr/bin/env", f"FIRM_BROWSER_OFFLINE={int(args.offline_reuse)}", *command)
         if args.chromium_sandbox:
             command += ("--chromium-sandbox",)
         run = box.start(RunSpec(
@@ -322,9 +385,21 @@ def main():
         ))
         result = box.wait(run, timeout=3000)
         record["run_seconds"] = round(time.monotonic() - started, 1)
+        record["traffic_after"] = box.linux.network.traffic()
         output = box.logs(run).decode(errors="replace")
         (args.evidence / "role.log").write_text(output)
         lines = output.splitlines()
+        record["setup_steps"] = setup_steps(lines)
+        record["project_existed"] = marker(lines, "BROWSER_PROJECT_EXISTED") == "true"
+        if args.mode == "native":
+            record["shared_browser_version"] = marker(lines, "BROWSER_SHARED_VERSION")
+            if record["shared_browser_version"] != "none":
+                record["playwright_package"] = record["shared_browser_version"]
+            downloads = marker(lines, "BROWSER_OWN_DOWNLOADS")
+            record["own_browser_downloads"] = None if downloads is None else int(downloads)
+        record["setup_failure"] = next(
+            (name for name, step in record["setup_steps"].items() if step["exit_code"]), None
+        )
         image = artifact(lines, "SCREENSHOT")
         if image is not None:
             (args.evidence / "page.png").write_bytes(image)
@@ -379,6 +454,14 @@ def main():
                 outside_container=browser.get("outside_container") is True,
                 chromium_sandbox_setting=browser.get("chromium_sandbox") is args.chromium_sandbox,
             )
+            if record["shared_browser_version"] not in (None, "none"):
+                checks.update(shared_browser_used=record["own_browser_downloads"] == 0)
+            if args.offline_reuse:
+                checks.update(
+                    egress_disabled=record.get("offline_egress") is False
+                    and record["traffic_after"].get("egress") is False,
+                    installers_skipped=record["setup_steps"] == {},
+                )
         else:
             checks.update(compose_exit_zero=record["compose_exit"] == 0,
                           compose_down_clean=record["compose_down_clean"])
@@ -386,14 +469,18 @@ def main():
         failed = [name for name, ok in checks.items() if not ok]
         if failed:
             raise RuntimeError(f"Browser workload failed {failed}; inspect role.log")
-        record["passed"] = True
     finally:
         (args.evidence / "result.json").write_text(json.dumps(record, indent=2))
-        box.down()
+        try:
+            if restore_egress is not None:
+                box.linux.network.set_egress(restore_egress)
+        finally:
+            box.down()
     if box.state() != "stopped":
         record["passed"] = False
         (args.evidence / "result.json").write_text(json.dumps(record, indent=2))
         raise RuntimeError("Browser acceptance cleanup left a VM running")
+    record["passed"] = True
     record["vms_stopped"] = True
     (args.evidence / "result.json").write_text(json.dumps(record, indent=2))
     print(json.dumps(record, indent=2), flush=True)

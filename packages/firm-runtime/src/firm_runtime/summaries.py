@@ -39,8 +39,12 @@ class SummaryInputTooLarge(ValueError):
     """Input validation failed before any provider launch was attempted."""
 
 
-def summary_role_id(run_id: str) -> str:
-    """Summary runs have no employee; their sandbox role id derives from the run."""
+def summary_role_id(run_id: str, stateless_slot: int | None = None) -> str:
+    """Stateless calls lease reusable accounts; task specs retain run identities."""
+    if stateless_slot is not None:
+        if type(stateless_slot) is not int or not 0 <= stateless_slot < MAX_SUMMARY_CONCURRENCY:
+            raise ValueError("invalid stateless slot")
+        return f"s-slot-{stateless_slot}"
     return "s-" + run_id[-32:]
 
 
@@ -77,12 +81,15 @@ CREATE TABLE IF NOT EXISTS summary_runs (
     token_hash TEXT UNIQUE,
     provider_started_at REAL,
     kind TEXT NOT NULL DEFAULT 'summary',
-    caller_activation_id TEXT REFERENCES activations(activation_id)
+    caller_activation_id TEXT REFERENCES activations(activation_id),
+    stateless_slot INTEGER CHECK(stateless_slot >= 0 AND stateless_slot < 4)
 );
 CREATE INDEX IF NOT EXISTS summary_runs_by_account
     ON summary_runs(account_id, state);
 CREATE INDEX IF NOT EXISTS task_runs_by_caller
     ON summary_runs(caller_activation_id, state) WHERE kind='task';
+CREATE UNIQUE INDEX IF NOT EXISTS active_stateless_slots
+    ON summary_runs(stateless_slot) WHERE state='running' AND stateless_slot IS NOT NULL;
 """
 
 
@@ -110,6 +117,7 @@ class SummaryLaunch:
     tools_enabled: bool = False
     workspace_grants: tuple[str, ...] = ()
     mcp_url: str | None = None
+    stateless_slot: int | None = None
 
 
 class SummaryRunner(Protocol):
@@ -177,6 +185,11 @@ class SandboxSummaryRunner:
             ):
                 raise SummaryUnavailable("summary admission is closed")
             spec = self.build_spec(request)
+            if request.stateless_slot is not None and (
+                not spec.stateless
+                or spec.role_id != summary_role_id(request.run_id, request.stateless_slot)
+            ):
+                raise ValueError("summary RunSpec must use its reserved stateless slot")
             if spec.organization is not None:
                 raise ValueError("summary RunSpec cannot grant organization authority")
             if "FIRM_ACTIVATION_TOKEN" in spec.env or "FIRM_ACTIVATION_TOKEN" in spec.secret_env:
@@ -223,6 +236,10 @@ class SandboxSummaryRunner:
 
     def _maintain(self, action, run):
         """Keep cancellation/cleanup off the request and host-power-off paths."""
+        if action == "retire" and run.role_id.startswith("s-slot-"):
+            # The guest wipes before publishing resolved exit. The account remains
+            # reusable; retiring it could race the next call using the same slot.
+            return
         key = (action, run.run_id)
         with self._lock:
             if key in self._maintenance:
@@ -297,12 +314,12 @@ class SandboxSummaryRunner:
             return {key for key, value in self._handles.items() if value.launch_pending}
 
     def confirm_host_stop(self, *, exclude=frozenset()) -> set[str]:
-        """Host-off proof applies only to launches already settled before that proof."""
+        """Host-off proves process death, but pooled homes still need guest cleanup."""
         with self._lock:
             pending = self.pending_launches() | set(exclude)
             for key, handle in self._handles.items():
                 handle.cancel.set()
-                if key not in pending:
+                if key not in pending and handle.request.stateless_slot is None:
                     handle.exit_confirmed = True
             return pending
 
@@ -328,7 +345,7 @@ class SandboxSummaryRunner:
                         handle.exit_confirmed = True
                 continue
             run, status = entry
-            if run.role_id != summary_role_id(row["run_id"]):
+            if run.role_id != summary_role_id(row["run_id"], row["stateless_slot"]):
                 raise FirmError("summary sandbox identity does not match its reservation")
             if status["running"] or status.get("unresolved"):
                 active.add(run.run_id)
@@ -587,21 +604,25 @@ class SummaryService:
         run_id = "run-" + uuid4().hex
         start_token = secrets.token_urlsafe(32)
         if self.store is None:
+            if isinstance(self.provider, SandboxSummaryRunner):
+                raise ValueError("sandbox summaries require durable slot reservations")
             self._inflight.add(run_id)
             return run_id, {"start_token": start_token}
         now = self.store.clock()
         with self.store.transaction() as db:
-            active = db.execute(
-                "SELECT COUNT(*) FROM summary_runs WHERE state='running' AND kind!='task'"
-            ).fetchone()[0]
-            if active >= MAX_SUMMARY_CONCURRENCY:
+            occupied = {row[0] for row in db.execute(
+                "SELECT stateless_slot FROM summary_runs WHERE state='running' AND kind!='task'"
+            )}
+            available = sorted(set(range(MAX_SUMMARY_CONCURRENCY)) - occupied)
+            if not available:
                 return None
+            stateless_slot = available[0]
             reservation = {} if reserve is None else reserve(db, run_id)
             if reservation is None:
                 return None
             db.execute(
                 "INSERT INTO summary_runs(run_id,started_at,state,input_bytes,account_id,profile,"
-                "provider,deadline,token_hash,kind) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "provider,deadline,token_hash,kind,stateless_slot) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     run_id,
                     now,
@@ -613,11 +634,12 @@ class SummaryService:
                     now + timeout,
                     hashlib.sha256(start_token.encode()).hexdigest(),
                     kind,
+                    stateless_slot,
                 ),
             )
             analysis_history.summary_bound(db, now, run_id, caller_session_id, reservation)
             self._inflight.add(run_id)
-        return run_id, {**reservation, "start_token": start_token}
+        return run_id, {**reservation, "start_token": start_token, "stateless_slot": stateless_slot}
 
     def begin_execution(self, token: str) -> dict:
         """One-use launch permission; this token grants no role or MCP access."""
@@ -712,6 +734,10 @@ class SummaryService:
             if candidate_ids is not None:
                 query += " AND run_id IN (" + ",".join("?" for _ in candidate_ids) + ")"
                 params += tuple(candidate_ids)
+            if host_stopped:
+                # Power-off proves process death, not erasure of persistent slot
+                # homes. Healthy guest inventory must confirm their cleanup.
+                query += " AND stateless_slot IS NULL"
             return db.execute(query, params).rowcount
 
     @staticmethod
@@ -854,6 +880,7 @@ class SummaryService:
             kind=kind,
             instructions=instructions,
             max_input_bytes=max_input_bytes,
+            stateless_slot=reservation.get("stateless_slot"),
         )
         try:
             try:

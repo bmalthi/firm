@@ -6,7 +6,6 @@ import sqlite3
 import sys
 
 import pytest
-from firm_sandbox.compatibility import COMPATIBILITY_GENERATION
 
 from firm_runtime import export as exports
 from firm_runtime import fleet
@@ -108,7 +107,6 @@ def test_export_writes_database_host_records_drive_and_a_verifiable_manifest(
     assert FakeSandbox.calls == [("export", False, True)]
     manifest = exports.verify(export)
     assert set(manifest["entries"]) == {
-        "firm-release.json",
         "firm.sqlite3",
         "events.jsonl",
         "inputs/activations/a1/activation.txt",
@@ -119,11 +117,7 @@ def test_export_writes_database_host_records_drive_and_a_verifiable_manifest(
     }
     assert manifest["entries"]["drive/org/founder/work/latest"] == {"link": "hello.md"}
     assert manifest["firm_id"] == result["firm_id"] == "demo"
-    assert (result["files"], manifest["homes"], manifest["refused"]) == (8, False, [])
-    assert (result["created_with_release"], result["compatibility_generation"]) == (
-        "0.1.0",
-        COMPATIBILITY_GENERATION,
-    )
+    assert (result["files"], manifest["homes"], manifest["refused"]) == (7, False, [])
     assert result["totals"]["drive"]["files"] == 2 and "entries" not in result
     db = sqlite3.connect(export / "firm.sqlite3")
     try:
@@ -135,7 +129,6 @@ def test_export_writes_database_host_records_drive_and_a_verifiable_manifest(
     assert sorted(path.name for path in export.iterdir()) == [
         "drive",
         "events.jsonl",
-        "firm-release.json",
         "firm.sqlite3",
         "inputs",
         "mac",
@@ -192,7 +185,7 @@ def test_reexport_replaces_the_previous_export_whole(firm, monkeypatch, capsys):
     result = invoke(monkeypatch, capsys, "export", firm, "--homes")
     assert not (firm / "export" / "drive" / "stale.md").exists()
     assert (firm / "export" / "homes" / "founder" / "work" / "draft.md").read_text() == "draft"
-    assert result["homes"] is True and exports.verify(firm / "export")["files"] == 9
+    assert result["homes"] is True and exports.verify(firm / "export")["files"] == 8
     assert not list(firm.glob(".export.new-*"))
 
 
@@ -394,3 +387,15 @@ def test_discard_vms_and_delete_require_a_stopped_firm(firm, monkeypatch, capsys
     invoke(monkeypatch, capsys, "discard-vms", firm, "--confirm", "demo")
     assert invoke(monkeypatch, capsys, "delete", firm, "--confirm", "demo")["status"] == "deleted"
     assert not firm.exists()
+
+
+def test_export_refuses_durable_symlink_before_staging(tmp_path, monkeypatch):
+    (tmp_path / "sandbox.toml").write_text('[firm]\nid = "test-firm"\n')
+    external = tmp_path / "external"
+    external.mkdir()
+    (tmp_path / "durable").symlink_to(external)
+    monkeypatch.setattr(exports, "Sandbox", lambda _: pytest.fail("Sandbox constructed"))
+    with pytest.raises(ValueError, match="owner-controlled"):
+        exports.write(tmp_path, "test-firm")
+    assert not list(external.iterdir())
+    assert not (tmp_path / "export").exists()

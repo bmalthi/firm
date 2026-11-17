@@ -136,6 +136,13 @@ checks the actual `agy-auth` projection before sandbox launch and saves allowlis
 and credentials. Quota/context are `unavailable`. Summary/chooser checks fail on
 any native tool step, including implicit `manage_task`.
 
+To validate eager MCP discovery independently of model tool use, run the provider
+commands with `--catalog-only` for both the fresh and resumed activation, using a
+separate disposable fixture. This mode asks for no tools, requires a successful
+authenticated `tools/list` receipt for each activation in `server-catalog.json`,
+and rejects any reported tool step. It skips the workspace artifact and peek
+requirements. The ordinary provider check also records catalog receipts.
+
 See [model/effort mapping](../../docs/runtime.md#experimental-agy-configuration)
 for additional fresh cases. Revoked auth/MCP, VM
 restart, two simultaneous real roles and other adversarial cases need separate live

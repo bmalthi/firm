@@ -442,11 +442,14 @@ def forward(
         while not stop.is_set():
             readable, _, _ = select.select([guest, upstream], [], [], 0.25)
             for source in readable:
+                direction = "outbound" if source is guest else "inbound"
                 try:
                     frame, _, flags, _ = source.recvmsg(MAX_FRAME)
                 except ConnectionResetError:
                     return  # Normal VM shutdown also closes this datagram link.
                 if flags & socket.MSG_TRUNC:
+                    if traffic is not None:
+                        traffic.drop(direction, "truncated")
                     continue
                 if not frame:
                     return
@@ -458,13 +461,17 @@ def forward(
                     try:
                         target.send(frame)
                     except BlockingIOError:
-                        pass  # Packet loss under backpressure is safer than unbounded queues.
+                        # Packet loss under backpressure is safer than unbounded queues.
+                        if traffic is not None:
+                            traffic.drop(direction, "would_block")
                     except OSError as exc:
                         if exc.errno == errno.ENOBUFS:
+                            if traffic is not None:
+                                traffic.drop(direction, "enobufs")
                             continue
-                        direction = "upstream" if source is guest else "guest"
+                        destination = "upstream" if source is guest else "guest"
                         raise RuntimeError(
-                            f"Network send to {direction} failed ({len(frame)} bytes)"
+                            f"Network send to {destination} failed ({len(frame)} bytes)"
                         ) from exc
 
 

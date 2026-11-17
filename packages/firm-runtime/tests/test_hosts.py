@@ -56,7 +56,8 @@ def test_every_role_waiting_on_a_host_is_answered_by_one_grant(tmp_path, clock):
     assert runtime.requests.grant(OWNER, "q1")["answered"] == ["q1", "q2"]
     for role in (founder, scout):
         (mail,) = mail_to(runtime, role.employee_id)
-        assert mail["subject"] == "Access granted: pypi.org"
+        assert mail["subject"] is None
+        assert mail["body"].startswith("Access granted: pypi.org\n\n")
         assert mail["scheduling_ready_at"] is not None
 
 
@@ -74,7 +75,8 @@ def test_one_denial_answers_every_role_waiting_on_a_host_it_covers(tmp_path, clo
     ]
     for role, host in ((founder, "*.example.org"), (scout, "www.example.org")):
         (mail,) = mail_to(runtime, role.employee_id)
-        assert mail["subject"] == f"Access declined: {host}"
+        assert mail["subject"] is None
+        assert mail["body"].startswith(f"Access declined: {host}\n\n")
         assert "No mirrors." in mail["body"] and mail["scheduling_ready_at"] is not None
 
 
@@ -174,7 +176,8 @@ def test_a_request_under_a_wildcard_grant_leaves_inbox_and_readiness(tmp_path, c
     (row,) = reader.read("readiness")["rows"]
     assert "owner_request_pending" not in row["reasons"]
     (mail,) = mail_to(runtime, founder.employee_id)
-    assert mail["subject"] == "Access granted: api.example.org"
+    assert mail["subject"] is None
+    assert mail["body"].startswith("Access granted: api.example.org\n\n")
 
 
 def test_an_allowed_host_is_granted_at_once_without_asking(tmp_path, clock):
@@ -259,7 +262,8 @@ def test_a_grant_writes_the_sandbox_records_and_wakes_the_role(tmp_path, clock):
         "request.granted", {"request_id": "q1", "kind": "network_host", "resource": "pypi.org"}
     )
     (mail,) = mail_to(runtime, founder.employee_id)
-    assert mail["author_id"] == "runtime" and mail["subject"] == "Access granted: pypi.org"
+    assert mail["author_id"] == "runtime" and mail["subject"] is None
+    assert mail["body"].startswith("Access granted: pypi.org\n\n")
     assert mail["scheduling_ready_at"] is not None  # a wake, not just a letter
     again = tools.request_access("network_host", "pypi.org", "Again", "ask-again")
     assert again.pop("mail_waiting")  # the answer's mail is presented with the next call
@@ -294,7 +298,8 @@ def test_a_denial_mails_the_reason_and_refuses_the_host_afterwards(tmp_path, clo
     (request,) = rows(runtime, "SELECT status,decision_note FROM owner_requests")
     assert request == {"status": "denied", "decision_note": "Use the firm drive."}
     (mail,) = mail_to(runtime, founder.employee_id)
-    assert mail["subject"] == "Access declined: pastebin.com"
+    assert mail["subject"] is None
+    assert mail["body"].startswith("Access declined: pastebin.com\n\n")
     assert "Use the firm drive." in mail["body"] and mail["scheduling_ready_at"] is not None
     assert request_events(runtime)[-1][0] == "request.denied"
     assert runtime.hosts.sandbox.writes == [[]]  # a decision rewrites the record

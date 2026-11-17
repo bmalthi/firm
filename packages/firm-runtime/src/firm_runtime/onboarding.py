@@ -64,23 +64,11 @@ def list_firms(root: Path) -> list[dict]:
             continue
         if not child.is_dir() or child.is_symlink() or info.st_uid != os.getuid():
             continue
-        from .compatibility import validate_firm
         from .setup_check import database_initialization_state
 
         database = child / "durable" / "firm.sqlite3"
         database_state = database_initialization_state(database)
-        release_record = child / "firm-release.json"
-        release_present = release_record.exists() or release_record.is_symlink()
-        release_error = None
-        if database_state in {"initialized", "partial"} or release_present:
-            try:
-                validate_firm(child)
-            except (OSError, ValueError) as exc:
-                release_error = str(exc)
-        if release_error is not None:
-            state = "needs attention"
-            reason = release_error
-        elif database_state == "initialized":
+        if database_state == "initialized":
             state, reason = "initialized", None
         elif database_state in {"missing", "partial"}:
             has_setup_files = any(

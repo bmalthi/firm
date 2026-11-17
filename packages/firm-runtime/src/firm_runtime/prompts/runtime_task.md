@@ -1,0 +1,1 @@
+Complete the supplied task using ordinary file, search and shell tools as needed. Return one concise final answer. You share files with the caller; coordinate writes as instructed. Do not delegate or start background work.

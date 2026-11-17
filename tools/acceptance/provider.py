@@ -17,6 +17,7 @@ from pathlib import Path
 
 from firm_sandbox import Config, Organization, RunSpec, Sandbox
 
+from firm_runtime import mcp_http
 from firm_runtime.agy_provider import parse_result as agy_result
 from firm_runtime.hosting import LocalServer
 from firm_runtime.mcp_http import build_http_app
@@ -54,6 +55,14 @@ exactly RECALLED: followed by the synthetic recall nonce from your first activat
 Use only your retained conversation memory; do not inspect files or native state
 to recover it. Still perform the peek and workspace artifact checks above.
 """
+AGY_CATALOG_MANDATE = """This is a bounded provider connectivity check. Do not call
+any tool or inspect files. Return exactly DONE. Preserve this conversation for the
+next owner message; do not call handoff or wait.
+"""
+AGY_CATALOG_RECALL = """\nFor this resumed activation, return exactly RECALLED:
+followed by the synthetic recall nonce from your first activation. Use only your
+retained conversation memory. Do not call tools or inspect files.
+"""
 
 
 def argument_parser():
@@ -64,10 +73,14 @@ def argument_parser():
     parser.add_argument("--profile", required=True)
     parser.add_argument("--provider", choices=PROVIDERS, help="Require this profile provider")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--catalog-only", action="store_true",
+        help="AGY: prove eager MCP listing without asking the model to call any tool",
+    )
     return parser
 
 
-def wake_retained_session(runtime, founder, profile):
+def wake_retained_session(runtime, founder, profile, *, catalog_only=False):
     with runtime.store.read() as db:
         role = runtime.store.role(db, founder["employee_id"])
         session = db.execute(
@@ -76,15 +89,19 @@ def wake_retained_session(runtime, founder, profile):
         if not session or role["execution_profile"] != profile:
             raise ValueError("--resume requires the original profile and a retained native session")
         session_id, native_id = role["session_id"], session["native_session_id"]
-    runtime.messaging.send(
-        "owner", [founder["address"]], AGY_MANDATE + AGY_RECALL,
-        request_id=f"provider-probe-{uuid.uuid4()}"
+    runtime.owner.send_mail(
+        "owner",
+        [founder["address"]],
+        (AGY_CATALOG_MANDATE + AGY_CATALOG_RECALL) if catalog_only else AGY_MANDATE + AGY_RECALL,
+        request_id=f"provider-probe-{uuid.uuid4()}",
     )
     return session_id, native_id
 
 
-def prepare_resume(runtime, founder, profile, provider):
+def prepare_resume(runtime, founder, profile, provider, *, catalog_only=False):
     if provider == "agy":
+        if catalog_only:
+            return wake_retained_session(runtime, founder, profile, catalog_only=True)
         return wake_retained_session(runtime, founder, profile)
     # Preserve the existing Codex/Claude acceptance fixture's fresh-route retry.
     runtime.owner.route(
@@ -116,6 +133,25 @@ def capture_server_peek(runtime, directory):
     return receipts
 
 
+def catalog_server(runtime, directory):
+    """Observe an authenticated successful list, without retaining its bearer."""
+    original = mcp_http.FastMCP
+    receipts = []
+
+    class CapturingServer(original):
+        async def list_tools(self):
+            result = await super().list_tools()
+            activation = runtime.authenticate(mcp_http._request_token())
+            receipts.append({
+                "method": "tools/list", "activation_id": activation["activation_id"],
+                "tool_count": len(result), "activation_validated": True,
+            })
+            (directory / "server-catalog.json").write_text(json.dumps(receipts, indent=2))
+            return result
+
+    return CapturingServer, receipts
+
+
 def seed_recall_nonce(box, nonce):
     start = box.start
 
@@ -127,6 +163,21 @@ def seed_recall_nonce(box, nonce):
                 "Keep it only in conversation memory; do not write it to workspace files. "
                 "Perform the mandate and finish with DONE."
             )
+            spec = replace(spec, stdin=(json.dumps(event) + "\n").encode())
+        return start(spec)
+
+    box.start = capture
+
+
+def request_catalog_recall(box):
+    # The no-tools fixture cannot peek owner mail. Deliver the recall instruction
+    # in this activation's native input, without supplying the previous nonce.
+    start = box.start
+
+    def capture(spec):
+        if spec.env.get("FIRM_AGY_MODE") == "role":
+            event = json.loads(spec.stdin)
+            event["message"]["content"] += AGY_CATALOG_RECALL
             spec = replace(spec, stdin=(json.dumps(event) + "\n").encode())
         return start(spec)
 
@@ -177,6 +228,8 @@ def main():
         profile, accounts = selected_profile(source, args.profile, args.provider)
     except ValueError as exc:
         parser.error(str(exc))
+    if args.catalog_only and profile["provider"] != "agy":
+        parser.error("--catalog-only requires AGY")
     config = {
         "max_active": 1,
         "staffing": False,
@@ -202,13 +255,15 @@ def main():
     server_tools = (capture_server_peek(runtime, args.evidence)
                     if profile["provider"] == "agy" else [])
     mandate = AGY_MANDATE if profile["provider"] == "agy" else MANDATE
+    if args.catalog_only:
+        mandate = AGY_CATALOG_MANDATE
     founder = runtime.lifecycle.initialize("vm-provider-live", mandate, config)["founder"]
     with runtime.store.read() as db:
         previous = {row[0] for row in db.execute("SELECT activation_id FROM activations")}
     expected_session = expected_native = None
     if args.resume:
         expected_session, expected_native = prepare_resume(
-            runtime, founder, args.profile, profile["provider"])
+            runtime, founder, args.profile, profile["provider"], catalog_only=args.catalog_only)
         # This acceptance fixture may have accumulated retry backoff while
         # diagnosing a launcher failure. Advance its clock rather than alter
         # production recovery records or wait half an hour between probes.
@@ -223,10 +278,15 @@ def main():
     box = Sandbox(Config.load(args.root / "sandbox.toml"))
     if nonce is not None and not args.resume:
         seed_recall_nonce(box, nonce)
+    elif args.catalog_only and args.resume:
+        request_catalog_recall(box)
     launches = capture_agy_launches(box, args.evidence)
     outputs = capture_provider_logs(
         box, args.evidence, profile["provider"], launches, expected_native,
         nonce if args.resume else None)
+    original_server = mcp_http.FastMCP
+    capture_server, server_catalog = catalog_server(runtime, args.evidence)
+    mcp_http.FastMCP = capture_server
     server = LocalServer(
         lambda port: build_http_app(
             runtime,
@@ -258,20 +318,23 @@ def main():
                 else:
                     raise TimeoutError("Provider activation did not settle within four minutes")
                 assert len(rows) == 1 and rows[0]["state"] == "completed", rows
-                check = box.start(RunSpec(
-                    sandbox_role_id(founder["employee_id"]),
-                    ("/bin/cat", "provider-validation.txt"),
-                    organization=Organization("founder"),
-                ))
-                assert box.wait(check, timeout=120)["exit_code"] == 0, box.logs(check)
-                content = box.logs(check)
-                assert content == b"VM_PROVIDER_OK\n", "Public provider artifact did not match"
+                content = b""
+                if not args.catalog_only:
+                    check = box.start(RunSpec(
+                        sandbox_role_id(founder["employee_id"]),
+                        ("/bin/cat", "provider-validation.txt"),
+                        organization=Organization("founder"),
+                    ))
+                    assert box.wait(check, timeout=120)["exit_code"] == 0, box.logs(check)
+                    content = box.logs(check)
+                    assert content == b"VM_PROVIDER_OK\n", "Public provider artifact did not match"
                 result = {
                     "passed": True,
                     "provider": profile["provider"],
                     "model": profile["model"],
                     "activations": rows,
                     "artifact": content.decode().strip(),
+                    "catalog_only": args.catalog_only,
                 }
                 with runtime.store.read() as db:
                     current = runtime.store.role(db, founder["employee_id"])
@@ -291,13 +354,21 @@ def main():
                 if profile["provider"] == "agy":
                     result["launches"] = launches
                     result["server_tools"] = server_tools
+                    result["server_catalog"] = server_catalog
                     result["outputs"] = {key: value[0] for key, value in outputs.items()
                                          if key in launches}
-                    result["passed"] = result["passed"] and bool(server_tools) and bool(launches)
+                    catalog_seen = any(
+                        item["activation_id"] == rows[0]["activation_id"]
+                        and item["tool_count"] > 0 for item in server_catalog
+                    )
+                    result["passed"] = result["passed"] and catalog_seen and bool(launches)
+                    if not args.catalog_only:
+                        result["passed"] = result["passed"] and bool(server_tools)
                     result["passed"] = result["passed"] and all(
                         launch["passed"] and key in outputs and outputs[key][0]["success"]
                         and outputs[key][0]["model_matches"]
-                        and outputs[key][0]["firm_tool_seen"]
+                        and (not outputs[key][0]["tool_steps"] if args.catalog_only
+                             else outputs[key][0]["firm_tool_seen"])
                         and bool(native) and outputs[key][1] == native["native_session_id"]
                         for key, launch in launches.items()
                     )
@@ -312,6 +383,7 @@ def main():
         if not result["passed"]:
             raise SystemExit(1)
     finally:
+        mcp_http.FastMCP = original_server
         try:
             # Request graceful shutdown if dispatcher drain has not already
             # powered off the VM. Resume relies on durable guest state.

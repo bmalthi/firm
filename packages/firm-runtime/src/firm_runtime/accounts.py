@@ -4,12 +4,14 @@ import hashlib
 import json
 import math
 import re
+import shlex
 from pathlib import Path
 from uuid import uuid4
 
 from .errors import FirmError
 from .prompt_resources import render
-from .provider_definitions import PROVIDER_DEFINITIONS, incompatible_service
+from .provider_contract import auth_repair, incident_code
+from .provider_definitions import PROVIDER_DEFINITIONS, effective_model, incompatible_service
 from .store import CONTROL_PRIORITY, OPERATIONS, ORDINARY_PRIORITY, OWNER, encoded
 from .telemetry import CONTEXT_POLICY_KEYS
 
@@ -75,7 +77,9 @@ CREATE TABLE IF NOT EXISTS execution_incidents (
     until_at REAL,
     created_at REAL NOT NULL,
     resolved_at REAL,
-    resolved_by TEXT CHECK(resolved_by IN ('owner','expired','superseded'))
+    resolved_by TEXT CHECK(resolved_by IN ('owner','expired','superseded')),
+    -- The recognized provider or credential code that opened the hold, when one was reported.
+    code TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_dependency_incident
     ON execution_incidents(scope,dependency) WHERE resolved_at IS NULL;
@@ -112,6 +116,31 @@ def incident_resolution(row, now):
     if row["until_at"] is not None and row["until_at"] <= now:
         return {"resolved_at": row["until_at"], "resolved_by": "expired"}
     return {"resolved_at": None, "resolved_by": None}
+
+
+def login_command(account_id, account):
+    """The owner command that signs in again and saves to the account's configured file."""
+    command = f"firm login {account_id} --provider {account['provider']}"
+    auth_file = Path(account["auth_file"]).expanduser()
+    if auth_file != credentials_path(account_id, account["provider"]):
+        command += f" --auth-file {shlex.quote(str(auth_file))}"
+    return command
+
+
+def incident_recovery(row, accounts):
+    """How the owner repairs an authentication hold; other kinds carry no sign-in advice.
+
+    ``repair`` says whether signing in again can help, ``guidance`` is the sentence every
+    owner surface shows, and ``login_command`` signs in to the held account.
+    """
+    if row["kind"] != "auth":
+        return {"repair": None}
+    repair = auth_repair(row["code"])
+    recovery = {"repair": repair, "guidance": render("notices", f"auth_repair_{repair}")}
+    account = accounts.get(row["dependency"]) if row["scope"] == "account" else None
+    if account is not None:
+        recovery["login_command"] = login_command(row["dependency"], account)
+    return recovery
 
 
 def _positive(value, label):
@@ -636,11 +665,12 @@ class Accounts:
             ),
         )
 
-    def hold(self, db, scope, dependency, kind, until=None):
+    def hold(self, db, scope, dependency, kind, until=None, *, code=None):
+        code = incident_code(code)
         if scope not in {"account", "profile"} or kind not in {"auth", "config", "quota", "outage"}:
             raise FirmError("invalid shared hold")
-        if kind in {"auth", "quota"} and scope != "account":
-            raise FirmError(f"{kind} holds must be scoped to an account")
+        if kind == "auth" and scope != "account":
+            raise FirmError("auth holds must be scoped to an account")
         if kind in {"auth", "config"} and until is not None:
             raise FirmError(f"{kind} holds require explicit clearance")
         if until is not None:
@@ -651,11 +681,19 @@ class Accounts:
                 until = None
             else:
                 until = max(old["until_at"], until)
+            # The first reported cause stays; a later one only fills a missing cause.
             db.execute(
-                "UPDATE execution_incidents SET until_at=? WHERE incident_id=?",
-                (until, old["incident_id"]),
+                "UPDATE execution_incidents SET until_at=?,code=COALESCE(code,?) "
+                "WHERE incident_id=?",
+                (until, code, old["incident_id"]),
             )
             return old["incident_id"]
+        if old and old["until_at"] is None and until is not None:
+            # A timed pause ends by itself; it never replaces a hold that waits for the owner.
+            return old["incident_id"]
+        if old and old["until_at"] is not None and until is not None:
+            # Of two timed pauses the later end stands: a short one cannot cut a long one.
+            until = max(old["until_at"], until)
         if old:
             db.execute(
                 "UPDATE execution_incidents SET resolved_at=?,resolved_by='superseded' "
@@ -665,10 +703,19 @@ class Accounts:
         incident_id = str(uuid4())
         db.execute(
             "INSERT INTO execution_incidents"
-            "(incident_id,scope,dependency,kind,until_at,created_at) "
-            "VALUES(?,?,?,?,?,?)",
-            (incident_id, scope, dependency, kind, until, self.store.clock()),
+            "(incident_id,scope,dependency,kind,until_at,created_at,code) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (incident_id, scope, dependency, kind, until, self.store.clock(), code),
         )
+        recovery = incident_recovery(
+            {"kind": kind, "code": code, "scope": scope, "dependency": dependency},
+            self.config(db).get("accounts", {}),
+        )
+        repair = recovery.get("guidance") or render("notices", "provider_repair_default")
+        if "login_command" in recovery:
+            repair += " " + render(
+                "notices", "auth_repair_command", command=recovery["login_command"]
+            )
         self.runtime.messaging.notice(
             db,
             [OWNER],
@@ -682,6 +729,8 @@ class Accounts:
                 kind=kind,
                 incident_id=incident_id,
                 until=until,
+                repair=repair,
+                code=code or "not reported",
             ),
             subject=render("notices", "shared_dependency_paused_subject"),
             priority=0 if until else CONTROL_PRIORITY,
@@ -689,13 +738,32 @@ class Accounts:
         )
         return incident_id
 
-    def record_failure(self, db, session_id, category, until=None):
+    def record_failure(self, db, session_id, category, until=None, *, code=None):
         binding = self.binding(db, session_id)
         if not binding or category not in {"auth", "config", "quota"}:
             return None
-        scope = "profile" if category == "config" else "account"
+        if code == "model_quota_reached":
+            # The profile stands for the refused model only when the session really ran
+            # that model. A role's effort override can select another one, and then no
+            # shared dependency names what was refused.
+            settings = json.loads(binding["settings_json"])
+            profile = self.config(db).get("profiles", {}).get(binding["profile"])
+            ran = effective_model(
+                binding["provider"], settings.get("model"), settings.get("effort")
+            )
+            if not profile or ran != effective_model(
+                profile.get("provider"), profile.get("model"), profile.get("effort")
+            ):
+                return None
+        # A model's own allowance belongs to the profile that names the model, as its
+        # configuration does: the account's other models still run.
+        scope = (
+            "profile" if category == "config" or code == "model_quota_reached" else "account"
+        )
         key = binding["profile"] if scope == "profile" else binding["account_id"]
-        incident_id = self.hold(db, scope, key, category, until if category == "quota" else None)
+        incident_id = self.hold(
+            db, scope, key, category, until if category == "quota" else None, code=code
+        )
         role = self.store.role(db, binding["employee_id"])
         if category in {"auth", "config"}:
             self._pin_role(db, role, incident_id)
@@ -707,6 +775,37 @@ class Accounts:
             )
             self._notify_block(db, role, incident)
         return incident_id
+
+    def report_task_setup(self, db, provider, model, code):
+        """Tell the owner once that task workers on a provider cannot be set up.
+
+        A task takes its model and effort from ``[task]``, not from an account or a
+        profile, so a failure of those settings holds nothing shared: roles keep
+        working and only the task call is refused. ``code`` is Firm's own setup code
+        or an already recognized provider code. The notice repeats only when the
+        model or the code changes.
+        """
+        payload = {"provider": provider, "model": model, "code": code}
+        request_id = "task-setup-rejected:" + hashlib.sha256(
+            encoded(payload).encode("utf-8")
+        ).hexdigest()
+
+        def notify():
+            return self.runtime.messaging.notice(
+                db,
+                [OWNER],
+                render(
+                    "notices",
+                    "task_setup_rejected_body",
+                    provider=provider,
+                    model=model,
+                    code=code or "not reported",
+                ),
+                subject=render("notices", "task_setup_rejected_subject", provider=provider),
+                priority=ORDINARY_PRIORITY,
+            )
+
+        self.store.request(db, OPERATIONS, request_id, "task_setup_rejected", payload, notify)
 
     def observe(self, actor_id, account_id, remaining_fraction, *, observed_at, valid_for, source):
         if actor_id != OWNER:
@@ -816,7 +915,7 @@ class Accounts:
             return None
         return {"observed_at": row["observed_at"], "windows": json.loads(row["windows_json"])}
 
-    def pause(self, actor_id, scope, dependency, kind, until=None):
+    def pause(self, actor_id, scope, dependency, kind, until=None, *, code=None):
         if actor_id != OWNER:
             raise FirmError("only the owner may pause shared execution dependencies")
         with self.store.transaction() as db:
@@ -824,7 +923,7 @@ class Accounts:
             key = {"account": "accounts", "profile": "profiles"}.get(scope)
             if key is None or dependency not in config.get(key, {}):
                 raise FirmError("unknown execution dependency")
-            incident_id = self.hold(db, scope, dependency, kind, until)
+            incident_id = self.hold(db, scope, dependency, kind, until, code=code)
         return {"status": "paused", "incident_id": incident_id}
 
     def clear(self, actor_id, incident_id):
@@ -878,7 +977,7 @@ class Accounts:
                     }
                 )
             incidents = [
-                dict(r)
+                {**dict(r), **incident_recovery(r, config.get("accounts", {}))}
                 for r in db.execute(
                     "SELECT * FROM execution_incidents WHERE resolved_at IS NULL "
                     "AND (until_at IS NULL OR until_at>?) ORDER BY created_at",

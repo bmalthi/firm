@@ -20,8 +20,10 @@ from firm_sandbox.egress_proxy import (
     EgressProxy,
     RequestLog,
     Summary,
+    connect_public,
     matches,
     permitted,
+    pipe,
     public_address,
     token,
 )
@@ -562,7 +564,7 @@ def test_a_grant_gone_while_the_client_hello_arrives_is_refused_before_forwardin
     proxy.set_granted(["unlisted.example"])
     # Allowed when the CONNECT is decided, gone by the time its hello has been read: the
     # change lands between the two checks, where no revocation could reach the relay.
-    answers = iter([True, False])
+    answers = iter([True, True, False])
     proxy.allowed = lambda host, identity=None: next(answers)
     answer = tunnel(proxy, "unlisted.example")
     assert answer == b"HTTP/1.1 200 Connection established\r\n\r\n"
@@ -838,6 +840,259 @@ def test_summary_is_bounded_with_an_overflow_count():
     assert set(rows) == {("a", "one.example"), ("a", "two.example")}
     assert (rows["a", "one.example"]["requests"], rows["a", "one.example"]["bytes_down"]) == (2, 7)
     assert (rows["a", "two.example"]["denied"], rows["a", "two.example"]["unlisted"]) == (1, 1)
+
+
+@pytest.mark.parametrize("failure", ["read", "write"])
+@pytest.mark.parametrize("reason", [None, "revoked", "egress_off", "closed"])
+def test_relay_io_failure_is_visible_without_overriding_policy_reason(failure, reason):
+    record = {"bytes_down": 0, "reason": reason}
+    sent = []
+
+    class Reader:
+        async def read(self, size):
+            if sent:
+                raise ConnectionResetError("private exception detail")
+            return b"partial response"
+
+    class Writer:
+        def write(self, chunk):
+            sent.append(chunk)
+
+        async def drain(self):
+            if failure == "write":
+                raise BrokenPipeError("private exception detail")
+
+    async def run():
+        return await pipe(Reader(), Writer(), record, "bytes_down", [0])
+
+    assert asyncio.run(run()) is False
+    assert sent == [b"partial response"]
+    assert record == {"bytes_down": len(sent[0]), "reason": reason or "relay_error"}
+
+
+def test_upload_io_failure_is_visible(tmp_path):
+    proxy = EgressProxy(port=0, role="analyst", log=RequestLog(tmp_path / "log"))
+    record = {"bytes_up": 0, "reason": None}
+
+    class Reader:
+        async def read(self, size):
+            raise ConnectionResetError("private exception detail")
+
+    class Writer:
+        def write(self, chunk):
+            pass
+
+        async def drain(self):
+            pass
+
+    async def run():
+        return await proxy._upload(Reader(), Writer(), record, b"head", 5, [0])
+
+    assert asyncio.run(run()) is False
+    assert record == {"bytes_up": 4, "reason": "relay_error"}
+
+
+def test_exchange_io_failure_is_logged_without_raw_exception_or_replay(start, tmp_path):
+    proxy = start()
+    attempts = []
+
+    async def fail(*args):
+        attempts.append(1)
+        raise ConnectionResetError("private exception detail")
+
+    proxy._forward = fail
+    answer = ask(proxy, b"GET http://pypi.org/ HTTP/1.1\r\n" + credentials("analyst"))
+    assert answer == b"" and attempts == [1]
+    (record,) = records(tmp_path)
+    assert record["reason"] == "relay_error"
+    assert "private exception detail" not in json.dumps(record)
+
+
+class DialWriter:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def test_connection_falls_back_before_slow_address_finishes(monkeypatch):
+    monkeypatch.setattr("firm_sandbox.egress_proxy.CONNECT_STAGGER", 0.01)
+    calls, canceled = [], []
+    writer = DialWriter()
+
+    async def opener(address, port):
+        calls.append((address, port))
+        if address == "slow":
+            try:
+                await asyncio.Event().wait()
+            finally:
+                canceled.append(address)
+        return object(), writer
+
+    async def run():
+        return await asyncio.wait_for(connect_public(["slow", "fast"], 443, opener), 1)
+
+    assert asyncio.run(run())[1] is writer
+    assert calls == [("slow", 443), ("fast", 443)]
+    assert canceled == ["slow"] and not writer.closed
+
+
+def test_connection_closes_simultaneous_successes_except_winner(monkeypatch):
+    monkeypatch.setattr("firm_sandbox.egress_proxy.CONNECT_STAGGER", 0)
+    writers = [DialWriter(), DialWriter()]
+
+    async def run():
+        ready = asyncio.Event()
+
+        async def opener(address, port):
+            if address == 1:
+                ready.set()
+            await ready.wait()
+            return object(), writers[address]
+
+        return await connect_public([0, 1], 80, opener)
+
+    winner = asyncio.run(run())[1]
+    assert not winner.closed
+    assert sum(writer.closed for writer in writers) == 1
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_connection_deadline_and_cancellation_reap_bounded_attempts(monkeypatch, cancel):
+    monkeypatch.setattr("firm_sandbox.egress_proxy.CONNECT_STAGGER", 0)
+    monkeypatch.setattr("firm_sandbox.egress_proxy.CONNECT_TIMEOUT", 0.05)
+    writers, ended = [], []
+
+    async def run():
+        full = asyncio.Event()
+
+        async def opener(address, port):
+            writer = DialWriter()
+            writers.append(writer)
+            if len(writers) == 4:
+                full.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # A connection completing as cancellation arrives must also close.
+                return object(), writer
+            finally:
+                ended.append(address)
+
+        task = asyncio.create_task(connect_public(range(4), 80, opener))
+        await full.wait()
+        if cancel:
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError if cancel else TimeoutError):
+            await asyncio.wait_for(task, 1)
+
+    asyncio.run(run())
+    assert len(writers) == len(ended) == 4
+    assert all(writer.closed for writer in writers)
+
+
+def test_connection_slow_addresses_do_not_starve_later_candidates(monkeypatch):
+    monkeypatch.setattr("firm_sandbox.egress_proxy.CONNECT_STAGGER", 0)
+    monkeypatch.setattr("firm_sandbox.egress_proxy.CONNECT_TIMEOUT", 0.2)
+    started, active, peak = [], set(), []
+    writer = DialWriter()
+
+    async def opener(address, port):
+        started.append(address)
+        active.add(address)
+        peak.append(len(active))
+        try:
+            if address < 8:
+                await asyncio.Event().wait()
+            return object(), writer
+        finally:
+            active.remove(address)
+
+    assert asyncio.run(connect_public(range(9), 80, opener))[1] is writer
+    assert started == list(range(9)) and max(peak) == 4 and not active
+    assert not writer.closed
+
+
+def test_connection_empty_addresses_fail_without_dialing():
+    async def opener(address, port):
+        pytest.fail("No address should be dialed")
+
+    with pytest.raises(OSError, match="No reachable public address"):
+        asyncio.run(connect_public([], 80, opener))
+
+
+def test_connection_immediate_failures_try_each_distinct_address():
+    calls = []
+
+    async def opener(address, port):
+        calls.append(address)
+        raise ConnectionRefusedError("unreachable")
+
+    with pytest.raises(OSError, match="No reachable public address"):
+        asyncio.run(connect_public(["first", "first", "second"], 80, opener))
+    assert calls == ["first", "second"]
+
+
+def test_slow_public_address_fallback_forwards_request_once(start, servers, monkeypatch):
+    monkeypatch.setattr("firm_sandbox.egress_proxy.CONNECT_STAGGER", 0.01)
+    calls = []
+
+    async def resolver(host, port):
+        return ["127.0.0.1", "8.8.8.8", PUBLIC]
+
+    async def opener(address, port):
+        calls.append(address)
+        if address == "8.8.8.8":
+            await asyncio.Event().wait()
+        return await asyncio.open_connection("127.0.0.1", servers["origin"])
+
+    proxy = start(resolver=resolver, opener=opener)
+    answer = ask(proxy, b"GET http://pypi.org/ HTTP/1.1\r\n" + credentials("analyst"))
+    assert answer.startswith(b"HTTP/1.1 200")
+    assert calls == ["8.8.8.8", PUBLIC]
+    assert len(Origin.received) == 1
+
+
+@pytest.mark.parametrize("reason", ["revoked", "egress_off"])
+@pytest.mark.parametrize("stage", ["resolve", "connect"])
+def test_policy_cutoff_cancels_pending_connection_without_forwarding(
+    start, tmp_path, reason, stage,
+):
+    entered = threading.Event()
+    closed = []
+
+    async def resolver(host, port):
+        if stage == "resolve":
+            entered.set()
+            await asyncio.Event().wait()
+        return [PUBLIC]
+
+    class Writer(DialWriter):
+        def close(self):
+            super().close()
+            closed.append(True)
+
+    async def opener(address, port):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return object(), Writer()
+
+    proxy = start(resolver=resolver, opener=opener)
+    proxy.set_granted(["unlisted.example"])
+    with socket.create_connection(("127.0.0.1", proxy.port), timeout=2) as client:
+        client.sendall(b"GET http://unlisted.example/ HTTP/1.1\r\n"
+                       + credentials("analyst") + b"\r\n")
+        assert entered.wait(1)
+        proxy.set_granted([]) if reason == "revoked" else proxy.close_relays()
+        assert client.recv(1024) == b""
+    (record,) = records(tmp_path)
+    assert record["reason"] == reason and record["allowed"] is False
+    assert record["bytes_up"] == record["bytes_down"] == 0
+    assert closed == ([True] if stage == "connect" else [])
+    assert not Origin.received
 
 
 def test_request_log_keeps_one_previous_file_within_its_limit(tmp_path):

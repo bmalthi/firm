@@ -26,7 +26,7 @@ def test_self_context_unknown_measured_aged_and_previous_period(tmp_path):
     assert peek()["stale_reason"] == "measurement_age"
     runtime.finish(actor.activation_id)
     assert peek()["stale_reason"] == "no_current_work_period_measurement"
-    runtime.messaging.send(OWNER, [actor.employee_id], "Continue", request_id="continue")
+    runtime.owner.send_mail(OWNER, [actor.employee_id], "Continue", request_id="continue")
     next_actor = start(runtime)
     assert peek()["state"] == "stale"
     runtime.record_usage(next_actor.activation_id, usage(1_000))
@@ -113,34 +113,31 @@ def test_context_and_mail_share_budget_with_explicit_omissions(tmp_path, monkeyp
     reports = []
     for i in range(30):
         reports.append(tools.hire(f"analyst-{i}", "Own work", f"hire-{i}", temporary_periods=1))
-        runtime.messaging.send(
-            OWNER, [founder.employee_id], "Body", subject="X" * 80, request_id=f"mail-{i}"
+        runtime.owner.send_mail(
+            OWNER, [founder.employee_id], "Body", subject="X" * 80, request_id=f"mail-{i}",
         )
     context = tools.peek()["context"]
     assert context["omitted_relevant_reports"] > 0
     assert len(context["direct_reports"]) + context["omitted_relevant_reports"] == 30
     assert len(encoded(context).encode()) <= messaging.MAX_PEEK_BYTES // 3
-    # Thirty reports each write in, so the founder has thirty-one conversations to page through.
+    # Every named send starts a separate thread.
     for report in reports:
-        runtime.messaging.send(
-            report["employee_id"], [founder.employee_id], "Body", subject="😀" * 80, request_id="in"
-        )
+        runtime.messaging.send(report["employee_id"], [founder.employee_id], [], "Body",
+                               subject="😀" * 80, request_id="in")
     first = runtime.messaging.peek(founder.employee_id)
-    # The owner's conversation comes first and carries all thirty of its messages.
-    assert first["conversations"][0]["participants"][0]["employee_id"] == OWNER
-    assert first["conversations"][0]["pending_count"] == 30
-    seen, cursor, pages = [], None, 0
+    assert first["threads"][0]["participants"][0]["employee_id"] == OWNER
+    assert first["threads"][0]["unread_count"] == 1
+    seen = []
     while True:
-        result = runtime.messaging.peek(founder.employee_id, cursor=cursor)
+        result = runtime.messaging.peek(founder.employee_id)
         assert len(encoded(result).encode()) <= messaging.MAX_PEEK_BYTES
         assert result["context"] == context
-        seen.extend(row["conversation_id"] for row in result["conversations"])
-        pages += 1
-        cursor = result["next_cursor"]
-        if cursor is None:
+        if not result["threads"]:
             break
-    assert pages > 1
-    assert len(seen) == len(set(seen)) == 31
+        for thread in result["threads"]:
+            seen.append(thread["message_id"])
+            runtime.messaging.dismiss(founder.employee_id, thread["message_id"])
+    assert len(seen) == len(set(seen)) == 60
 
 
 def test_fresh_session_does_not_relabel_previous_pressure_or_window(tmp_path):
@@ -285,7 +282,8 @@ def test_housekeeping_counts_finished_periods_for_only_this_employee(tmp_path):
     expected = (
         "Housekeeping: see what your scratch directory and Docker hold (du -sh on scratch, "
         "docker system df) and remove checkouts, containers, images and volumes from finished "
-        "work. Keep what current work still needs."
+        "work (or set clean_up=True when calling handoff after finished work). "
+        "Keep what current work still needs."
     )
     for finished in range(2 * HOUSEKEEPING_EVERY + 1):
         notices = runtime.messaging.peek(actor.employee_id)["context"]["notices"]

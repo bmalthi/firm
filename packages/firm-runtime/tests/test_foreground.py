@@ -627,9 +627,8 @@ def test_local_server_bind_failure_reports_the_cause_and_closes_socket(monkeypat
 def test_detached_launcher_returns_reconnects_and_keeps_child_output_alive(tmp_path, monkeypatch):
     directory = tmp_path / "detached-firm"
     directory.mkdir()
-    from firm_runtime.compatibility import initialize_firm
 
-    initialize_firm(directory)
+
     durable = directory / "durable"
     durable.mkdir(mode=0o700)
     key_file = durable / "console-key"

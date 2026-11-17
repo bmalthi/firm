@@ -201,11 +201,11 @@ def test_owner_inbox_filters_before_paging_and_dismissal_replays(tmp_path):
     ids = []
     for i in range(5):
         ids.append(
-            runtime.messaging.send(founder, [OWNER], f"Report {i}", request_id=f"owner-{i}")[
+            runtime.messaging.send(founder, [OWNER], [], f"Report {i}", request_id=f"owner-{i}")[
                 "message_id"
             ]
         )
-        runtime.messaging.send(founder, [analyst], "Internal", request_id=f"internal-{i}")
+        runtime.messaging.send(founder, [analyst], [], "Internal", request_id=f"internal-{i}")
     with _login(app) as client:
         assert client.get("/api/snapshot").json()["needs_you"]["owner_mail"] == 5
         payload = {"operation_id": "dismiss", "message_ids": [ids[1], ids[3]]}
@@ -304,21 +304,21 @@ def test_between_role_mail_filters_owner_deliveries_before_paging(tmp_path):
     runtime, founder, analyst, app = _system(tmp_path)
     expected = [
         runtime.messaging.send(
-            analyst, [founder], f"Between roles {index}", request_id=f"between-{index}"
+            analyst, [founder], [], f"Between roles {index}", request_id=f"between-{index}",
         )["message_id"]
         for index in range(55)
     ]
     dismissed = [
         runtime.messaging.send(
-            analyst, [OWNER], f"Dismissed {index}", request_id=f"dismissed-{index}"
+            analyst, [OWNER], [], f"Dismissed {index}", request_id=f"dismissed-{index}",
         )["message_id"]
         for index in range(210)
     ]
     for offset in range(0, len(dismissed), 100):
-        runtime.messaging.dismiss(
+        runtime.messaging.dismiss_exact(
             OWNER, dismissed[offset:offset + 100], request_id=f"done-{offset}"
         )
-    pending = runtime.messaging.send(analyst, [OWNER], "Still new", request_id="pending")
+    pending = runtime.messaging.send(analyst, [OWNER], [], "Still new", request_id="pending")
     with _login(app) as client:
         # The unfiltered feed really is buried under more than the UI's 200-message cap.
         assert all(
@@ -437,6 +437,43 @@ def test_incident_listing_uses_readiness_and_hydrates_immutable_notices(tmp_path
         assert open_incidents[0]["resolved_by"] is None
 
 
+def test_incident_rows_carry_recovery_for_auth_and_none_for_config(tmp_path):
+    runtime, _, _, app = _system(tmp_path)
+    with runtime.store.transaction() as db:
+        config = runtime.accounts.config(db)
+        config["accounts"] = {"a": {"provider": "codex", "max_active": 4, "auth_file": "/x/a"}}
+        config["profiles"]["default"] = {"provider": "codex", "accounts": ["a"]}
+        db.execute("UPDATE firm SET config_json=?", (json.dumps(config),))
+    auth = runtime.accounts.pause(OWNER, "account", "a", "auth", code="oauth_org_not_allowed")
+    config_hold = runtime.accounts.pause(OWNER, "profile", "default", "config")
+    with _login(app) as client:
+        listed = client.get("/api/incidents").json()["open"]
+        snapshot = client.get("/api/snapshot").json()["accounts"]["incidents"]
+        for rows in (listed, snapshot):
+            by_id = {row["incident_id"]: row for row in rows}
+            row = by_id[auth["incident_id"]]
+            assert row["code"] == "oauth_org_not_allowed" and row["repair"] == "organization"
+            assert "organization" in row["guidance"]
+            assert row["login_command"] == "firm login a --provider codex --auth-file /x/a"
+            other = by_id[config_hold["incident_id"]]
+            assert other["repair"] is None and other["code"] is None
+            assert "guidance" not in other and "login_command" not in other
+        # History keeps the cause, and an account since removed has no command to offer.
+        runtime.accounts.clear(OWNER, auth["incident_id"])
+        with runtime.store.transaction() as db:
+            config = runtime.accounts.config(db)
+            config["accounts"] = {"b": {"provider": "codex", "max_active": 4, "auth_file": "/x/b"}}
+            config["profiles"]["default"]["accounts"] = ["b"]
+            db.execute("UPDATE firm SET config_json=?", (json.dumps(config),))
+        (resolved,) = [
+            row for row in client.get("/api/incidents").json()["recent"]
+            if row["incident_id"] == auth["incident_id"]
+        ]
+        assert resolved["resolved_by"] == "owner"
+        assert (resolved["code"], resolved["repair"]) == ("oauth_org_not_allowed", "organization")
+        assert "organization" in resolved["guidance"] and "login_command" not in resolved
+
+
 def test_incident_clear_and_receipt_roll_back_together(tmp_path, monkeypatch):
     runtime, _, _, app = _system(tmp_path)
     incident = runtime.accounts.pause(OWNER, "profile", "default", "config")["incident_id"]
@@ -483,6 +520,8 @@ def test_expired_incident_reads_are_effective_and_do_not_write(tmp_path):
                     "until_at": 1010,
                     "resolved_at": 1010,
                     "resolved_by": "expired",
+                    "code": None,
+                    "repair": None,
                     "blocked_roles": [],
                 }
             ],
@@ -550,7 +589,7 @@ def test_console_request_notice_status_is_hydrated_at_read_time(tmp_path, decide
         assert client.get("/api/requests").json()["recent"][0]["decided_by"] == decided_by
     assert (
         "regarding"
-        not in runtime.messaging.messages(founder, [notice["message_id"]])["messages"][0]
+        not in runtime.messaging.read(OWNER, notice["message_id"])["messages"][0]
     )
 
 
@@ -601,7 +640,7 @@ def test_console_message_send_and_reply_replay_the_same_service_request(tmp_path
             == 409
         )
         assert (
-            runtime.messaging.messages(analyst, [result["message_id"]])["messages"][0]["body"]
+            runtime.messaging.read(analyst, result["message_id"])["messages"][0]["body"]
             == payload["body"]
         )
         with runtime.store.read() as db:
@@ -858,7 +897,7 @@ def test_console_reconciles_failed_denial_response_with_the_exact_note(
 @pytest.mark.parametrize("action", ["send", "reply"])
 def test_console_message_limit_counts_utf8_bytes_for_send_and_reply(tmp_path, action):
     runtime, _, analyst, app = _system(tmp_path)
-    original = runtime.messaging.send(analyst, [OWNER], "A question", request_id="question")
+    original = runtime.messaging.send(analyst, [OWNER], [], "A question", request_id="question")
     payload = {"recipients": ["founder/analyst"]} if action == "send" else {
         "message_id": original["message_id"]
     }
@@ -1055,7 +1094,7 @@ def test_nested_attachment_round_trip_uses_real_guest_validation(tmp_path, archi
     attachment = {"path": work + "/reports/drafts", "name": "nested.md"}
     drive = Layout.for_role(sandbox_role_id(founder)).drive
     sent = runtime.messaging.send(
-        founder, [OWNER], "Nested report", subject="Nested", request_id="nested",
+        founder, [OWNER], [], "Nested report", subject="Nested", request_id="nested",
         attachments=[f"{drive}/{attachment['path']}/{attachment['name']}"],
     )
     with _login(app) as client:
@@ -1087,18 +1126,18 @@ def test_console_results_lists_owner_deliveries_by_message_then_attachment(tmp_p
     runtime, founder, analyst, app, _, _ = _file_console(tmp_path)
     drive = Layout.for_role(sandbox_role_id(analyst)).drive
     first = runtime.messaging.send(
-        analyst, [OWNER], "First report", subject="First", request_id="first",
+        analyst, [OWNER], [], "First report", subject="First", request_id="first",
         attachments=[f"{drive}/shared/first.md"],
     )
     internal = runtime.messaging.send(
-        analyst, [founder], "Internal report", request_id="internal",
+        analyst, [founder], [], "Internal report", request_id="internal",
         attachments=[f"{drive}/shared/private.md"],
     )
     latest = runtime.messaging.send(
-        analyst, [OWNER], "Latest report", subject="Latest", request_id="latest",
+        analyst, [OWNER], [], "Latest report", subject="Latest", request_id="latest",
         attachments=[f"{drive}/shared/second.md", f"{drive}/shared/third.txt"],
     )
-    runtime.messaging.dismiss(OWNER, [latest["message_id"]], request_id="done-latest")
+    runtime.messaging.dismiss_exact(OWNER, [latest["message_id"]], request_id="done-latest")
     with _login(app) as client:
         page = client.get("/api/results").json()
         latest_message = next(
@@ -1127,6 +1166,7 @@ def test_console_results_lists_owner_deliveries_by_message_then_attachment(tmp_p
         "subject": "Latest",
         "author": latest_message["author"],
         "created_at": latest_message["created_at"],
+        "reply_audience": latest_message["reply_audience"],
     }
     assert [item["name"] for item in one["results"]] == ["second.md"]
     assert one["truncated"] is True
@@ -1142,7 +1182,7 @@ def test_console_owner_replies_with_reattachment_and_replays_receipt(tmp_path):
     runtime, _, analyst, app, _, _ = _file_console(tmp_path)
     drive = Layout.for_role(sandbox_role_id(analyst)).drive
     source = runtime.messaging.send(
-        analyst, [OWNER], "Please review", request_id="source",
+        analyst, [OWNER], [], "Please review", request_id="source",
         attachments=[f"{drive}/shared/draft.md"],
     )
     attachment = {"path": "shared", "name": "draft.md"}
@@ -1417,7 +1457,7 @@ def test_snapshot_leads_with_what_needs_the_owner(tmp_path):
     runtime.mark_started(invocation.activation_id)
     tools = runtime.tools(invocation.token)
     tools.request_access("network_host", "pypi.org", "Install packages", "ask")
-    tools.send([OWNER], "Blocked on packages", "status")
+    tools.send([OWNER], [], "Blocked on packages")
     with _login(app) as client:
         needs = client.get("/api/snapshot").json()["needs_you"]
         page = client.get("/").text
@@ -1745,11 +1785,15 @@ def test_console_uses_explicit_public_names_in_role_cards(tmp_path):
 
 def test_console_pages_all_firm_messages_without_claiming_mail(tmp_path):
     runtime, founder, analyst, app = _system(tmp_path)
-    colleague = runtime.messaging.send(founder, [analyst], "Colleague note", request_id="colleague")
-    first = runtime.messaging.send(analyst, [OWNER], "First owner update", request_id="owner-1")
-    second = runtime.messaging.send(analyst, [OWNER], "Second owner update", request_id="owner-2")
-    outgoing = runtime.messaging.send(
-        OWNER, [founder, analyst], "Owner to both roles", request_id="owner-3"
+    colleague = runtime.messaging.send(
+        founder, [analyst], [], "Colleague note", request_id="colleague",
+    )
+    first = runtime.messaging.send(analyst, [OWNER], [], "First owner update", request_id="owner-1")
+    second = runtime.messaging.send(
+        analyst, [OWNER], [], "Second owner update", request_id="owner-2",
+    )
+    outgoing = runtime.owner.send_mail(
+        OWNER, [founder, analyst], "Owner to both roles", request_id="owner-3",
     )
     with runtime.store.read() as db:
         before = list(db.iterdump())
@@ -1870,10 +1914,10 @@ def test_snapshot_timing_with_50_roles_and_accumulated_history(tmp_path, monkeyp
     assert len(roles) == 50
     for cycle in range(10):
         for employee_id in roles:
-            runtime.messaging.send(
-                OWNER, [employee_id], "Continue", request_id=f"wake-{cycle}-{employee_id}"
+            runtime.owner.send_mail(
+                OWNER, [employee_id], "Continue", request_id=f"wake-{cycle}-{employee_id}",
             )
-            runtime.messaging.send(employee_id, [OWNER], "Report", request_id=f"report-{cycle}")
+            runtime.messaging.send(employee_id, [OWNER], [], "Report", request_id=f"report-{cycle}")
         for _ in roles:
             invocation = runtime.admit()
             assert invocation is not None
@@ -1988,8 +2032,8 @@ def test_console_counts_waiting_messages_independently_of_wakes_and_execution(tm
     activation = runtime.admit()
     assert activation.employee_id == founder
     runtime.mark_started(activation.activation_id)
-    first = runtime.messaging.send(OWNER, [founder], "First", request_id="first")
-    runtime.messaging.send(OWNER, [founder], "Second", request_id="second")
+    first = runtime.owner.send_mail(OWNER, [founder], "First", request_id="first")
+    runtime.owner.send_mail(OWNER, [founder], "Second", request_id="second")
 
     def check(client, expected):
         roles = {role["employee_id"]: role for role in client.get("/api/snapshot").json()["roles"]}
@@ -2005,7 +2049,7 @@ def test_console_counts_waiting_messages_independently_of_wakes_and_execution(tm
 
     with _login(app) as client:
         check(client, 2)
-        runtime.messaging.claim(founder, [first["message_id"]], request_id="claim-first")
+        runtime.messaging.read(founder, first["message_id"])
         check(client, 1)
     with runtime.store.read() as db:
         assert (
@@ -2109,3 +2153,37 @@ def test_console_retains_poll_with_newer_empty_recorded_stream_without_durable_w
         "observed_at": stream["observed_at"],
     }
     assert quota["capability"] == {"stream": True, "poll": "reading"}
+
+
+def test_console_action_selection_uses_actual_reply_audience_and_shared_validation(tmp_path):
+    runtime, founder, analyst, app = _system(tmp_path)
+    source = runtime.owner.send_mail(
+        OWNER, [founder, "missing"], "Intended group", request_id="source",
+    )
+    group = runtime.owner.send_mail(OWNER, [founder, analyst], "Actual group", request_id="group")
+    with runtime.store.transaction() as db:
+        db.execute("UPDATE roles SET employment='retired' WHERE employee_id=?", (analyst,))
+    with _login(app) as client:
+        messages = {m["message_id"]: m for m in client.get("/api/messages").json()["messages"]}
+        assert {p["employee_id"] for p in messages[source["message_id"]]["reply_audience"]} == {
+            OWNER, founder,
+        }
+        assert {p["employee_id"] for p in messages[group["message_id"]]["reply_audience"]} == {
+            OWNER, founder, analyst,
+        }
+        payload = {"message_id": group["message_id"], "body": "Founder act",
+                   "action_recipients": [founder], "operation_id": "targeted-reply"}
+        result = _post(client, "/api/messages/reply", payload)
+        assert result.status_code == 200, result.text
+        assert result.json()["queued"][0]["action_required"] is True
+        assert _post(client, "/api/messages/reply", payload).json() == result.json()
+        refused = _post(client, "/api/messages/reply", {
+            **payload, "operation_id": "outside", "action_recipients": ["missing"],
+        })
+        assert refused.status_code == 400
+        direct = _post(client, "/api/messages/send", {
+            "recipients": [founder], "body": "FYI", "action_recipients": [],
+            "operation_id": "direct-fyi",
+        })
+        assert direct.status_code == 200
+        assert direct.json()["queued"][0]["action_required"] is False

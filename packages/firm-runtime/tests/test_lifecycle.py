@@ -460,11 +460,8 @@ def test_real_messaging_notice_and_retirement_share_lifecycle_transactions(tmp_p
     lifecycle.initialize("acme", "Build carefully.", CONFIG)
     hired = lifecycle.hire(FOUNDER_ID, "delivery", "Deliver the work.", "light", request_id="hire")
     sent = messaging.send(
-        FOUNDER_ID,
-        [hired["employee_id"]],
-        "Please take the first task.",
-        subject="First delivery work item",
-        request_id="send",
+        FOUNDER_ID, [hired["employee_id"]], [], "Please take the first task.",
+        subject="First delivery work item", request_id="send",
     )
 
     lifecycle.revise_mandate(

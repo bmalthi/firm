@@ -20,6 +20,7 @@ from .provider_contract import (
     RoleLaunchRequest,
     SubscriptionObservation,
     category_for_code,
+    retry_after_seconds,
     safe_code,
     summary_error,
     token_count,
@@ -38,6 +39,24 @@ from .provider_support import (
 from .summaries import SummaryOutput, summary_role_id
 
 NATIVE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+# The CLI's own refusal when a model's allowance is spent, as observed in the terminal
+# result's error field (never the model's response). Anything else stays unclassified.
+MODEL_QUOTA_REFUSAL = re.compile(
+    r"Individual quota reached\. Please upgrade your subscription to increase your limits\. "
+    r"Resets in (?:(\d{1,4})h)?(?:(\d{1,2})m)?(?:(\d{1,2})s)?\."
+)
+
+
+def _model_quota_reset(terminal):
+    """Seconds until the reset the CLI stated, None for an unusable time, False otherwise."""
+    error = terminal.get("error")
+    match = MODEL_QUOTA_REFUSAL.fullmatch(error) if isinstance(error, str) else None
+    if match is None:
+        return False
+    hours, minutes, seconds = (int(part or 0) for part in match.groups())
+    wait = hours * 3600 + minutes * 60 + seconds
+    # A missing or zero wait would readmit the role at once, into the same refusal.
+    return retry_after_seconds({"retry_after_seconds": wait}) if wait > 0 else None
 
 
 def native_model_id(model, effort):
@@ -149,7 +168,7 @@ def _stream(logs):
     return events, session, terminal, launch, valid
 
 
-def _error(kind, exit_code, code=None):
+def _error(kind, exit_code, code=None, *, retry_after=None):
     return ProviderError(
         kind=kind,
         category=("transient" if code in {
@@ -158,10 +177,11 @@ def _error(kind, exit_code, code=None):
         message="AGY did not complete a valid successful turn",
         exit_code=exit_code,
         code=code,
+        retry_after_seconds=retry_after,
     )
 
 
-def parse_result(logs, exit_code):
+def parse_result(logs, exit_code, *, tool_free=False):
     if type(exit_code) is not int:
         raise TypeError("exit_code must be an integer")
     events, session, terminal, launch, valid = _stream(logs)
@@ -175,6 +195,16 @@ def parse_result(logs, exit_code):
         )
     if not valid:
         return ProviderResult(session, False, None, _error("invalid_output", exit_code))
+    # Positive execution evidence invalidates a tool-free contract. Absence of
+    # reported steps is not proof of isolation or complete native reporting.
+    if tool_free and any(
+        event.get("event") == "step_update"
+        and event["step_update"].get("step_type") == "tool"
+        for event in events
+    ):
+        return ProviderResult(
+            session, False, None, _error("invalid_output", exit_code, "tool_free_violation")
+        )
     # Native MCP ERROR cannot distinguish ordinary isError from transport failure.
     # Like Codex/Claude, individual tool failures do not fail a successful turn.
     if terminal is not None and terminal.get("finished_reason") == "print_timeout":
@@ -183,6 +213,13 @@ def parse_result(logs, exit_code):
             interrupted=True
         )
     if terminal is not None and terminal.get("status") != "SUCCESS":
+        reset = _model_quota_reset(terminal) if terminal.get("status") == "ERROR" else False
+        if reset is not False:
+            # Without a usable reset time the pause waits for the owner.
+            return ProviderResult(
+                session, False, None,
+                _error("result_error", exit_code, "model_quota_reached", retry_after=reset),
+            )
         # Even resumed expiry-poisoned turns consume the ordinary failure budget;
         # only print_timeout is a clean yield. Never infer auth from native prose.
         return ProviderResult(session, False, None, _error("result_error", exit_code))
@@ -251,7 +288,7 @@ def parse_failed_tool_calls(logs):
 
 
 def parse_summary(logs, exit_code):
-    result, usage = parse_result(logs, exit_code), parse_usage(logs)
+    result, usage = parse_result(logs, exit_code, tool_free=True), parse_usage(logs)
     counters = dict(usage.__dict__) if usage else {}
     # Summary/chooser sessions are fresh, just like isolated task sessions.
     for name in ("input_tokens", "output_tokens", "cached_input_tokens", "reasoning_output_tokens"):
@@ -345,6 +382,7 @@ class AgyProvider:
         token_name = "activation-token" if role else "summary-token"
         return RunSpec(
             role_id=role_id,
+            stateless=mode == "tool_free",
             run_id=run_id,
             argv=(layout.python, layout.credential("agy-launcher")),
             env={
@@ -426,7 +464,7 @@ class AgyProvider:
                 category="config", code="provider_mismatch", message="AGY summary provider mismatch"
             )
         return self._spec(
-            role_id=summary_role_id(request.run_id),
+            role_id=summary_role_id(request.run_id, request.stateless_slot),
             run_id=request.run_id,
             session_id=str(uuid5(NAMESPACE_URL, request.run_id)),
             mode=mode,
