@@ -60,8 +60,7 @@ def task_settings(value):
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS execution_bindings (
     session_id TEXT PRIMARY KEY,
-    employee_id TEXT NOT NULL,
-    primary_profile TEXT NOT NULL,
+    employee_id TEXT NOT NULL REFERENCES roles(employee_id),
     profile TEXT NOT NULL,
     account_id TEXT NOT NULL,
     provider TEXT NOT NULL,
@@ -71,9 +70,9 @@ CREATE TABLE IF NOT EXISTS execution_bindings (
 );
 CREATE TABLE IF NOT EXISTS execution_incidents (
     incident_id TEXT PRIMARY KEY,
-    scope TEXT NOT NULL,
+    scope TEXT NOT NULL CHECK(scope IN ('account','profile')),
     dependency TEXT NOT NULL,
-    kind TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('auth','config','quota','outage')),
     until_at REAL,
     created_at REAL NOT NULL,
     resolved_at REAL,
@@ -84,8 +83,8 @@ CREATE TABLE IF NOT EXISTS execution_incidents (
 CREATE UNIQUE INDEX IF NOT EXISTS one_dependency_incident
     ON execution_incidents(scope,dependency) WHERE resolved_at IS NULL;
 CREATE TABLE IF NOT EXISTS incident_roles (
-    incident_id TEXT NOT NULL,
-    employee_id TEXT NOT NULL,
+    incident_id TEXT NOT NULL REFERENCES execution_incidents(incident_id),
+    employee_id TEXT NOT NULL REFERENCES roles(employee_id),
     manager_id TEXT NOT NULL,
     PRIMARY KEY(incident_id,employee_id,manager_id)
 );
@@ -103,8 +102,8 @@ CREATE TABLE IF NOT EXISTS subscription_readings (
     observed_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS role_dependencies (
-    employee_id TEXT PRIMARY KEY,
-    incident_id TEXT NOT NULL
+    employee_id TEXT PRIMARY KEY REFERENCES roles(employee_id),
+    incident_id TEXT NOT NULL REFERENCES execution_incidents(incident_id)
 );
 """
 
@@ -304,6 +303,7 @@ class Accounts:
                 "WHERE incident_id=?",
                 (row["until_at"], row["incident_id"]),
             )
+            db.execute("DELETE FROM role_dependencies WHERE incident_id=?", (row["incident_id"],))
             return None
         return dict(row) if row else None
 
@@ -407,6 +407,8 @@ class Accounts:
         """
         if not isinstance(run_id, str) or not run_id:
             raise FirmError("summary run_id must be a non-empty string")
+        if self.store.firm(db)["state"] in {"draining", "stopping"}:
+            return None
         config = self.config(db)
         if "accounts" not in config:
             return {}
@@ -451,6 +453,8 @@ class Accounts:
         """
         if not isinstance(run_id, str) or not run_id:
             raise FirmError("staffing run_id must be a non-empty string")
+        if self.store.firm(db)["state"] in {"draining", "stopping"}:
+            return None
         config = self.config(db)
         staffing = config.get("staffing")
         if not staffing:
@@ -639,7 +643,6 @@ class Accounts:
         *_, account_id, name = min(candidates)
         profile = profiles[name]
         return {
-            "primary_profile": primary,
             "profile": name,
             "account_id": account_id,
             "provider": profile["provider"],
@@ -651,11 +654,12 @@ class Accounts:
         if self.binding(db, session_id):
             return
         db.execute(
-            "INSERT INTO execution_bindings VALUES(?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO execution_bindings("
+            "session_id,employee_id,profile,account_id,provider,settings_json,account_json,"
+            "created_at) VALUES(?,?,?,?,?,?,?,?)",
             (
                 session_id,
                 role["employee_id"],
-                selected["primary_profile"],
                 selected["profile"],
                 selected["account_id"],
                 selected["provider"],
@@ -700,6 +704,7 @@ class Accounts:
                 "WHERE incident_id=?",
                 (self.store.clock(), old["incident_id"]),
             )
+            db.execute("DELETE FROM role_dependencies WHERE incident_id=?", (old["incident_id"],))
         incident_id = str(uuid4())
         db.execute(
             "INSERT INTO execution_incidents"
@@ -947,6 +952,7 @@ class Accounts:
                         incident_id,
                     ),
                 )
+                db.execute("DELETE FROM role_dependencies WHERE incident_id=?", (incident_id,))
         return {"status": "cleared", "incident_id": incident_id}
 
     def status(self):

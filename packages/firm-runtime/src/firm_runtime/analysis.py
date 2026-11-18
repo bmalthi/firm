@@ -85,6 +85,12 @@ def wake_reasons(snapshot):
     ]
 
 
+def _batches(values, size: int = 500):
+    items = sorted(values)
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
 def tool_group(tool):
     """Runtime tools carry their MCP server; everything else ran inside the guest."""
     parts = tool.split("__")
@@ -460,10 +466,14 @@ class AnalysisReader:
         never include a work period that page cannot show.
         """
         tallies = defaultdict(dict)
-        if activation_ids:
-            for row in db.execute("SELECT activation_id,tool,calls FROM activation_tool_calls"):
-                if row["activation_id"] in activation_ids:
-                    tallies[row["activation_id"]][row["tool"]] = row["calls"]
+        for batch in _batches(activation_ids):
+            placeholders = ",".join("?" for _ in batch)
+            for row in db.execute(
+                "SELECT activation_id,tool,calls FROM activation_tool_calls "
+                f"WHERE activation_id IN ({placeholders})",
+                batch,
+            ):
+                tallies[row["activation_id"]][row["tool"]] = row["calls"]
         return tallies
 
     @staticmethod
@@ -473,14 +483,16 @@ class AnalysisReader:
         The ledger's payloads and results hold message bodies and handoff notes and are
         never read here; it also sees only operations that carry a request id.
         """
-        counts = defaultdict(Counter)
-        if activation_ids:
+        counts = defaultdict(dict)
+        for batch in _batches(activation_ids):
+            placeholders = ",".join("?" for _ in batch)
             for row in db.execute(
-                "SELECT activation_id,operation FROM requests WHERE activation_id IS NOT NULL"
+                "SELECT activation_id,operation,COUNT(*) AS calls FROM requests "
+                f"WHERE activation_id IN ({placeholders}) GROUP BY activation_id,operation",
+                batch,
             ):
-                if row["activation_id"] in activation_ids:
-                    counts[row["activation_id"]][row["operation"]] += 1
-        return {aid: dict(tally) for aid, tally in counts.items()}
+                counts[row["activation_id"]][row["operation"]] = row["calls"]
+        return counts
 
     def events(self, db, start, end, employee_id, cutoffs):
         if not cutoffs["analysis_events"]:
@@ -647,19 +659,26 @@ class AnalysisReader:
 
     def usage(self, db, now, start, end, employee_id, cutoffs):
         executions = self.activations(db, start, end, employee_id, cutoffs)
-        usage = {
-            r["activation_id"]: dict(r)
+        usage = {}
+        usage_cols = "SELECT activation_id,resolved_model," + ",".join(COUNTERS)
+        if not executions:
+            db.execute(usage_cols + " FROM activation_usage WHERE 0").fetchall()
+        for batch in _batches({row["activation_id"] for row in executions}):
+            placeholders = ",".join("?" for _ in batch)
             for r in db.execute(
-                "SELECT activation_id,resolved_model," + ",".join(COUNTERS)
-                + " FROM activation_usage"
-            )
-        }
-        bindings = {
-            r["session_id"]: dict(r)
+                usage_cols + f" FROM activation_usage WHERE activation_id IN ({placeholders})",
+                batch,
+            ):
+                usage[r["activation_id"]] = dict(r)
+        bindings = {}
+        for batch in _batches({row["session_id"] for row in executions if row["session_id"]}):
+            placeholders = ",".join("?" for _ in batch)
             for r in db.execute(
-                "SELECT session_id,provider,account_id,settings_json FROM execution_bindings"
-            )
-        }
+                "SELECT session_id,provider,account_id,settings_json FROM execution_bindings "
+                f"WHERE session_id IN ({placeholders})",
+                batch,
+            ):
+                bindings[r["session_id"]] = dict(r)
         for row in executions:
             row.update(usage.get(row["activation_id"], {}))
             binding = bindings.get(row["session_id"], {})
@@ -669,31 +688,52 @@ class AnalysisReader:
                 model=json.loads(binding.get("settings_json", "{}")).get("model"),
                 workload="role",
             )
-        identity = {}
-        if cutoffs["analysis_events"]:
-            for r in db.execute(
-                "SELECT summary_run_id,employee_id,payload_json FROM analysis_events "
-                "WHERE kind='summary.bound' AND sequence<=?",
-                (cutoffs["analysis_events"],),
-            ):
-                identity[r[0]] = {**public_event(json.loads(r[2])), "employee_id": r[1]}
-        summaries, tasks = [], []
+        raw_runs = []
         if cutoffs["summary_runs"]:
-            for r in db.execute(
-                "SELECT t.run_id,t.started_at,t.provider,t.account_id,t.input_tokens,"
-                "t.cached_input_tokens,t.output_token_usage AS output_tokens,"
-                "t.reasoning_output_tokens,t.resolved_model,t.kind,t.caller_activation_id,"
-                "a.employee_id AS caller_employee_id FROM summary_runs t "
-                "LEFT JOIN activations a ON a.activation_id=t.caller_activation_id AND a.rowid<=? "
-                "WHERE t.started_at>=? AND t.started_at<? AND t.rowid<=?",
-                (cutoffs["activations"], start, end, cutoffs["summary_runs"]),
-            ):
-                row = {**dict(r), **identity.get(r["run_id"], {}), "workload": r["kind"]}
-                del row["kind"]
-                if r["kind"] == "task":
-                    row["employee_id"] = row["caller_employee_id"]
-                if employee_id is None or row.get("employee_id") == employee_id:
-                    (tasks if r["kind"] == "task" else summaries).append(row)
+            raw_runs = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT t.run_id,t.started_at,t.provider,t.model,t.account_id,t.input_tokens,"
+                    "t.cached_input_tokens,"
+                    "COALESCE(t.output_token_usage,t.output_tokens) AS output_tokens,"
+                    "t.reasoning_output_tokens,t.resolved_model,t.kind,t.caller_activation_id,"
+                    "a.employee_id AS caller_employee_id FROM summary_runs t "
+                    "LEFT JOIN activations a ON a.activation_id=t.caller_activation_id "
+                    "AND a.rowid<=? "
+                    "WHERE t.started_at>=? AND t.started_at<? AND t.rowid<=?",
+                    (cutoffs["activations"], start, end, cutoffs["summary_runs"]),
+                )
+            ]
+        identity = {}
+        if cutoffs["analysis_events"] and raw_runs:
+            for batch in _batches({r["run_id"] for r in raw_runs}):
+                placeholders = ",".join("?" for _ in batch)
+                for r in db.execute(
+                    "SELECT summary_run_id,employee_id,payload_json FROM analysis_events "
+                    f"WHERE kind='summary.bound' AND sequence<=? "
+                    f"AND summary_run_id IN ({placeholders}) ORDER BY sequence DESC",
+                    (cutoffs["analysis_events"], *batch),
+                ):
+                    identity.setdefault(
+                        r["summary_run_id"],
+                        {
+                            **public_event(json.loads(r["payload_json"])),
+                            "employee_id": r["employee_id"],
+                        },
+                    )
+        summaries, tasks = [], []
+        for r in raw_runs:
+            bound = identity.get(r["run_id"], {})
+            row = dict(r)
+            row["workload"] = row.pop("kind")
+            for key in ("provider", "account_id", "model"):
+                if row.get(key) is None and bound.get(key) is not None:
+                    row[key] = bound[key]
+            row["employee_id"] = (
+                row["caller_employee_id"] if r["kind"] == "task" else bound.get("employee_id")
+            )
+            if employee_id is None or row.get("employee_id") == employee_id:
+                (tasks if r["kind"] == "task" else summaries).append(row)
         all_usage = executions + summaries + tasks
         groups = defaultdict(list)
         for row in all_usage:
@@ -758,33 +798,36 @@ class AnalysisReader:
                 (cutoffs["activations"], employee_id, employee_id),
             )
         }
-        session_ids = {r["session_id"] for r in executions}
+        session_ids = {r["session_id"] for r in executions if r["session_id"]}
         session_executions = defaultdict(list)
         for execution in executions:
             session_executions[execution["session_id"]].append(execution)
-        for r in db.execute(
+        session_cols = (
             "SELECT session_id,employee_id,execution_profile,provider,soft_context_window,"
             "advisory_fraction,handoff_reserve,current_context_tokens,high_water_context_tokens,"
             "provider_context_window,cumulative_input_tokens,cumulative_cached_input_tokens,"
             "cumulative_output_tokens,cumulative_reasoning_output_tokens,native_compactions,"
             "observed_at,source FROM context_sessions"
-        ):
-            if r["session_id"] not in session_ids:
-                continue
-            row = dict(r)
-            selected = session_executions[r["session_id"]]
-            row.update(
-                id="session:" + r["session_id"],
-                type="session",
-                label=r["session_id"],
-                usage=measured(selected),
-                executions=len(selected),
-                model=selected[0]["model"],
-                **model_resolution(selected),
-                first_admitted_at=firsts[r["session_id"]][0],
-                first_started_at=firsts[r["session_id"]][1],
-            )
-            rows.append(row)
+        )
+        for batch in _batches(session_ids):
+            placeholders = ",".join("?" for _ in batch)
+            for r in db.execute(
+                session_cols + f" WHERE session_id IN ({placeholders})", batch
+            ):
+                row = dict(r)
+                selected = session_executions[r["session_id"]]
+                row.update(
+                    id="session:" + r["session_id"],
+                    type="session",
+                    label=r["session_id"],
+                    usage=measured(selected),
+                    executions=len(selected),
+                    model=selected[0]["model"],
+                    **model_resolution(selected),
+                    first_admitted_at=firsts[r["session_id"]][0],
+                    first_started_at=firsts[r["session_id"]][1],
+                )
+                rows.append(row)
         events = self.events(db, start, end, employee_id, cutoffs)
         threshold_entries = Counter(
             e["evidence"].get("session_id")
@@ -849,41 +892,86 @@ class AnalysisReader:
     def conversations(
         self, db, now, start, end, employee_id, cutoffs, *, conversation_id=None
     ):
-        query = ("SELECT message_id,sequence,conversation_id,author_id,subject,body,"
-                 "created_at,reply_to")
+        cols = (
+            "m.message_id,m.sequence,m.conversation_id,m.author_id,m.subject,"
+            "m.body,m.created_at,m.reply_to"
+        )
         if conversation_id:
-            query += ",summary"
-        query += " FROM messages WHERE rowid<=?"
+            cols += ",m.summary"
+        where = ["m.rowid<=?"]
         args = [cutoffs["messages"]]
         if conversation_id:
-            query += " AND conversation_id=?"
+            where.append("m.conversation_id=?")
             args.append(conversation_id)
-        messages = {r["message_id"]: dict(r) for r in db.execute(query, args)}
-        deliveries = defaultdict(list)
-        for r in db.execute(
-            "SELECT message_id,employee_id,disposition,disposition_at,failure_reason,"
-            "read_activation_id FROM message_deliveries"
-        ):
-            if r["message_id"] in messages:
-                deliveries[r["message_id"]].append(dict(r))
-        started_at = {
-            r["activation_id"]: r["started_at"]
+        else:
+            where.append(
+                "((m.created_at>=? AND m.created_at<?) OR "
+                "(m.created_at<? AND EXISTS("
+                "SELECT 1 FROM message_deliveries d WHERE d.message_id=m.message_id "
+                "AND d.disposition='pending')))"
+            )
+            args.extend([start, end, start])
+        if employee_id:
+            where.append(
+                "(m.author_id=? OR EXISTS("
+                "SELECT 1 FROM message_deliveries d WHERE d.message_id=m.message_id "
+                "AND d.employee_id=?))"
+            )
+            args.extend([employee_id, employee_id])
+        messages = {
+            r["message_id"]: dict(r)
             for r in db.execute(
-                "SELECT activation_id,started_at FROM activations WHERE rowid<=?",
-                (cutoffs["activations"],),
+                f"SELECT {cols} FROM messages m WHERE "
+                + " AND ".join(where)
+                + " ORDER BY m.sequence",
+                args,
             )
         }
+        deliveries = defaultdict(list)
+        for batch in _batches(messages):
+            placeholders = ",".join("?" for _ in batch)
+            for r in db.execute(
+                "SELECT message_id,employee_id,disposition,disposition_at,failure_reason,"
+                f"read_activation_id FROM message_deliveries WHERE message_id IN ({placeholders})",
+                batch,
+            ):
+                deliveries[r["message_id"]].append(dict(r))
+        activation_ids = {
+            d["read_activation_id"]
+            for ds in deliveries.values()
+            for d in ds
+            if d["read_activation_id"] is not None
+        }
+        started_at = {}
+        for batch in _batches(activation_ids):
+            placeholders = ",".join("?" for _ in batch)
+            for r in db.execute(
+                "SELECT activation_id,started_at FROM activations "
+                f"WHERE rowid<=? AND activation_id IN ({placeholders})",
+                (cutoffs["activations"], *batch),
+            ):
+                started_at[r["activation_id"]] = r["started_at"]
+        reader_ids = {
+            d["employee_id"]
+            for ds in deliveries.values()
+            for d in ds
+            if d["disposition"] == "read"
+        }
         notices = defaultdict(list)
-        for r in db.execute(
-            "SELECT employee_id,observed_at,payload_json FROM analysis_events "
-            "WHERE kind='mail.presented' AND rowid<=?",
-            (cutoffs["analysis_events"],),
-        ):
-            payload = json.loads(r["payload_json"])
-            if payload.get("value") is not None:
-                notices[r["employee_id"]].append(
-                    (payload.get("previous") or 0, payload["value"], r["observed_at"])
-                )
+        if cutoffs["analysis_events"] and reader_ids:
+            for batch in _batches(reader_ids):
+                placeholders = ",".join("?" for _ in batch)
+                for r in db.execute(
+                    "SELECT employee_id,observed_at,payload_json FROM analysis_events "
+                    "WHERE kind='mail.presented' AND rowid<=? "
+                    f"AND employee_id IN ({placeholders})",
+                    (cutoffs["analysis_events"], *batch),
+                ):
+                    payload = json.loads(r["payload_json"])
+                    if payload.get("value") is not None:
+                        notices[r["employee_id"]].append(
+                            (payload.get("previous") or 0, payload["value"], r["observed_at"])
+                        )
 
         def announced_at(employee_id, sequence):
             """When a waiting-mail notice first named this message to this role."""
@@ -1224,6 +1312,9 @@ class AnalysisReader:
                 "SELECT employee_id,attempts,retry_at FROM hire_levels WHERE state='pending'"
             )
         }
+        guidance_records = {
+            r["employee_id"]: dict(r) for r in db.execute("SELECT * FROM role_guidance")
+        }
         bindings = {
             r["session_id"]: dict(r)
             for r in db.execute(
@@ -1239,6 +1330,16 @@ class AnalysisReader:
                 )
             )
         )
+        for account_id, task_slots in db.execute(
+            "SELECT account_id, COALESCE(SUM(n-borrowed),0) FROM ("
+            "SELECT t.account_id, COUNT(*) AS n, CASE WHEN a.state IN ('admitted','running') "
+            "AND COUNT(CASE WHEN t.reason IS NULL THEN 1 END)>0 "
+            "THEN 1 ELSE 0 END AS borrowed FROM summary_runs t "
+            "JOIN activations a ON a.activation_id=t.caller_activation_id "
+            "WHERE t.kind='task' AND t.state='running' AND t.account_id IS NOT NULL "
+            "GROUP BY t.account_id, t.caller_activation_id) GROUP BY account_id"
+        ):
+            occupancy[account_id] += task_slots
         query = (
             "SELECT rowid,* FROM roles"
         )
@@ -1292,10 +1393,18 @@ class AnalysisReader:
                 stable.append(pinned["incident_id"])
             if eid in pending_levels:
                 add("level_pending", pending_levels[eid])
-            if (can_select and config.get("staffing") is not False and not role["birth_delivered"]
-                    and role["guidance_state"] == "pending"):
-                add("guidance_pending", {"attempts": role["guidance_attempts"],
-                                         "retry_at": role["guidance_retry_at"]})
+            guide = guidance_records.get(eid)
+            if (
+                can_select
+                and config.get("staffing") is not False
+                and not role["birth_delivered"]
+                and guide is not None
+                and guide["state"] == "pending"
+            ):
+                add(
+                    "guidance_pending",
+                    {"attempts": guide["attempts"], "retry_at": guide["retry_at"]},
+                )
             appointment = terms.get(eid, {"kind": "durable"})
             if appointment["kind"] == "temporary" and appointment["remaining_periods"] == 0:
                 add("temporary_exhausted", appointment)
@@ -1444,7 +1553,7 @@ class AnalysisReader:
                     "address": role["address"],
                     "identity": identity(dict(role)),
                     "level": level_of(role, config),
-                    "guidance": guidance.view(db, role, config),
+                    "guidance": guidance.view(db, role, config, guide),
                     "activity": activity,
                     "primary_reason": reasons[0],
                     "reasons": reasons,
@@ -1791,33 +1900,38 @@ class AnalysisReader:
             for row in self.activations(db, start, end, employee_id, cutoffs)
         }
         runs, by_role = [], defaultdict(list)
-        for row in db.execute(
-            "SELECT activation_id,role_id,memory_peak_bytes,cpu_usec,oom_kills "
-            "FROM sandbox_runs WHERE rowid<=?",
-            (cutoffs["sandbox_runs"],),
-        ):
-            activation = activations.get(row["activation_id"])
-            if activation is None:
-                continue
-            finished = activation["finished_at"]
-            elapsed = duration(activation["started_at"], now if finished is None else finished)
-            seconds = None if row["cpu_usec"] is None else row["cpu_usec"] / 1e6
-            run = {
-                "id": "run:" + row["activation_id"],
-                "type": "run",
-                "activation_id": row["activation_id"],
-                "employee_id": activation["employee_id"],
-                "role_id": row["role_id"],
-                "started_at": activation["started_at"],
-                "finished_at": finished,
-                "duration_seconds": elapsed,
-                "memory_peak_bytes": row["memory_peak_bytes"],
-                "cpu_seconds": seconds,
-                "mean_vcpus": seconds / elapsed if seconds is not None and elapsed else None,
-                "oom_kills": row["oom_kills"],
-            }
-            runs.append(run)
-            by_role[activation["employee_id"]].append(run)
+        if cutoffs["sandbox_runs"]:
+            for batch in _batches(activations):
+                placeholders = ",".join("?" for _ in batch)
+                for row in db.execute(
+                    "SELECT activation_id,role_id,memory_peak_bytes,cpu_usec,oom_kills "
+                    f"FROM sandbox_runs WHERE rowid<=? AND activation_id IN ({placeholders})",
+                    (cutoffs["sandbox_runs"], *batch),
+                ):
+                    activation = activations[row["activation_id"]]
+                    finished = activation["finished_at"]
+                    elapsed = duration(
+                        activation["started_at"], now if finished is None else finished
+                    )
+                    seconds = None if row["cpu_usec"] is None else row["cpu_usec"] / 1e6
+                    run = {
+                        "id": "run:" + row["activation_id"],
+                        "type": "run",
+                        "activation_id": row["activation_id"],
+                        "employee_id": activation["employee_id"],
+                        "role_id": row["role_id"],
+                        "started_at": activation["started_at"],
+                        "finished_at": finished,
+                        "duration_seconds": elapsed,
+                        "memory_peak_bytes": row["memory_peak_bytes"],
+                        "cpu_seconds": seconds,
+                        "mean_vcpus": (
+                            seconds / elapsed if seconds is not None and elapsed else None
+                        ),
+                        "oom_kills": row["oom_kills"],
+                    }
+                    runs.append(run)
+                    by_role[activation["employee_id"]].append(run)
         rows = list(runs)
         for employee, group in by_role.items():
             peaks = [r["memory_peak_bytes"] for r in group if r["memory_peak_bytes"] is not None]

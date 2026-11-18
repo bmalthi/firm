@@ -301,6 +301,7 @@ class LinuxVM(GuestControl):
                 },
                 "cpus": self.settings.cpus,
                 "memory_gib": self.settings.memory_gib,
+                "disk_gib": self.settings.disk_gib,
                 "subnet": self.subnet,
                 "ready": False,
             },
@@ -453,8 +454,8 @@ sync
             self.paths.preserve_logs()
             running = False
         if not running:
-            self.network.write_configuration()
             self.network.stop()
+            self.network.write_configuration()
             self.network.start()
             started = False
             try:

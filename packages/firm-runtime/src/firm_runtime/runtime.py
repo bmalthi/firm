@@ -25,7 +25,7 @@ from .prompt_resources import render
 from .reminders import Reminders
 from .requests import OwnerRequests
 from .scheduling import acknowledge_opportunities
-from .store import CONTROL_PRIORITY, OPERATIONS, OWNER, Store, encoded
+from .store import CONTROL_PRIORITY, OPERATIONS, ORDINARY_PRIORITY, OWNER, Store, encoded
 from .summaries import SummaryService
 from .tasks import TaskService
 from .telemetry import ContextTelemetry, handoff_checklist
@@ -114,6 +114,7 @@ class Runtime:
 
     def start(self) -> dict:
         self.summary_service.open()
+        self.levels.open()
         with self.store.transaction() as db:
             firm = self.store.firm(db)
             if firm["state"] in {"draining", "stopping"}:
@@ -130,6 +131,7 @@ class Runtime:
 
     def stop(self, force: bool = False) -> dict:
         """Close admission. Dispatcher must separately verify actual execution exit."""
+        self.levels.close()
         self.summary_service.close()
         with self.store.transaction() as db:
             firm = self.store.firm(db)
@@ -288,7 +290,9 @@ class Runtime:
             "AND (r.retry_at IS NULL OR r.retry_at<=?) AND w.priority=w.top_priority "
             "AND NOT EXISTS(SELECT 1 FROM hire_levels h WHERE h.employee_id=r.employee_id "
             "AND h.state='pending') "
-            "AND NOT (? AND r.birth_delivered=0 AND r.guidance_state IS 'pending') "
+            "AND NOT (? AND r.birth_delivered=0 AND EXISTS("
+            "SELECT 1 FROM role_guidance g WHERE g.employee_id=r.employee_id "
+            "AND g.state='pending')) "
             "AND NOT EXISTS(SELECT 1 FROM activations a WHERE a.employee_id=r.employee_id "
             "AND a.state IN ('admitted','running')) GROUP BY r.employee_id "
             "ORDER BY priority DESC,oldest,r.employee_id",
@@ -416,7 +420,8 @@ class Runtime:
             activation_id, token = str(uuid4()), secrets.token_urlsafe(32)
             db.execute(
                 "INSERT INTO activations(activation_id,employee_id,session_id,state,token_hash,"
-                "wake_snapshot,context_json,created_at) VALUES(?,?,?,'admitted',?,?,?,?)",
+                "wake_snapshot,context_json,created_at,fresh_session,inbox_frontier_before) "
+                "VALUES(?,?,?,'admitted',?,?,?,?,?,?)",
                 (
                     activation_id,
                     role["employee_id"],
@@ -425,6 +430,8 @@ class Runtime:
                     encoded(reasons),
                     encoded(context),
                     now,
+                    int(fresh),
+                    role["last_offered_message_sequence"],
                 ),
             )
             db.execute(
@@ -573,9 +580,9 @@ class Runtime:
                     if activation["next_intent"] is not None:
                         raise FirmError("this activation already has a handoff")
                     db.execute(
-                        "UPDATE activations SET handoff_notes=?,next_intent=? "
+                        "UPDATE activations SET handoff_notes=?,next_intent=?,clean_up=? "
                         "WHERE activation_id=?",
-                        (notes, next, activation["activation_id"]),
+                        (notes, next, int(clean_up), activation["activation_id"]),
                     )
                     analysis_history.record(
                         db,
@@ -609,6 +616,8 @@ class Runtime:
         category: str = "unknown",
         retry_after: float | None = None,
         require_mcp_catalog: bool = False,
+        check_provider_session: bool = False,
+        discard_session: bool = False,
     ) -> None:
         """Called only after the executor confirms exit (or launch never occurred)."""
         if outcome not in {"completed", "failed", "interrupted"}:
@@ -641,6 +650,29 @@ class Runtime:
                 raise FirmError("a failed launch must have a recorded attempt")
             role = self.store.role(db, activation["employee_id"])
             now = self.store.clock()
+            session_resumable = not discard_session and (
+                not check_provider_session
+                or (
+                    db.execute(
+                        "SELECT 1 FROM provider_sessions WHERE session_id=?",
+                        (activation["session_id"],),
+                    ).fetchone()
+                    is not None
+                )
+            )
+            try:
+                snapshot_items = json.loads(activation["wake_snapshot"])
+            except (TypeError, ValueError):
+                snapshot_items = []
+            wake_priority = max(
+                (
+                    item.get("priority", ORDINARY_PRIORITY)
+                    for item in snapshot_items
+                    if isinstance(item, dict)
+                    and type(item.get("priority")) is int
+                ),
+                default=ORDINARY_PRIORITY,
+            )
             if category in {"auth", "config", "quota"}:
                 if (
                     self.accounts.record_failure(
@@ -677,13 +709,25 @@ class Runtime:
                     )
                     if activation["next_intent"] == "continue" and role["employment"] != "retired":
                         self.store.request_execution(db, role["employee_id"], "handoff")
+                elif not session_resumable:
+                    db.execute(
+                        "UPDATE roles SET session_id=NULL WHERE employee_id=?",
+                        (role["employee_id"],),
+                    )
             else:
                 if activation["started_at"] is None:
-                    before = json.loads(activation["context_json"]).get("inbox_frontier_before")
-                    if before is not None:
-                        db.execute("UPDATE roles SET last_offered_message_sequence=? "
-                                   "WHERE employee_id=?", (before, role["employee_id"]))
-                    if json.loads(activation["context_json"])["fresh_session"]:
+                    db.execute(
+                        "UPDATE roles SET last_offered_message_sequence=? WHERE employee_id=?",
+                        (activation["inbox_frontier_before"], role["employee_id"]),
+                    )
+                    if not session_resumable and role["recovery_json"]:
+                        recovery = json.loads(role["recovery_json"])
+                        recovery["context_retained"] = False
+                        db.execute(
+                            "UPDATE roles SET session_id=NULL,recovery_json=? WHERE employee_id=?",
+                            (encoded(recovery), role["employee_id"]),
+                        )
+                    elif activation["fresh_session"] or not session_resumable:
                         db.execute(
                             "UPDATE roles SET session_id=NULL WHERE employee_id=?",
                             (role["employee_id"],),
@@ -693,15 +737,23 @@ class Runtime:
                         "cause": category,
                         "time_utc": datetime.fromtimestamp(now, UTC).isoformat(),
                         "time_is_detection": True,
-                        "context_retained": True,
+                        "context_retained": session_resumable,
                         "recent_reads": self.messaging.recent_reads(
                             db, role["employee_id"], activation["session_id"]
                         ),
                     }
-                    db.execute(
-                        "UPDATE roles SET recovery_json=?,handoff_notes=NULL WHERE employee_id=?",
-                        (encoded(recovery), role["employee_id"]),
-                    )
+                    if session_resumable:
+                        db.execute(
+                            "UPDATE roles SET recovery_json=?,handoff_notes=NULL "
+                            "WHERE employee_id=?",
+                            (encoded(recovery), role["employee_id"]),
+                        )
+                    else:
+                        db.execute(
+                            "UPDATE roles SET session_id=NULL,recovery_json=?,handoff_notes=NULL "
+                            "WHERE employee_id=?",
+                            (encoded(recovery), role["employee_id"]),
+                        )
                 setup_retry = category == "transient" and activation["launch_attempted_at"] is None
                 attempts = role["attempt_count"] + int(setup_retry)
                 if setup_retry:
@@ -709,6 +761,40 @@ class Runtime:
                         "UPDATE roles SET attempt_count=? WHERE employee_id=?",
                         (attempts, role["employee_id"]),
                     )
+                unstarted_idle_review = (
+                    activation["started_at"] is None
+                    and bool(snapshot_items)
+                    and all(
+                        isinstance(item, dict) and item.get("reason") == "idle_inbox_review"
+                        for item in snapshot_items
+                    )
+                )
+
+                def restore_unstarted_reasons(ready_at: float | None = None) -> None:
+                    if activation["started_at"] is not None:
+                        return
+                    for item in snapshot_items:
+                        if not isinstance(item, dict):
+                            continue
+                        item_reason = item.get("reason")
+                        if item_reason in WAKE_REASONS - {"message", "idle_inbox_review"}:
+                            item_priority = (
+                                item["priority"]
+                                if type(item.get("priority")) is int
+                                else wake_priority
+                            )
+                            item_source = (
+                                item["source_id"] if isinstance(item.get("source_id"), str) else ""
+                            )
+                            self.store.request_execution(
+                                db,
+                                role["employee_id"],
+                                item_reason,
+                                item_priority,
+                                ready_at=ready_at,
+                                source_id=item_source,
+                            )
+
                 if (category == "owner_stop"
                         or (activation["launch_attempted_at"] is None and not setup_retry)
                         or (outcome == "interrupted"
@@ -719,15 +805,21 @@ class Runtime:
                             "WHERE employee_id=?",
                             (role["employee_id"],),
                         )
-                    if role["employment"] != "retired":
-                        self.store.request_execution(db, role["employee_id"], "interrupted_work")
+                    if role["employment"] != "retired" and not unstarted_idle_review:
+                        self.store.request_execution(
+                            db, role["employee_id"], "interrupted_work", wake_priority
+                        )
+                        restore_unstarted_reasons()
                 elif category in {"auth", "config", "quota"}:
                     db.execute(
                         "UPDATE roles SET attempt_count=MAX(0,attempt_count-1) WHERE employee_id=?",
                         (role["employee_id"],),
                     )
-                    if role["employment"] != "retired":
-                        self.store.request_execution(db, role["employee_id"], "dependency_recovery")
+                    if role["employment"] != "retired" and not unstarted_idle_review:
+                        self.store.request_execution(
+                            db, role["employee_id"], "dependency_recovery", wake_priority
+                        )
+                        restore_unstarted_reasons()
                 elif role["employment"] != "retired":
                     if category == "refusal" or attempts >= 4:
                         reason = "refusal" if category == "refusal" else "attempts_exhausted"
@@ -758,9 +850,11 @@ class Runtime:
                             "UPDATE roles SET retry_at=? WHERE employee_id=?",
                             (ready, role["employee_id"]),
                         )
-                        self.store.request_execution(
-                            db, role["employee_id"], "recovery", ready_at=ready
-                        )
+                        if not unstarted_idle_review:
+                            self.store.request_execution(
+                                db, role["employee_id"], "recovery", wake_priority, ready_at=ready
+                            )
+                            restore_unstarted_reasons(ready_at=ready)
             analysis_history.role_changed(
                 db,
                 now,

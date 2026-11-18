@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from firm_runtime import guidance
 from firm_runtime.accounts import TASK_DEFAULTS
 from firm_runtime.errors import FirmError
 from firm_runtime.lifecycle import FOUNDER_ID, Lifecycle
@@ -667,29 +668,37 @@ def test_guidance_registration_and_replayed_requests_are_atomic(
     employee = lifecycle.hire("founder", "worker", "Work", **kwargs)["employee_id"]
     with store.read() as db:
         for eid in ("founder", employee):
-            role = store.role(db, eid)
-            assert role["guidance_state"] == ("pending" if staffing else None)
-            assert role["guidance_revision"] == (0 if staffing else None)
+            guide = guidance.record(db, eid)
+            if staffing:
+                assert guide["state"] == "pending"
+                assert guide["revision"] == 0
+            else:
+                assert guide is None
     if staffing:
         with store.transaction() as db:
             db.execute(
-                "UPDATE roles SET guidance_attempts=2,guidance_retry_at=200 WHERE employee_id=?",
+                "UPDATE role_guidance SET attempts=2,retry_at=200 WHERE employee_id=?",
                 (employee,),
             )
     lifecycle.hire("founder", "worker", "Work", **kwargs)
     with store.read() as db:
-        assert store.role(db, employee)["guidance_attempts"] == (2 if staffing else 0)
+        guide = guidance.record(db, employee)
+        assert (guide["attempts"] if guide else 0) == (2 if staffing else 0)
     lifecycle.revise_mandate("founder", employee, 0, "New work", request_id="rev")
     with store.read() as db:
-        role = store.role(db, employee)
-        assert role["guidance_revision"] == (1 if staffing else None)
-        assert role["guidance_attempts"] == 0 and role["guidance_retry_at"] is None
+        guide = guidance.record(db, employee)
+        if staffing:
+            assert guide["revision"] == 1
+            assert guide["attempts"] == 0 and guide["retry_at"] is None
+        else:
+            assert guide is None
     if staffing:
         with store.transaction() as db:
             db.execute(
-                "UPDATE roles SET guidance_attempts=1,guidance_retry_at=300 WHERE employee_id=?",
+                "UPDATE role_guidance SET attempts=1,retry_at=300 WHERE employee_id=?",
                 (employee,),
             )
     lifecycle.revise_mandate("founder", employee, 0, "New work", request_id="rev")
     with store.read() as db:
-        assert store.role(db, employee)["guidance_attempts"] == (1 if staffing else 0)
+        guide = guidance.record(db, employee)
+        assert (guide["attempts"] if guide else 0) == (1 if staffing else 0)

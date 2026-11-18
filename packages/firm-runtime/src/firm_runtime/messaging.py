@@ -35,8 +35,10 @@ NO_RECIPIENT = "no active or paused role at that address"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS message_sequence (
-    sequence INTEGER PRIMARY KEY AUTOINCREMENT
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    sequence INTEGER NOT NULL DEFAULT 0 CHECK(sequence>=0)
 );
+INSERT OR IGNORE INTO message_sequence VALUES(1,0);
 CREATE TABLE IF NOT EXISTS conversations (
     conversation_id TEXT PRIMARY KEY,
     sequence INTEGER NOT NULL UNIQUE,
@@ -77,13 +79,16 @@ CREATE TABLE IF NOT EXISTS message_deliveries (
     read_sequence INTEGER,
     read_activation_id TEXT REFERENCES activations(activation_id),
     failure_reason TEXT,
+    action_required INTEGER NOT NULL DEFAULT 1 CHECK(action_required IN (0, 1)),
     scheduling_priority INTEGER NOT NULL DEFAULT 0,
     scheduling_ready_at REAL,
     PRIMARY KEY(message_id, employee_id)
 );
 CREATE TABLE IF NOT EXISTS message_read_sequence (
-    sequence INTEGER PRIMARY KEY AUTOINCREMENT
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    sequence INTEGER NOT NULL DEFAULT 0 CHECK(sequence>=0)
 );
+INSERT OR IGNORE INTO message_read_sequence VALUES(1,0);
 CREATE INDEX IF NOT EXISTS pending_mail
     ON message_deliveries(employee_id, disposition, message_id);
 CREATE INDEX IF NOT EXISTS delivery_scheduling
@@ -435,7 +440,7 @@ class Messaging:
     @staticmethod
     def _pending_rows(db, actor_id):
         return db.execute(
-            "SELECT m.*,c.audience_json FROM message_deliveries d "
+            "SELECT m.*,c.audience_json,d.action_required FROM message_deliveries d "
             "JOIN messages m USING(message_id) JOIN conversations c USING(conversation_id) "
             "WHERE d.employee_id=? AND d.disposition='pending' ORDER BY m.sequence",
             (actor_id,),
@@ -486,16 +491,11 @@ class Messaging:
             "participants": self._participant_preview(others),
             "participants_omitted": max(0, len(others) - 8),
             "unread_count": len(messages),
-            "action_required": any(self._action(row, actor_id) for row in messages),
+            "action_required": any(bool(row["action_required"]) for row in messages),
         }
         if latest["subject"] is None:
             result["preview"] = self._excerpt(" ".join(latest["body"].split()), 80)
         return result
-
-    @staticmethod
-    def _action(row, actor_id):
-        return any(p.get("employee_id") == actor_id and p.get("action_required", False)
-                   for p in json.loads(row["recipients_json"]))
 
     def _unread(self, db, actor_id, source):
         return db.execute(
@@ -647,8 +647,9 @@ class Messaging:
         read_sequence = None
         if disposition == "read":
             read_sequence = db.execute(
-                "INSERT INTO message_read_sequence DEFAULT VALUES"
-            ).lastrowid
+                "UPDATE message_read_sequence SET sequence=sequence+1 "
+                "WHERE singleton=1 RETURNING sequence"
+            ).fetchone()[0]
         placeholders = ",".join("?" for _ in message_ids)
         db.execute(
             f"UPDATE message_deliveries SET disposition=?,disposition_at=?,read_sequence=?,"
@@ -805,7 +806,9 @@ class Messaging:
         notification_title: str | None = None,
     ) -> str:
         attached = [] if attachments is None else attachments
-        sequence = db.execute("INSERT INTO message_sequence DEFAULT VALUES").lastrowid
+        sequence = db.execute(
+            "UPDATE message_sequence SET sequence=sequence+1 WHERE singleton=1 RETURNING sequence"
+        ).fetchone()[0]
         message_id = "m" + _base36(sequence)
         recipient_records = [{**person, "status": "queued",
                               "action_required": self._participant_key(person) in action_keys}
@@ -861,16 +864,16 @@ class Messaging:
         )
         for recipient in accepted:
             employee_id = recipient["employee_id"]
+            action_required = self._participant_key(recipient) in action_keys
             scheduling_ready_at = (
                 (candidate["created_at"] if ready_at is None else ready_at)
-                if self._participant_key(recipient) in action_keys
-                and employee_id not in {OWNER, OPERATIONS}
+                if action_required and employee_id not in {OWNER, OPERATIONS}
                 else None
             )
             db.execute(
-                "INSERT INTO message_deliveries("
-                "message_id,employee_id,scheduling_priority,scheduling_ready_at) VALUES(?,?,?,?)",
-                (message_id, employee_id, priority, scheduling_ready_at),
+                "INSERT INTO message_deliveries(message_id,employee_id,action_required,"
+                "scheduling_priority,scheduling_ready_at) VALUES(?,?,?,?,?)",
+                (message_id, employee_id, int(action_required), priority, scheduling_ready_at),
             )
             if employee_id == OWNER:
                 self.notify_owner(
@@ -1033,7 +1036,8 @@ class Messaging:
 
     def idle_rows(self, db, actor_id: str, now: float) -> list[sqlite3.Row]:
         rows = db.execute(
-            "SELECT m.*,c.audience_json,d.scheduling_ready_at FROM message_deliveries d "
+            "SELECT m.*,c.audience_json,d.action_required,d.scheduling_ready_at "
+            "FROM message_deliveries d "
             "JOIN messages m USING(message_id) JOIN conversations c USING(conversation_id) "
             "JOIN roles r ON r.employee_id=d.employee_id WHERE d.employee_id=? "
             "AND d.disposition='pending' AND m.sequence>r.last_offered_message_sequence "

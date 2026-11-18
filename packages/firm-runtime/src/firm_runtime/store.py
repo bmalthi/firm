@@ -43,20 +43,16 @@ CREATE TABLE IF NOT EXISTS roles (
     execution_profile TEXT NOT NULL,
     effort TEXT,
     session_id TEXT,
-    session_mandate_revision INTEGER NOT NULL DEFAULT 0,
+    session_mandate_revision INTEGER NOT NULL DEFAULT 0 CHECK(session_mandate_revision >= 0),
     scope_guidance TEXT,
     functional_guidance TEXT NOT NULL DEFAULT '[]',
-    guidance_state TEXT CHECK(guidance_state IN ('pending','chosen','defaulted','owner')),
-    guidance_revision INTEGER,
-    guidance_attempts INTEGER NOT NULL DEFAULT 0,
-    guidance_retry_at REAL,
-    guidance_reason TEXT,
     session_guidance TEXT,
-    birth_delivered INTEGER NOT NULL DEFAULT 0,
-    last_offered_message_sequence INTEGER NOT NULL DEFAULT 0,
+    birth_delivered INTEGER NOT NULL DEFAULT 0 CHECK(birth_delivered IN (0, 1)),
+    last_offered_message_sequence INTEGER NOT NULL DEFAULT 0
+        CHECK(last_offered_message_sequence >= 0),
     handoff_notes TEXT,
     recovery_json TEXT,
-    attempt_count INTEGER NOT NULL DEFAULT 0,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
     recovery_episode TEXT NOT NULL,
     hold_reason TEXT,
     retry_at REAL,
@@ -92,6 +88,10 @@ CREATE TABLE IF NOT EXISTS activations (
     drain_presented_at REAL,
     handoff_presented_compactions INTEGER,
     mail_presented_sequence INTEGER,
+    clean_up INTEGER NOT NULL DEFAULT 0 CHECK(clean_up IN (0, 1)),
+    cleaned_up_at REAL,
+    fresh_session INTEGER NOT NULL DEFAULT 0 CHECK(fresh_session IN (0, 1)),
+    inbox_frontier_before INTEGER NOT NULL DEFAULT 0,
     failure_category TEXT,
     failure TEXT
 );
@@ -130,29 +130,25 @@ CREATE TABLE IF NOT EXISTS sandbox_runs (
     role_id TEXT NOT NULL,
     run_id TEXT NOT NULL UNIQUE,
     vm_generation TEXT,
-    provider TEXT NOT NULL,
+    execution_profile TEXT NOT NULL,
     deadline REAL NOT NULL,
+    idle_timeout REAL NOT NULL CHECK(idle_timeout > 0),
+    output_digest TEXT,
     stop_cause TEXT,
     memory_peak_bytes INTEGER,
     cpu_usec INTEGER,
     oom_kills INTEGER
-);
-CREATE TABLE IF NOT EXISTS execution_activity (
-    activation_id TEXT PRIMARY KEY REFERENCES sandbox_runs(activation_id),
-    idle_timeout REAL NOT NULL CHECK(idle_timeout > 0),
-    output_digest TEXT
 );
 CREATE TABLE IF NOT EXISTS sandbox_run_settlements (
     run_id TEXT PRIMARY KEY,
     role_id TEXT NOT NULL,
     vm_generation TEXT NOT NULL,
     recorded_at REAL NOT NULL,
-    usage_json TEXT,
-    reclaim_json TEXT
+    usage_json TEXT
 );
 CREATE TABLE IF NOT EXISTS provider_sessions (
     session_id TEXT PRIMARY KEY,
-    provider TEXT NOT NULL,
+    execution_profile TEXT NOT NULL,
     native_session_id TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS execution_host (
@@ -174,8 +170,72 @@ INSERT OR IGNORE INTO employee_sequence VALUES(1,1);
 """
 
 
+def schema_modules():
+    """Ordered runtime schema modules (core tables first, views after base tables)."""
+    from . import (
+        accounts,
+        analysis_history,
+        appointments,
+        github,
+        guidance,
+        hosts,
+        levels,
+        mac_lease,
+        messaging,
+        reminders,
+        requests,
+        scheduling,
+        store,
+        summaries,
+        telemetry,
+    )
+
+    return (
+        store,
+        messaging,
+        scheduling,
+        accounts,
+        telemetry,
+        reminders,
+        appointments,
+        analysis_history,
+        summaries,
+        levels,
+        guidance,
+        mac_lease,
+        github,
+        requests,
+        hosts,
+    )
+
+
 def encoded(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def read_employee_sequence(path: Path) -> int | None:
+    """Read and validate the high-water sequence sidecar without blocking on special files."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("invalid employee sequence")
+        stream = os.fdopen(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with stream:
+        raw = stream.read(32)
+    saved = raw.strip()
+    if len(raw) == 32 or not saved.isascii() or not saved.isdecimal():
+        raise ValueError("invalid employee sequence")
+    value = int(saved)
+    if value >= 2**63 - 1:
+        raise ValueError("employee sequence is exhausted")
+    return value
 
 
 class Store:
@@ -192,17 +252,8 @@ class Store:
         sequence = self.path.with_name(self.path.name + ".employee-sequence")
         temporary = sequence.with_name("." + sequence.name + "." + secrets.token_hex(8))
         try:
-            try:
-                descriptor = os.open(sequence, os.O_RDONLY | os.O_NOFOLLOW)
-            except FileNotFoundError:
-                high_water = 0
-            else:
-                with os.fdopen(descriptor) as stream:
-                    raw = stream.read(32)
-                saved = raw.strip()
-                if len(raw) == 32 or not saved.isascii() or not saved.isdecimal():
-                    raise ValueError("invalid employee sequence")
-                high_water = int(saved)
+            saved = read_employee_sequence(sequence)
+            high_water = 0 if saved is None else saved
             floor = db.execute(
                 "SELECT next_number FROM employee_sequence WHERE singleton=1"
             ).fetchone()[0]
@@ -266,46 +317,8 @@ class Store:
         )
         with self._connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
-            db.executescript(SCHEMA)
-            from .messaging import SCHEMA as MESSAGE_SCHEMA
-
-            db.executescript(MESSAGE_SCHEMA)
-            from .scheduling import SCHEMA as SCHEDULING_SCHEMA
-
-            db.executescript(SCHEDULING_SCHEMA)
-            from .accounts import SCHEMA as ACCOUNT_SCHEMA
-
-            db.executescript(ACCOUNT_SCHEMA)
-            from .telemetry import SCHEMA as TELEMETRY_SCHEMA
-
-            db.executescript(TELEMETRY_SCHEMA)
-            from .reminders import SCHEMA as REMINDER_SCHEMA
-
-            db.executescript(REMINDER_SCHEMA)
-            from .appointments import SCHEMA as APPOINTMENT_SCHEMA
-
-            db.executescript(APPOINTMENT_SCHEMA)
-            from .analysis_history import SCHEMA as ANALYSIS_SCHEMA
-
-            db.executescript(ANALYSIS_SCHEMA)
-            from .summaries import SCHEMA as SUMMARY_SCHEMA
-
-            db.executescript(SUMMARY_SCHEMA)
-            from .levels import SCHEMA as LEVELS_SCHEMA
-
-            db.executescript(LEVELS_SCHEMA)
-            from .mac_lease import SCHEMA as MAC_SCHEMA
-
-            db.executescript(MAC_SCHEMA)
-            from .github import SCHEMA as GITHUB_SCHEMA
-
-            db.executescript(GITHUB_SCHEMA)
-            from .requests import SCHEMA as REQUESTS_SCHEMA
-
-            db.executescript(REQUESTS_SCHEMA)
-            from .hosts import SCHEMA as HOSTS_SCHEMA
-
-            db.executescript(HOSTS_SCHEMA)
+            for module in schema_modules():
+                db.executescript(module.SCHEMA)
             db.execute(
                 "INSERT OR IGNORE INTO runtime_secrets VALUES('discovery_cursor',?)",
                 (secrets.token_hex(32),),

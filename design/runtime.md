@@ -158,7 +158,7 @@ that point. No per-delivery review registry or receipt protocol is needed.
 
 ### Handoff and the Next Work Period
 
-The handoff request stores `clean_up` in its payload (default `false`). When a period whose handoff set `clean_up` completes, the dispatcher's idle-role loop disposes of scratch and scoped Docker state (containers, dangling images and ordinary build cache; tagged images and volumes stay) best-effort, one role per tick, shared with retirement and expired temporary appointments; if the role's next launch is admitted first, that launch performs the cleanup instead. A returned receipt, even partial, marks the activation cleaned for this host process; an exception backs off fifteen minutes, and a host restart may repeat cleanup harmlessly.
+The handoff request records `clean_up` (default `false`) both on `activations` and in its request receipt. When a period whose handoff set `clean_up` completes, the dispatcher's idle-role loop disposes of scratch and scoped Docker state (containers, dangling images and ordinary build cache; tagged images and volumes stay) best-effort, one role per tick, shared with retirement and expired temporary appointments; if the role's next launch is admitted first, that launch performs the cleanup instead. A returned receipt, even partial, records `cleaned_up_at` on `activations` in SQLite so cleanup does not repeat across host restarts; an exception backs off fifteen minutes.
 
 | How the role stops | Context on next activation | Wake behavior |
 | :--- | :--- | :--- |

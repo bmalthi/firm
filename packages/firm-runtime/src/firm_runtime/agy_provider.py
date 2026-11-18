@@ -68,7 +68,7 @@ def native_model_id(model, effort):
             message="AGY supports low, medium, high and the Firm xhigh mapping",
         )
     if not isinstance(model, str) or model not in {
-        "gemini-4-argon", "gemini-4-hydrogen"
+        "gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen"
     }:
         raise ProviderSetupError(
             category="config",
@@ -230,6 +230,29 @@ def parse_result(logs, exit_code, *, tool_free=False):
     return ProviderResult(session, True, terminal["response"], None, parse_usage(logs))
 
 
+def _agy_usage(mapping: object) -> tuple[int | None, int | None, int | None, int | None]:
+    if not isinstance(mapping, dict):
+        return None, None, None, None
+    uncached = token_count(mapping, "input_tokens")
+    cached = token_count(mapping, "cache_read_tokens")
+    inputs = (
+        None
+        if uncached is None and cached is None
+        else (uncached or 0) + (cached or 0)
+    )
+    return (
+        inputs,
+        cached,
+        token_count(mapping, "output_tokens"),
+        token_count(mapping, "thinking_tokens"),
+    )
+
+
+def _sum_optional(values: list[int | None]) -> int | None:
+    present = [value for value in values if value is not None]
+    return sum(present) if present else None
+
+
 def parse_usage(logs):
     events, _, terminal, _, valid = _stream(logs)
     if not valid:
@@ -239,18 +262,42 @@ def parse_usage(logs):
     )
     if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", model):
         model = None
+    steps: dict[int, tuple[int | None, int | None, int | None, int | None]] = {}
+    for event in events:
+        if event.get("event") != "step_update":
+            continue
+        payload = event["step_update"]
+        index = payload.get("step_index")
+        if (
+            payload.get("step_type") == "agent_response"
+            and type(index) is int
+            and index >= 0
+            and isinstance(payload.get("usage"), dict)
+        ):
+            steps[index] = _agy_usage(payload["usage"])
     usage = terminal.get("usage") if terminal else None
-    if not isinstance(usage, dict):
-        if model is None:
-            return None
-        usage = {}
+    if not isinstance(usage, dict) and not steps and model is None:
+        return None
+    current = high_water = None
+    ordered = [steps[index] for index in sorted(steps)]
+    for inputs, _, output, _ in ordered:
+        if inputs is not None and output is not None:
+            current = inputs + output
+            high_water = current if high_water is None else max(high_water, current)
+    session_inputs, session_cached, session_output, session_reasoning = _agy_usage(usage)
     # Native totals include earlier activations. Thinking is a subset of output,
     # not an extra output charge. No new persisted baseline is needed.
     return ProviderUsage(
-        session_input_tokens=token_count(usage, "input_tokens"),
-        session_output_tokens=token_count(usage, "output_tokens"),
-        session_cached_input_tokens=token_count(usage, "cache_read_tokens"),
-        session_reasoning_output_tokens=token_count(usage, "thinking_tokens"),
+        current_context_tokens=current,
+        high_water_context_tokens=high_water,
+        input_tokens=_sum_optional([step[0] for step in ordered]),
+        cached_input_tokens=_sum_optional([step[1] for step in ordered]),
+        output_tokens=_sum_optional([step[2] for step in ordered]),
+        reasoning_output_tokens=_sum_optional([step[3] for step in ordered]),
+        session_input_tokens=session_inputs,
+        session_output_tokens=session_output,
+        session_cached_input_tokens=session_cached,
+        session_reasoning_output_tokens=session_reasoning,
         resolved_model=model,
         source="agy-stream",
     )

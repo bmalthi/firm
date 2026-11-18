@@ -56,10 +56,10 @@ def child_setup(setup):
     parent_id = sandbox_run_id(caller.activation_id)
     with runtime.store.transaction() as db:
         db.execute(
-            "INSERT INTO sandbox_runs(activation_id,role_id,run_id,provider,deadline,"
-            "vm_generation) VALUES(?,?,?,?,?,?)",
+            "INSERT INTO sandbox_runs(activation_id,role_id,run_id,execution_profile,deadline,"
+            "idle_timeout,vm_generation) VALUES(?,?,?,?,?,?,?)",
             (caller.activation_id, sandbox_role_id(caller.employee_id), parent_id,
-             "primary", now[0] + 50, "generation"),
+             "primary", now[0] + 50, 50, "generation"),
         )
     box = ChildSandbox()
     runner = GuestTaskRunner(

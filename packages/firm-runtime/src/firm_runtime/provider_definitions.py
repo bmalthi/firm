@@ -69,6 +69,7 @@ PROVIDER_DEFINITIONS: Mapping[str, ProviderDefinition] = MappingProxyType({
         staffing_medium=ModelSettings("gemini-4-hydrogen", "high"),
         staffing_high=ModelSettings("gemini-4-argon", "medium"),
         staffing_chooser=ModelSettings("gemini-4-hydrogen", "low"),
+        soft_context_window=500_000,
         incompatible_services=("google_cloud",),
     ),
 })

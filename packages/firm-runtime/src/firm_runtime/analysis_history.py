@@ -26,6 +26,9 @@ CREATE TABLE IF NOT EXISTS analysis_events (
 CREATE INDEX IF NOT EXISTS analysis_events_by_time ON analysis_events(observed_at,sequence);
 CREATE INDEX IF NOT EXISTS analysis_events_by_role_kind
     ON analysis_events(employee_id,kind,sequence);
+CREATE INDEX IF NOT EXISTS analysis_events_by_summary_run
+    ON analysis_events(kind,summary_run_id,sequence)
+    WHERE summary_run_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS resource_samples (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     observed_at REAL NOT NULL,

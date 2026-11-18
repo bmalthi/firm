@@ -23,6 +23,7 @@ from .provider_definitions import incompatible_service
 from .provider_support import activation_url
 from .public_profiles import ingest_public_profiles
 from .runtime import Runtime
+from .store import encoded
 from .summaries import summary_role_id
 from .task_runner import reconcile_tasks
 from .workspaces import (
@@ -62,7 +63,6 @@ class SandboxDispatcher:
         self._logs: dict[str, bytearray] = {}
         self._pool = None
         self._retired = set()
-        self._cleaned = set()
         self._retire_not_before = {}
         self._summary_runner = None
         self._task_runner = None
@@ -477,37 +477,26 @@ class SandboxDispatcher:
 
     def _missing(self, row):
         if row["stop_cause"] == "owner_stop" or self.runtime.status()["state"] == "stopping":
-            self.runtime.finish(row["activation_id"], "interrupted", category="owner_stop")
+            self.runtime.finish(
+                row["activation_id"],
+                "interrupted",
+                category="owner_stop",
+                check_provider_session=True,
+            )
         else:
             self.runtime.finish(
                 row["activation_id"],
                 "interrupted",
                 category="host_restart",
                 failure="sandbox invocation is absent from healthy inventory",
+                check_provider_session=True,
             )
         self._forget_log(row["activation_id"])
-        self._clear_unresumable_session(row)
-
-    def _clear_unresumable_session(self, row):
-        with self.runtime.store.transaction() as db:
-            if db.execute(
-                "SELECT 1 FROM provider_sessions WHERE session_id=?", (row["session_id"],)
-            ).fetchone():
-                return
-            activation = self.runtime._activation(db, row["activation_id"])
-            role = self.runtime.store.role(db, activation["employee_id"])
-            recovery = json.loads(role["recovery_json"]) if role["recovery_json"] else None
-            if recovery:
-                recovery["context_retained"] = False
-            db.execute(
-                "UPDATE roles SET session_id=NULL,recovery_json=? WHERE employee_id=?",
-                (json.dumps(recovery) if recovery else None, role["employee_id"]),
-            )
 
     def _provider(self, row) -> ExecutionProvider:
         if hasattr(self.providers, "for_session"):
             return self.providers.for_session(row["session_id"])
-        provider = self.providers.get(row["provider"])
+        provider = self.providers.get(row["execution_profile"])
         if provider is None:
             raise FirmError("execution profile needed for reconciliation is not configured")
         return provider
@@ -519,11 +508,14 @@ class SandboxDispatcher:
                 old = db.execute(
                     "SELECT * FROM provider_sessions WHERE session_id=?", (row["session_id"],)
                 ).fetchone()
-                if old and (old["provider"], old["native_session_id"]) != (row["provider"], native):
+                if old and (old["execution_profile"], old["native_session_id"]) != (
+                    row["execution_profile"],
+                    native,
+                ):
                     raise FirmError("provider resumed a different conversation")
                 db.execute(
                     "INSERT OR IGNORE INTO provider_sessions VALUES(?,?,?)",
-                    (row["session_id"], row["provider"], native),
+                    (row["session_id"], row["execution_profile"], native),
                 )
 
     def _observe_usage(self, row, logs, *, historical=False, strict=False):
@@ -633,9 +625,13 @@ class SandboxDispatcher:
                 self._record_tool_calls(row, logs)
             # Runtime loss is established when the host locks are reacquired;
             # partial provider output is not needed to classify interruption.
-            self.runtime.finish(row["activation_id"], "interrupted", category="host_restart")
+            self.runtime.finish(
+                row["activation_id"],
+                "interrupted",
+                category="host_restart",
+                check_provider_session=True,
+            )
             self._forget_log(row["activation_id"])
-            self._clear_unresumable_session(row)
             return
         if parsed is None:
             logs = self._read_logs(row, run, info)
@@ -657,19 +653,34 @@ class SandboxDispatcher:
             and parsed.success
         )
         if row["stop_cause"] == "owner_stop":
-            self.runtime.finish(row["activation_id"], "interrupted", category="owner_stop")
+            self.runtime.finish(
+                row["activation_id"],
+                "interrupted",
+                category="owner_stop",
+                check_provider_session=True,
+            )
         elif row["stop_cause"] == "timeout" and not completed:
             self.runtime.finish(
-                row["activation_id"], "failed", failure="execution inactivity timeout expired"
+                row["activation_id"],
+                "failed",
+                failure="execution inactivity timeout expired",
+                check_provider_session=True,
             )
         elif parsed is not None and getattr(parsed, "interrupted", False):
-            self.runtime.finish(row["activation_id"], "interrupted", category="transient")
+            self.runtime.finish(
+                row["activation_id"],
+                "interrupted",
+                category="transient",
+                check_provider_session=True,
+            )
         elif row["state"] == "running" and parsed.success:
             # AGY can report SUCCESS after silently dropping its MCP server.
             # Check the current activation's receipt atomically with settlement;
             # missing MCP consumes the failure budget rather than a refunded yield.
             self.runtime.finish(
-                row["activation_id"], require_mcp_catalog=self._provider(row).name == "agy"
+                row["activation_id"],
+                require_mcp_catalog=self._provider(row).name == "agy",
+                check_provider_session=True,
             )
         else:
             kind = parsed.error.kind if parsed.error else "invalid_output"
@@ -694,10 +705,11 @@ class SandboxDispatcher:
                 failure_code=getattr(parsed.error, "code", None),
                 category=category,
                 retry_after=retry_at,
+                check_provider_session=True,
+                discard_session=(self._provider(row).name == "agy" and kind == "result_error"),
             )
         self._subscription_events.pop(row["activation_id"], None)
         self._forget_log(row["activation_id"])
-        self._clear_unresumable_session(row)
 
     def _poll_run(self, row, run, info):
         if info.get("unresolved"):
@@ -810,6 +822,7 @@ class SandboxDispatcher:
         # the authoritative exit proof.
         if self._task_runner:
             self._task_runner.cancel_all()
+        self.runtime.levels.close()
         self.runtime.summary_service.close()
         if self._summary_runner:
             self._summary_runner.cancel_all()
@@ -858,6 +871,7 @@ class SandboxDispatcher:
             for row in active:
                 self.runtime.finish(row[0], "interrupted", category="owner_stop")
             self._infrastructure_state("stopped")
+            self.runtime.levels.close(wait=True)
             with self.runtime.store.transaction() as db:
                 self.runtime._settle_stop(db)
             self.runtime.github.settle()
@@ -872,15 +886,14 @@ class SandboxDispatcher:
         self.runtime.task_service.recover_confirmed(ids)
 
     def _cleanup_activation(self, db, employee_id):
-        request = db.execute(
-            "SELECT activation_id,payload_json FROM requests WHERE operation='handoff' "
-            "AND activation_id=(SELECT activation_id FROM activations WHERE employee_id=? "
-            "AND state='completed' AND next_intent IS NOT NULL ORDER BY rowid DESC LIMIT 1)",
+        row = db.execute(
+            "SELECT activation_id,clean_up,cleaned_up_at FROM activations "
+            "WHERE employee_id=? AND state='completed' AND next_intent IS NOT NULL "
+            "ORDER BY rowid DESC LIMIT 1",
             (employee_id,),
         ).fetchone()
-        if (request and request["activation_id"] not in self._cleaned
-                and json.loads(request["payload_json"]).get("clean_up", False)):
-            return request["activation_id"]
+        if row and row["clean_up"] and row["cleaned_up_at"] is None:
+            return row["activation_id"]
         return None
 
     def _clean_up(self, invocation):
@@ -891,17 +904,26 @@ class SandboxDispatcher:
 
     def _expired_cleanup_activation(self, db, employee_id):
         activation = db.execute(
-            "SELECT a.activation_id,a.state,a.failure_category,s.stop_cause FROM activations AS a "
+            "SELECT a.activation_id,a.state,a.failure_category,a.cleaned_up_at,s.stop_cause "
+            "FROM activations AS a "
             "JOIN appointments AS p USING(employee_id) "
             "LEFT JOIN sandbox_runs AS s ON s.activation_id=a.activation_id WHERE a.employee_id=? "
             "AND p.kind='temporary' AND p.remaining_periods=0 AND a.finished_at IS NOT NULL "
-            "ORDER BY a.finished_at DESC,a.rowid DESC LIMIT 1", (employee_id,),
+            "ORDER BY a.finished_at DESC,a.rowid DESC LIMIT 1",
+            (employee_id,),
         ).fetchone()
-        if (activation and activation["activation_id"] not in self._cleaned
-                and activation["stop_cause"] is None
-                and (activation["state"] == "completed" or (
+        if (
+            activation
+            and activation["cleaned_up_at"] is None
+            and activation["stop_cause"] is None
+            and (
+                activation["state"] == "completed"
+                or (
                     activation["state"] == "failed"
-                    and activation["failure_category"] in {"unknown", "refusal"}))):
+                    and activation["failure_category"] in {"unknown", "refusal"}
+                )
+            )
+        ):
             return activation["activation_id"]
         return None
 
@@ -953,7 +975,11 @@ class SandboxDispatcher:
                     self.sandbox.retire(role_id)
                     self._retired.add(role_id)
                 else:
-                    self._cleaned.add(cleanup)
+                    with self.runtime.store.transaction() as db:
+                        db.execute(
+                            "UPDATE activations SET cleaned_up_at=? WHERE activation_id=?",
+                            (self.runtime.store.clock(), cleanup),
+                        )
                     LOGGER.info("Idle-role cleanup for %s (%s): %s", role_id, cleanup, receipt)
             except Exception:
                 LOGGER.warning("Idle-role cleanup failed for %s; retrying in 15 minutes", role_id,
@@ -991,10 +1017,13 @@ class SandboxDispatcher:
             self._tasks_host_stopped()
             for row in self._records(active_only=True):
                 self._missing(row)
+            self.runtime.levels.close()
+            self.runtime.summary_service.close()
             if self._summary_runner:
                 self._summary_runner.confirm_host_stop()
             self.runtime.summary_service.reconcile(set(), host_stopped=True)
             self._infrastructure_state("stopped")
+            self.runtime.levels.close(wait=True)
             with self.runtime.store.transaction() as db:
                 self.runtime._settle_stop(db)
             if state == "running":
@@ -1022,7 +1051,12 @@ class SandboxDispatcher:
         self.runtime.github.settle()
         state = self.runtime.status()
         if state["state"] in {"draining", "stopping"}:
+            self.runtime.levels.close()
+            self.runtime.summary_service.close()
             if not state["active"] and not self._launches and not self._summary_records():
+                self.runtime.levels.close(wait=True)
+                if self._summary_records():
+                    return []
                 inventory = self._inventory()
                 owned = tuple(
                     inventory[r["run_id"]][0]
@@ -1078,9 +1112,11 @@ class SandboxDispatcher:
                     ),
                 }
                 profile = binding["profile"] if binding else role["execution_profile"]
-                if session and session["provider"] != profile:
+                if session and session["execution_profile"] != profile:
                     raise FirmError("retained conversation cannot silently change providers")
-                adapter = self._provider({"provider": profile, "session_id": invocation.session_id})
+                adapter = self._provider(
+                    {"execution_profile": profile, "session_id": invocation.session_id}
+                )
                 provider_name = adapter.name
                 service = incompatible_service(provider_name, config)
                 if service is not None:
@@ -1178,23 +1214,20 @@ class SandboxDispatcher:
                     continue
                 db.execute(
                     "UPDATE activations SET context_json=? WHERE activation_id=?",
-                    (json.dumps(invocation.context), invocation.activation_id),
+                    (encoded(invocation.context), invocation.activation_id),
                 )
                 self.runtime.mark_launch_attempted(invocation.activation_id)
                 db.execute(
-                    "INSERT INTO sandbox_runs(activation_id,role_id,run_id,provider,deadline) "
-                    "VALUES(?,?,?,?,?)",
+                    "INSERT INTO sandbox_runs(activation_id,role_id,run_id,execution_profile,"
+                    "deadline,idle_timeout) VALUES(?,?,?,?,?,?)",
                     (
                         invocation.activation_id,
                         role_id,
                         run_id,
                         profile,
                         self.runtime.store.clock() + self.execution_timeout,
+                        self.execution_timeout,
                     ),
-                )
-                db.execute(
-                    "INSERT INTO execution_activity(activation_id,idle_timeout) VALUES(?,?)",
-                    (invocation.activation_id, self.execution_timeout),
                 )
             self._launches[invocation.activation_id] = self._pool.submit(self.sandbox.start, spec)
             launched.append(invocation)
@@ -1222,6 +1255,7 @@ class SandboxDispatcher:
 
     def __exit__(self, exc_type, exc, traceback):
         try:
+            self.runtime.levels.close()
             if self._task_runner:
                 self._task_runner.close()
                 if self.runtime.task_service.runner is self._task_runner:
@@ -1230,6 +1264,7 @@ class SandboxDispatcher:
             self.runtime.summary_service.close()
             if self._summary_runner:
                 self._summary_runner.close()
+            self.runtime.levels.close(wait=True)
             if self._pool is not None:
                 self._pool.shutdown(wait=True)
                 self._pool = None

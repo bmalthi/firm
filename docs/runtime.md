@@ -908,8 +908,8 @@ after it ends, while the firm is running (or at the role's next launch, if it is
 first). The dispatcher attempts one idle role per tick, shared with retirement and
 expired temporary appointments. Containers (running ones are stopped first), dangling
 images, ordinary build cache and scratch are removed; tagged images and volumes stay.
-Returned receipts, including partial cleanup, are logged and counted as done for this
-host process; exceptions retry after fifteen minutes without preventing the next-launch
+Returned receipts, including partial cleanup, are logged and record `cleaned_up_at` in SQLite
+so cleanup does not repeat across host restarts; exceptions retry after fifteen minutes without preventing the next-launch
 fallback. That fallback records `cleanup` in `record.json`. Failed or interrupted
 periods do not apply their handoff. Leave cleanup unset when the next period still needs
 its state. Design: [Handoff and the next work

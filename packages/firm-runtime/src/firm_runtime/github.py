@@ -947,9 +947,11 @@ class GitHubAccess:
         """Lift ``scope``'s revocation, give a named address write, answer who that helps.
 
         Any repository of the organization the App can reach; ``scope`` is an address and its
-        subtree, or ``''`` for every role, which lifts every revocation. A wider revocation
-        covering a named address is refused, never lifted for everyone it covers. With
-        ``request_id``, that request must still be open.
+        subtree, or ``''`` for every role, which lifts every revocation. When ``scope`` is
+        non-empty, the database grant itself applies strictly to the named role address
+        (unlike configured ``[[github.grants]]`` entries, which cover descendants). A wider
+        revocation covering a named address is refused, never lifted for everyone it covers.
+        With ``request_id``, that request must still be open.
         """
         repository, github, app = self._in_organization(repo)
         try:

@@ -1093,7 +1093,17 @@ def build_console_app(
                     ids,
                 )
             }
-            guidance_views = {eid: guidance.view(db, row, config) for eid, row in rows.items()}
+            guidance_rows = {
+                row["employee_id"]: dict(row)
+                for row in db.execute(
+                    f"SELECT * FROM role_guidance WHERE employee_id IN ({placeholders})",
+                    ids,
+                )
+            }
+            guidance_views = {
+                eid: guidance.view(db, row, config, guidance_rows.get(eid))
+                for eid, row in rows.items()
+            }
             mandate_revisions = {
                 row["employee_id"]: row["revision"]
                 for row in db.execute(
@@ -1278,7 +1288,6 @@ def build_console_app(
                 "WHERE employee_id=? AND disposition='pending'",
                 (employee_id,),
             ).fetchone()[0]
-        with runtime.store.read() as db:
             config = runtime.accounts.config(db)
             record = runtime.levels.record(db, employee_id)
             guidance_view = guidance.view(db, role, config)

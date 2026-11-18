@@ -1209,6 +1209,10 @@ def test_removed_retained_account_pins_role_and_notifies_manager_until_repaired(
 
     runtime.owner.configure(OWNER, configuration())
     runtime.accounts.clear(OWNER, incident["incident_id"])
+    with runtime.store.read() as db:
+        assert not db.execute(
+            "SELECT 1 FROM role_dependencies WHERE employee_id='founder'"
+        ).fetchone()
     resumed = start(runtime)
     assert resumed.session_id == first.session_id
     assert binding(runtime, resumed)["account_id"] == "a"
@@ -1269,3 +1273,22 @@ def test_guidance_change_keeps_native_session_binding_and_execution_profile(syst
     assert binding(runtime, next_run) == original
     with runtime.store.read() as db:
         assert runtime.store.role(db, "founder")["execution_profile"] == profile
+
+
+def test_role_dependency_is_deleted_on_expiry_and_supersession(system):
+    runtime, now = system
+    first = start(runtime)
+    with runtime.store.transaction() as db:
+        timed = runtime.accounts.hold(db, "account", "a", "quota", until=now[0] + 50)
+        runtime.accounts._pin_role(db, role(runtime), timed)
+    now[0] = 1060
+    with runtime.store.transaction() as db:
+        assert runtime.accounts._incident(db, "account", "a") is None
+        assert not db.execute("SELECT 1 FROM role_dependencies").fetchone()
+        held = runtime.accounts.hold(db, "account", "a", "quota", until=now[0] + 50)
+        runtime.accounts._pin_role(db, role(runtime), held)
+        runtime.accounts.hold(db, "account", "a", "auth")
+        assert not db.execute(
+            "SELECT 1 FROM role_dependencies WHERE incident_id=?", (held,)
+        ).fetchone()
+    assert first.employee_id == "founder"

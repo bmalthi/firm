@@ -225,10 +225,16 @@ class OwnerControls:
                 if role["employment"] == "retired":
                     raise FirmError("retired roles cannot be given guidance")
                 db.execute(
-                    "UPDATE roles SET guidance_state='owner',scope_guidance=?,"
-                    "functional_guidance=?,guidance_retry_at=NULL,guidance_reason=NULL "
-                    "WHERE employee_id=?",
+                    "UPDATE roles SET scope_guidance=?,functional_guidance=? WHERE employee_id=?",
                     (selection["scope"], encoded(selection["functions"]), employee_id),
+                )
+                db.execute(
+                    "INSERT INTO role_guidance("
+                    "employee_id,state,revision,attempts,retry_at,reason) "
+                    "VALUES(?,'owner',NULL,0,NULL,NULL) "
+                    "ON CONFLICT(employee_id) DO UPDATE SET "
+                    "state='owner',retry_at=NULL,reason=NULL",
+                    (employee_id,),
                 )
                 analysis_history.record(db, self.store.clock(), "guidance.owner_set",
                                         employee_id, **selection)
@@ -253,11 +259,7 @@ class OwnerControls:
                     "WHERE employee_id=?", (employee_id,),
                 )
                 if config.get("staffing") is False:
-                    db.execute(
-                        "UPDATE roles SET guidance_state=NULL,guidance_revision=NULL,"
-                        "guidance_attempts=0,guidance_retry_at=NULL,guidance_reason=NULL "
-                        "WHERE employee_id=?", (employee_id,),
-                    )
+                    db.execute("DELETE FROM role_guidance WHERE employee_id=?", (employee_id,))
                 else:
                     guidance.register(db, employee_id, revision)
                 analysis_history.record(db, self.store.clock(), "guidance.automatic",

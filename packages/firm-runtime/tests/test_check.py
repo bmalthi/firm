@@ -561,3 +561,29 @@ def test_check_port_failures_preserve_the_cause_and_appropriate_action(
         assert "--mcp-port" not in result["action"]
     if operation != "socket":
         listener.close.assert_called_once_with()
+
+
+def test_database_initialization_state_rejects_missing_view_and_corrupt_sidecar(tmp_path):
+    from firm_runtime.setup_check import database_initialization_state
+
+    database_path = tmp_path / "durable" / "firm.sqlite3"
+    runtime = Runtime(Store(database_path))
+    runtime.lifecycle.initialize(
+        "demo",
+        "Build a useful firm.",
+        validate_config(
+            tomllib.loads(
+                'max_active = 1\nstaffing = false\nfounder_profile = "controlled"\n'
+                "[profiles.controlled]\n"
+            )
+        ),
+    )
+    assert database_initialization_state(database_path) == "initialized"
+    sequence = database_path.with_name(database_path.name + ".employee-sequence")
+    sequence.write_text("broken")
+    assert database_initialization_state(database_path) == "invalid"
+    sequence.write_text("1\n")
+    assert database_initialization_state(database_path) == "initialized"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP VIEW scheduling_opportunities")
+    assert database_initialization_state(database_path) == "invalid"

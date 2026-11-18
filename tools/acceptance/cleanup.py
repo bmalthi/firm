@@ -158,7 +158,7 @@ def main():
                         )}
                         rows = [dict(row) for row in db.execute(
                             "SELECT a.activation_id,a.employee_id,a.state,"
-                            "a.failure_category,r.address "
+                            "a.failure_category,a.cleaned_up_at,r.address "
                             "FROM activations AS a JOIN roles AS r USING(employee_id)"
                         )]
                     record.update(roles=roles, activations=rows)
@@ -174,13 +174,15 @@ def main():
                         )
                     pending = [f"{name} completion/cleanup" for name in ("founder", "temp")
                                if name not in completed
-                               or completed[name]["activation_id"] not in dispatcher._cleaned]
+                               or completed[name]["cleaned_up_at"] is None]
                     if ("fireme" not in roles or sandbox_role_id(roles["fireme"]["employee_id"])
                             not in box.file_server.retired_roles()):
                         pending.append("fireme guest/file-server retirement")
                     if not pending:
                         assert len(rows) == 3 and len(completed) == 3, rows
-                        record["cleaned"] = sorted(dispatcher._cleaned)
+                        record["cleaned"] = sorted(
+                            row["activation_id"] for row in rows if row["cleaned_up_at"] is not None
+                        )
                         break
                     time.sleep(0.2)
                 else:

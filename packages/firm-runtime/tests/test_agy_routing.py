@@ -56,7 +56,7 @@ def test_defaults_and_factory_keep_model_effort_separate(tmp_path, monkeypatch):
         provider_adapter(config["profiles"]["main"], config["accounts"]["subscription"]),
         AgyProvider,
     )
-    assert context_policy(config["profiles"]["main"])[0] is None
+    assert context_policy(config["profiles"]["main"])[0] == 500_000
 
 
 @pytest.mark.parametrize("target", ["account", "profile"])

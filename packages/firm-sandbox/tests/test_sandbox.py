@@ -812,6 +812,22 @@ def test_network_status_reports_the_firm_and_each_vm(box):
     assert status["egress"]["live"] is False
     assert status["egress"]["entries"] == [{**entry, "vm": "linux"}]
 
+    # A running filter reports its boot-time network.json policy even after sandbox.toml changes.
+    scratch = box.linux.root / "scratch"
+    scratch.mkdir(parents=True)
+    (scratch / "network.json").write_text(
+        json.dumps({"mode": "enforce", "allow_hosts": ["boot.example"]})
+    )
+    live_status = box.network_status()
+    assert live_status["mode"] == "enforce"
+    assert any(
+        row["host"] == "boot.example" and row["source"] == "config"
+        for row in live_status["allowed_hosts"]
+    )
+    (scratch / "network.json").write_text("{corrupt")
+    with pytest.raises(RuntimeError, match="unreadable"):
+        box.network_status()
+
 
 def test_configured_hosts_are_reported_once_by_their_first_source(tmp_path, monkeypatch):
     monkeypatch.setattr(sandbox, "LinuxVM", FakeLinux)

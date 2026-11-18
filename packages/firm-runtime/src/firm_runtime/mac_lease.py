@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS mac_leases (
     lease_id TEXT PRIMARY KEY,
     station INTEGER NOT NULL,
     activation_id TEXT NOT NULL REFERENCES activations(activation_id),
-    employee_id TEXT NOT NULL,
+    employee_id TEXT NOT NULL REFERENCES roles(employee_id),
     acquired_at REAL NOT NULL,
     released_at REAL,
     outcome TEXT CHECK(outcome IN ('released','release_failed','recovered')),
@@ -45,11 +45,11 @@ CREATE TABLE IF NOT EXISTS mac_leases (
 );
 CREATE TABLE IF NOT EXISTS mac_lease_events (
     at REAL NOT NULL,
-    employee_id TEXT NOT NULL,
-    activation_id TEXT NOT NULL,
+    employee_id TEXT NOT NULL REFERENCES roles(employee_id),
+    activation_id TEXT NOT NULL REFERENCES activations(activation_id),
     event TEXT NOT NULL
         CHECK(event IN ('granted','busy','released','release_failed','recovered')),
-    lease_id TEXT,
+    lease_id TEXT REFERENCES mac_leases(lease_id),
     -- A 'busy' event is about every station at once, so it names no lease or station.
     station INTEGER
 );
@@ -57,10 +57,10 @@ CREATE TABLE IF NOT EXISTS mac_lease_events (
 -- and captured images stay out of the database.
 CREATE TABLE IF NOT EXISTS mac_operations (
     at REAL NOT NULL,
-    lease_id TEXT NOT NULL,
+    lease_id TEXT NOT NULL REFERENCES mac_leases(lease_id),
     station INTEGER NOT NULL,
-    employee_id TEXT NOT NULL,
-    activation_id TEXT NOT NULL,
+    employee_id TEXT NOT NULL REFERENCES roles(employee_id),
+    activation_id TEXT NOT NULL REFERENCES activations(activation_id),
     op TEXT NOT NULL,
     duration_ms REAL NOT NULL,
     outcome TEXT NOT NULL  -- 'ok', or the reason the request was refused

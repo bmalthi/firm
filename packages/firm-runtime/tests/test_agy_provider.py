@@ -511,12 +511,98 @@ def test_native_identity_and_all_cumulative_counters_are_preserved():
     events[0]["init"]["model"] = "gemini-4-argon-high"
     usage = parse_usage(encode(events))
     assert usage.resolved_model == "gemini-4-argon-high"
-    assert usage.session_input_tokens == 6680
+    assert usage.session_input_tokens == 6710
     assert usage.session_output_tokens == 147
     assert usage.session_reasoning_output_tokens == 122
     assert usage.session_cached_input_tokens == 30
     assert usage.input_tokens is None and usage.output_tokens is None
     assert parse_usage(encode(events[:1])).resolved_model == "gemini-4-argon-high"
+
+
+def test_agent_response_step_updates_populate_live_context_and_activation_totals():
+    events = stream(
+        usage={
+            "input_tokens": 1000,
+            "cache_read_tokens": 20000,
+            "output_tokens": 300,
+            "thinking_tokens": 120,
+        }
+    )
+    events[1:1] = [
+        {
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": "synthetic-id",
+                "step_index": 1,
+                "step_type": "agent_response",
+                "state": "DONE",
+                "usage": {
+                    "input_tokens": 400,
+                    "cache_read_tokens": 5000,
+                    "output_tokens": 150,
+                    "thinking_tokens": 60,
+                },
+            },
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": "synthetic-id",
+                "step_index": 1,
+                "step_type": "agent_response",
+                "state": "DONE",
+                "usage": {
+                    "input_tokens": 400,
+                    "cache_read_tokens": 5000,
+                    "output_tokens": 150,
+                    "thinking_tokens": 60,
+                },
+            },
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": "synthetic-id",
+                "step_index": 2,
+                "step_type": "tool",
+                "state": "DONE",
+                "tool_name": "read_file",
+                "usage": {"input_tokens": 999, "output_tokens": 99},
+            },
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": "synthetic-id",
+                "step_index": 3,
+                "step_type": "agent_response",
+                "state": "DONE",
+                "usage": {
+                    "input_tokens": 600,
+                    "cache_read_tokens": 15000,
+                    "output_tokens": 150,
+                    "thinking_tokens": 60,
+                },
+            },
+        },
+    ]
+    # Live mid-turn polling (before terminal result) still populates context & totals.
+    mid = parse_usage(encode(events[:-1]))
+    assert mid.current_context_tokens == 15750
+    assert mid.high_water_context_tokens == 15750
+    assert mid.input_tokens == 21000
+    assert mid.cached_input_tokens == 20000
+    assert mid.output_tokens == 300
+    assert mid.reasoning_output_tokens == 120
+
+    done = parse_usage(encode(events))
+    assert done.current_context_tokens == 15750
+    assert done.high_water_context_tokens == 15750
+    assert done.session_input_tokens == 21000
+    assert done.session_cached_input_tokens == 20000
+    assert done.session_output_tokens == 300
+    assert done.session_reasoning_output_tokens == 120
+    assert native_model_id("gemini-4-carbon", "high") == "gemini-4-carbon-high"
 
 
 @pytest.mark.parametrize("firm", [False, True])

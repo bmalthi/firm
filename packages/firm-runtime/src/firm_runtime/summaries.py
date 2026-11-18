@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS summary_runs (
     account_id TEXT,
     profile TEXT,
     provider TEXT,
+    model TEXT,
     deadline REAL,
     input_tokens INTEGER,
     cached_input_tokens INTEGER,
@@ -622,7 +623,8 @@ class SummaryService:
                 return None
             db.execute(
                 "INSERT INTO summary_runs(run_id,started_at,state,input_bytes,account_id,profile,"
-                "provider,deadline,token_hash,kind,stateless_slot) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "provider,model,deadline,token_hash,kind,stateless_slot) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     run_id,
                     now,
@@ -631,6 +633,7 @@ class SummaryService:
                     reservation.get("account_id"),
                     reservation.get("profile"),
                     reservation.get("provider"),
+                    reservation.get("model"),
                     now + timeout,
                     hashlib.sha256(start_token.encode()).hexdigest(),
                     kind,
