@@ -29,7 +29,7 @@ Every provider receives the same assembled standing text. Codex receives it via 
 
 1. **Layer 1 — Standing Instructions (Byte-Stable System Prompt):**
    * Role identity, manager, verbatim own mandate, accessible workspace/drive paths (`workplace.json`), and only the optional capabilities (`[github]`, `[google_cloud]`, `[mac]`) actually enabled for this firm.
-   * First, two common resources in fixed order: `standing-physics.md` (mail, working memory and handoff, tools, Linux environment summary with `~/scratch` vs durable `<drive>`, outside services and access) and `standing-good-worker.md` (outcomes, follow-through, investigation and escalation, communication, evidence, usable results, shared time and resources).
+   * First, two common resources in fixed order: `standing-physics.md` (workspace records, mail, working memory, task switches and handoff, tools, Linux environment summary with `~/scratch` vs durable `<drive>`, outside services and access) and `standing-good-worker.md` (outcomes, follow-through, investigation and escalation, communication, deliverable hygiene, evidence and rendered visual inspection, usable results, shared time and resources).
    * Then `guidance-introduction.md` and selected bodies from `guidance/`, scope first and functions in catalog order; omit the introduction when no guides apply. `standing-limits.md` comes last for every role. Physics describes the environment; good-worker and role guides describe craft and yield to the mandate. Limits hold firm-wide rules that no mandate, profile, mail, guide or tool result changes.
    * Contains no timestamps, inbox counts, or token counters so provider prompt caches stay warm. The common resources are fixed for a running host; the assembled text changes only when the role's identity, mandate, paths, capabilities or effective guidance change. Prompt resource edits load only after restarting the host.
 2. **Layer 2 — Transition Context (`stdin`):**
@@ -54,14 +54,14 @@ Prompt resource files live in `packages/firm-runtime/src/firm_runtime/prompts/`:
 | Resource File | Purpose |
 | :--- | :--- |
 | `workplace.json` | Role identity, mandate, workspace paths, and conditionally rendered capability blocks (GitHub, Gemini, Mac). |
-| `standing-physics.md` | Common workplace physics: mail, working memory and handoff, tools, Linux environment, outside services and access. |
+| `standing-physics.md` | Common workplace physics: workspace records, mail, working memory, task switches and handoff, tools, Linux environment, outside services and access. |
 | `standing-good-worker.md` | Common good-worker guidance: how to do useful work with others. |
 | `guidance/catalog.json`, `guidance/*.md`, `guidance-introduction.md` | Validated scope and function guides, composed only when selected. |
 | `standing-limits.md` | Firm-wide authority, spending, credential, secret and publication limits; always last. |
 | `founder_birth.md`, `birth.md`, `wake.json` | First-day onboarding for the Founder vs. hired employees, plus wake/resume wrappers. |
 | `context-handoff.md`, `controls.json` | Handoff checklist and Operations control banners (soft drain, context pressure). |
 | `mac-acquired.md` | Detailed macOS/Xcode/Device Hub workflow notes delivered when `mac_acquire` succeeds. |
-| `tools.json`, `results.json`, `references.json` | MCP tool schemas, return-state explanations, and actionable error messages. |
+| `tools.json`, `results.json`, `references.json` | MCP tool schemas (gated at launch by configured `[mac]` and `[github]` capabilities), return-state explanations, and actionable error messages. |
 | `notices.json` | Templates for attributed Operations messages (bounces, request grants/denials, mandate updates). |
 | `runtime_summary.md`, `runtime_level-choice.md`, `runtime_task.md` | Isolated infrastructure prompts for thread summarization (`read` with `summarize`, `introduce` with `summarize`), level and guidance selection (`[staffing]`), and bounded `task` workers. Never shown to employees. |
 | `tracking.md` | Maintainer reference mapping how standing and activation prompt layers are ordered across the four activation occasions (not injected at runtime). |
@@ -76,9 +76,9 @@ no chooser runs and only the org-chart scope applies unless the owner sets an ov
 
 Scope guidance follows responsibility, while function guidance follows the work in
 the mandate; neither changes permissions or the model route. The catalog contains
-four scopes and sixteen functions, including copywriting. Founder and team-leader
-scopes come from the org chart rather than a model judgment. The chooser sees the
-remaining scopes and functions, so it cannot override those reporting facts.
+four scopes and eighteen functions, including research, media production and copywriting. Founder and
+team-leader scopes come from the org chart rather than a model judgment. The chooser
+sees the remaining scopes and functions, so it cannot override those reporting facts.
 
 If no isolated runner is available, pending selections default without a chooser
 call or owner notice; the reason is recorded in guidance state and history. This

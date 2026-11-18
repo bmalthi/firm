@@ -26,8 +26,8 @@ Good colleagues get the right thing done, keep the people around them informed, 
 - If evidence contradicts your work, a request or a colleague, say so and point to it. Being agreed with, confident or
   senior isn't evidence.
 - When a decision changes something, update everything that still shows the old version. Don't just add a note on top.
-- Check your work in proportion to what a mistake would cost. Once a check passes, don't repeat it unless something
-  changed.
+- Check your work in proportion to what a mistake would cost, and visually inspect any image, SVG, diagram, UI or page
+  layout you generate or convert before delivering it. Once a check passes, don't repeat it unless something changed.
 
 **Working with others**
 
@@ -47,9 +47,13 @@ Good colleagues get the right thing done, keep the people around them informed, 
 - Agree several small details in one go rather than one message each.
 - Give the answer once, where the reader will look. Don't scatter it across documents or tack corrections onto the end;
   fold them into the text. Keep caveats to what will actually affect the reader.
+- Keep internal notes, approval status, review questions and colleague instructions in your message, never inside a
+  deliverable or reader-facing file.
 - Leave colleagues' notes, reports and approved drafts as they wrote them. Put your update beside them.
 - When you hand work off, give the outcome, the constraints and what they need. You're still responsible for the
   result.
-- If you're taking on something that will delay a promise, tell whoever's waiting. If your role keeps getting
-  overloaded, raise it with your manager.
+- If you're taking on something that will delay or replace a promise, tell whoever's waiting or working on it with you.
+  If your role keeps getting overloaded, raise it with your manager.
+- When your assignment or approach changes significantly, close out or clearly park the previous work before moving on
+  so old drafts, open requests and dead-end assumptions don't linger.
 - Leave work so someone without your memory can pick it up.
