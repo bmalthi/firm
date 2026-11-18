@@ -430,6 +430,19 @@ class Sandbox:
         """Where the shared trees live and how the owner mounts them."""
         return {"storage": "linux-vm", **self.file_server.owner_access()}
 
+    def _active_network_policy(self, live: bool) -> tuple[str, tuple[str, ...]]:
+        """Return the running filter's boot-time policy when available; fail closed if corrupt."""
+        path = self.linux.root / "scratch" / "network.json"
+        if not live or not path.exists():
+            return self.config.egress_mode, self.config.allow_hosts
+        try:
+            record = read_record(path)
+            if not isinstance(record, dict) or record.get("mode") not in {"enforce", "observe"}:
+                raise ValueError("invalid network configuration record")
+            return record["mode"], host_entries(record.get("allow_hosts", ()))
+        except (OSError, ValueError, TypeError) as exc:
+            raise RuntimeError("Live VM network policy record is unreadable") from exc
+
     def network_status(self):
         """The firm's egress: ``enabled``, the owner's cutoff (true only while every VM is
         on); ``mode``, enforce or observe; ``allowed_hosts``, the effective allowlist with
@@ -455,10 +468,12 @@ class Sandbox:
                 "egress": observe(vm.network.egress_summary),
                 "traffic": traffic,
             }
+        live = bool(vms.get("linux", {}).get("traffic", {}).get("live"))
+        mode, allow_hosts = self._active_network_policy(live)
         return {
             "enabled": all(row["enabled"] for row in vms.values()),
-            "mode": self.config.egress_mode,
-            "allowed_hosts": self.allowed_hosts(),
+            "mode": mode,
+            "allowed_hosts": self.allowed_hosts(allow_hosts=allow_hosts),
             "egress": {
                 "live": all(row["egress"]["live"] for row in vms.values()),
                 "entries": [
@@ -474,13 +489,21 @@ class Sandbox:
         """The owner's run-time grants, as the Linux VM's ``hosts.json`` holds them."""
         return list(read_hosts(hosts_file(self.linux.root)))
 
-    def allowed_hosts(self):
+    def allowed_hosts(self, *, allow_hosts: tuple[str, ...] | None = None):
         """The effective allowlist, each entry once with the first source that holds it:
         ``baseline`` (shipped), ``config`` (``[network] allow_hosts``) or ``granted``."""
+        if allow_hosts is None:
+            live = False
+            if hasattr(self.linux.network, "traffic"):
+                try:
+                    live = bool(self.linux.network.traffic().get("live"))
+                except RuntimeError:
+                    live = False
+            _, allow_hosts = self._active_network_policy(live)
         rows, seen = [], set()
         for source, entries in (
             ("baseline", BASELINE_HOSTS),
-            ("config", self.config.allow_hosts),
+            ("config", allow_hosts),
             ("granted", self.granted_hosts()),
         ):
             for host in entries:

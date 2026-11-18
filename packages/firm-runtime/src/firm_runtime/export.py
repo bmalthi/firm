@@ -147,6 +147,16 @@ def _copy_host_records(config: Config, staging: Path) -> None:
         target.close()
         source.close()
     (staging / DATABASE).chmod(0o600)
+    sequence = durable / f"{DATABASE}.employee-sequence"
+    if not sequence.is_symlink() and sequence.is_file():
+        shutil.copy2(sequence, staging / sequence.name)
+    for vm_name in ("linux", "mac"):
+        egress_summary = durable / vm_name / "scratch" / "egress-summary.json"
+        if not egress_summary.is_symlink() and egress_summary.is_file():
+            (staging / vm_name / "scratch").mkdir(parents=True, exist_ok=True)
+            shutil.copy2(
+                egress_summary, staging / vm_name / "scratch" / "egress-summary.json"
+            )
     with locked(config.locks, "events", shared=True):
         if (durable / "events.jsonl").is_file():
             shutil.copy2(durable / "events.jsonl", staging / "events.jsonl")

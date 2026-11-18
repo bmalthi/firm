@@ -466,3 +466,54 @@ def test_credential_endpoint_is_bound_revocable_and_access_only(
             == 401
         )
         assert runtime.accounts.status()["incidents"] == []
+
+
+def test_sync_mcp_tool_does_not_block_concurrent_http_routes(tmp_path, monkeypatch):
+    import hashlib
+    import time
+
+    runtime, founder, founder_run, _analyst, _analyst_run = _runtime(tmp_path)
+    sent = runtime.owner.send_mail(
+        OWNER, [founder], "body", subject="Sync tool deadlock check", request_id="sync-deadlock"
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    original_read = runtime.messaging.read
+
+    def blocking_read(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=5)
+        return original_read(*args[:2], False, *args[3:], **kwargs)
+
+    monkeypatch.setattr(runtime.messaging, "read", blocking_read)
+    summary_token = "summary-concurrent-token"
+    with runtime.store.transaction() as db:
+        db.execute(
+            "INSERT INTO summary_runs(run_id,started_at,state,input_bytes,account_id,"
+            "provider,deadline,token_hash) VALUES('s-concurrent',?,'running',1,'a','agy',?,?)",
+            (time.time(), time.time() + 60, hashlib.sha256(summary_token.encode()).hexdigest()),
+        )
+    app = build_http_app(runtime, **ALLOWED)
+
+    async def check():
+        async with app.router.lifespan_context(app):
+            async with _session(app, founder_run.token) as session:
+                read_task = asyncio.create_task(
+                    session.call_tool("read", {"message_id": sent["message_id"], "summarize": True})
+                )
+                while not entered.is_set():
+                    await asyncio.sleep(0.01)
+                transport = httpx.ASGITransport(app=app)
+                headers = {"Authorization": f"Bearer {summary_token}", "Origin": BASE_URL}
+                async with httpx.AsyncClient(
+                    transport=transport, base_url=BASE_URL, headers=headers
+                ) as client:
+                    response = await asyncio.wait_for(
+                        client.post("/summary/start"), timeout=2
+                    )
+                assert response.status_code == 200
+                release.set()
+                tool_result = await asyncio.wait_for(read_task, timeout=2)
+                assert not tool_result.isError
+
+    asyncio.run(check())

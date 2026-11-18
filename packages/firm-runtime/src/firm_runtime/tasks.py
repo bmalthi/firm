@@ -134,8 +134,8 @@ class TaskService:
         )
         db.execute(
             "INSERT INTO summary_runs(run_id,started_at,state,input_bytes,account_id,profile,"
-            "provider,deadline,kind,caller_activation_id,token_hash) "
-            "VALUES(?,?,'running',?,?,?,?,?,'task',?,?)",
+            "provider,model,deadline,kind,caller_activation_id,token_hash) "
+            "VALUES(?,?,'running',?,?,?,?,?,?,'task',?,?)",
             (
                 launch.run_id,
                 now,
@@ -143,6 +143,7 @@ class TaskService:
                 account_id,
                 binding["profile"],
                 provider,
+                launch.model,
                 launch.deadline,
                 actor["activation_id"],
                 hashlib.sha256(launch.start_token.encode()).hexdigest(),

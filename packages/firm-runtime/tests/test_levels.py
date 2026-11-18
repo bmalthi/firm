@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import copy
 import json
+import threading
 
 import pytest
 
-from firm_runtime import levels
+from firm_runtime import guidance, levels
 from firm_runtime.errors import FirmError
 from firm_runtime.runtime import Runtime
 from firm_runtime.simulation import ControlledExecutor, SimulationDispatcher
@@ -45,6 +46,11 @@ def role(runtime, employee_id):
 def record(runtime, employee_id):
     with runtime.store.read() as db:
         return runtime.levels.record(db, employee_id)
+
+
+def guide_record(runtime, employee_id="founder"):
+    with runtime.store.read() as db:
+        return guidance.record(db, employee_id)
 
 
 def events(runtime, kind):
@@ -551,9 +557,9 @@ def test_oversized_hire_defaults_once_without_reserving_or_rewriting_mandate(
     )
     assert "UTF-8 bytes" in decision["reason"] and "262144 bytes" in decision["reason"]
     assert (decision["model_class"], decision["effort"]) == levels.FALLBACK_LEVEL
-    guide = role(runtime, employee_id)
-    assert (guide["guidance_state"], guide["guidance_attempts"]) == ("defaulted", 1)
-    assert guide["guidance_reason"] == decision["reason"]
+    guide = guide_record(runtime, employee_id)
+    assert (guide["state"], guide["attempts"]) == ("defaulted", 1)
+    assert guide["reason"] == decision["reason"]
     now[0] += 1000
     assert runtime.levels.tick(background=False) == []
     assert record(runtime, employee_id) == decision
@@ -766,12 +772,12 @@ def guide_hire(runtime, **kwargs):
 
 def test_founder_and_explicit_temporary_hires_request_guidance_at_revision_zero(system):
     runtime, _ = system
-    assert role(runtime, "founder")["guidance_state"] == "pending"
+    assert guide_record(runtime, "founder")["state"] == "pending"
     seen = []
     runtime.levels.chooser = lambda p: seen.append(json.loads(p)) or guidance_reply()
     employee = runtime.lifecycle.hire("founder", "worker", "Do the work.", "sonnet",
                                       request_id="h", temporary_periods=2)["employee_id"]
-    assert role(runtime, employee)["guidance_revision"] == 0
+    assert guide_record(runtime, employee)["revision"] == 0
     assert record(runtime, employee) is None
     runtime.start()
     runtime.levels.tick(background=False)
@@ -781,15 +787,15 @@ def test_founder_and_explicit_temporary_hires_request_guidance_at_revision_zero(
     assert founder["existing_reports_of_hiring_manager"] == []
     assert founder["existing_reports_total"] == 0
     assert all("levels_available" not in p for p in seen)
-    assert role(runtime, employee)["guidance_state"] == "chosen"
+    assert guide_record(runtime, employee)["state"] == "chosen"
     runtime.lifecycle.hire("founder", "worker", "Do the work.", "sonnet", request_id="h",
                            temporary_periods=2)
-    assert role(runtime, employee)["guidance_state"] == "chosen"
+    assert guide_record(runtime, employee)["state"] == "chosen"
     runtime.lifecycle.revise_mandate("founder", employee, 0, "Different work.", request_id="rev")
     runtime.levels.tick(background=False)
-    current = role(runtime, employee)
+    current = (role(runtime, employee), guide_record(runtime, employee))
     runtime.lifecycle.revise_mandate("founder", employee, 0, "Different work.", request_id="rev")
-    assert role(runtime, employee) == current
+    assert (role(runtime, employee), guide_record(runtime, employee)) == current
 
 
 def test_chooser_input_has_only_descriptions_of_chooser_entries(system):
@@ -846,7 +852,7 @@ def test_guidance_dedup_catalog_order_and_bounded_choice_reasons(system):
     bounded = levels._clip(reason, levels.MAX_CHOICE_REASON_CHARS)
     assert len(bounded) == levels.MAX_CHOICE_REASON_CHARS
     assert bounded.endswith(levels.TRUNCATION_MARKER)
-    assert role(runtime, employee)["guidance_reason"] == bounded
+    assert guide_record(runtime, employee)["reason"] == bounded
     assert record(runtime, employee)["reason"] == bounded
     for kind in ("level.chosen", "guidance.chosen"):
         (event,) = events(runtime, kind)
@@ -866,7 +872,7 @@ def test_decisions_validate_and_retry_independently_in_one_call(system, invalid)
     assert len(seen) == 1
     assert "levels_available" in seen[0] and "guidance_catalog" in seen[0]
     assert record(runtime, employee)["state"] == ("pending" if invalid == "level" else "chosen")
-    assert role(runtime, employee)["guidance_state"] == (
+    assert guide_record(runtime, employee)["state"] == (
         "chosen" if invalid == "level" else "pending"
     )
     now[0] += 60
@@ -879,7 +885,7 @@ def test_decisions_validate_and_retry_independently_in_one_call(system, invalid)
     runtime.levels.tick(background=False)
     assert ("levels_available" in seen[1]) == (invalid == "level")
     assert ("guidance_catalog" in seen[1]) == (invalid == "guidance")
-    assert role(runtime, employee)["guidance_state"] == "chosen"
+    assert guide_record(runtime, employee)["state"] == "chosen"
     assert record(runtime, employee)["state"] == "chosen"
 
 
@@ -891,7 +897,7 @@ def test_separate_due_times_and_owner_guidance_make_level_only_calls(system):
     runtime.start()
     with runtime.store.transaction() as db:
         db.execute(
-            "UPDATE roles SET guidance_retry_at=? WHERE employee_id=?", (now[0] + 30, employee)
+            "UPDATE role_guidance SET retry_at=? WHERE employee_id=?", (now[0] + 30, employee)
         )
     runtime.levels.tick(background=False)
     assert "guidance_catalog" not in seen[0]
@@ -960,8 +966,8 @@ def test_prompt_construction_failure_uses_both_retry_paths(system, monkeypatch):
     monkeypatch.setattr(levels, "build_prompt", broken)
     runtime.levels.tick(background=False)
     assert record(runtime, employee)["attempts"] == 1
-    assert role(runtime, employee)["guidance_attempts"] == 1
-    assert role(runtime, employee)["guidance_reason"] == "prompt construction failed"
+    assert guide_record(runtime, employee)["attempts"] == 1
+    assert guide_record(runtime, employee)["reason"] == "prompt construction failed"
 
 
 @pytest.mark.parametrize("action", ["revise", "fire", "owner", "set-clear"])
@@ -987,15 +993,16 @@ def test_inflight_guidance_success_and_failure_guards(system, action, failure):
     runtime.levels.chooser = chooser
     runtime.levels.tick(background=False)
     result = role(runtime, employee)
+    guide = guide_record(runtime, employee)
     if action == "revise":
         assert (
-            result["guidance_state"],
-            result["guidance_revision"],
-            result["guidance_attempts"],
+            guide["state"],
+            guide["revision"],
+            guide["attempts"],
         ) == ("pending", 1, 0)
         assert not events(runtime, "guidance.chosen") and not events(runtime, "guidance.defaulted")
     elif action == "fire":
-        assert result["guidance_state"] == "pending" and result["guidance_attempts"] == 0
+        assert guide["state"] == "pending" and guide["attempts"] == 0
         assert record(runtime, employee)["state"] == "pending"
         assert record(runtime, employee)["attempts"] == 0
         assert not events(runtime, "level.chosen") and not events(runtime, "level.defaulted")
@@ -1006,10 +1013,10 @@ def test_inflight_guidance_success_and_failure_guards(system, action, failure):
                 "OR body LIKE 'Role guidance not selected\n\n%'"
             ).fetchone()
     elif action == "owner":
-        assert result["guidance_state"] == "owner" and result["scope_guidance"] == "team-leader"
+        assert guide["state"] == "owner" and result["scope_guidance"] == "team-leader"
     else:
-        assert result["guidance_state"] == ("pending" if failure else "chosen")
-        assert result["guidance_attempts"] == 1
+        assert guide["state"] == ("pending" if failure else "chosen")
+        assert guide["attempts"] == 1
 
 
 def test_duplicate_completions_are_guarded_by_captured_attempt_count(system):
@@ -1023,12 +1030,12 @@ def test_duplicate_completions_are_guarded_by_captured_attempt_count(system):
     runtime.levels._apply(employee, "high", "high", "duplicate", request=level_request)
     runtime.levels._failed(employee, "duplicate", request=level_request)
     assert record(runtime, employee) == level_after
-    request = role(runtime, employee)
+    request = guide_record(runtime, employee)
     guidance.failed(runtime, employee, request, "first")
-    after = role(runtime, employee)
+    after = (role(runtime, employee), guide_record(runtime, employee))
     guidance.failed(runtime, employee, request, "duplicate")
     guidance.apply(runtime, employee, request, {"scope": None, "functions": ["legal"]}, "duplicate")
-    assert role(runtime, employee) == after
+    assert (role(runtime, employee), guide_record(runtime, employee)) == after
 
 
 @pytest.mark.parametrize("scope", ["firm-leader", "specialist-adviser"])
@@ -1039,9 +1046,9 @@ def test_automatic_clears_owner_selection_and_uses_current_revision(system, scop
     employee = guide_hire(runtime)
     runtime.owner.set_guidance(OWNER, employee, scope, ["legal"], "set")
     runtime.lifecycle.revise_mandate("founder", employee, 0, "New mandate", request_id="rev")
-    assert role(runtime, employee)["guidance_state"] == "owner"
+    assert guide_record(runtime, employee)["state"] == "owner"
     runtime.owner.automatic_guidance(OWNER, employee, "auto")
-    assert role(runtime, employee)["guidance_revision"] == 1
+    assert guide_record(runtime, employee)["revision"] == 1
     runtime.owner.route(OWNER, employee, "sonnet", "route")
     runtime.start()
 
@@ -1057,10 +1064,10 @@ def test_automatic_clears_owner_selection_and_uses_current_revision(system, scop
         if attempt < 3:
             runtime.levels.tick(background=False)
             now[0] += 60 * (attempt + 1)
-    assert role(runtime, employee)["guidance_state"] == "defaulted"
+    assert guide_record(runtime, employee)["state"] == "defaulted"
     runtime.owner.automatic_guidance(OWNER, employee, "again")
-    assert role(runtime, employee)["guidance_state"] == "pending"
-    assert role(runtime, employee)["guidance_attempts"] == 0
+    assert guide_record(runtime, employee)["state"] == "pending"
+    assert guide_record(runtime, employee)["attempts"] == 0
 
 
 @pytest.mark.parametrize("level_due", [False, True])
@@ -1069,7 +1076,7 @@ def test_guidance_fallback_keeps_ids_and_sends_one_notice_then_no_retries(system
 
     runtime, now = system
     employee = guide_hire(runtime)
-    guidance.apply(runtime, employee, role(runtime, employee),
+    guidance.apply(runtime, employee, guide_record(runtime, employee),
                    {"scope": "specialist-adviser", "functions": ["legal"]}, "chosen")
     with runtime.store.transaction() as db:
         guidance.request_reassessment(db, employee, 0)
@@ -1085,9 +1092,9 @@ def test_guidance_fallback_keeps_ids_and_sends_one_notice_then_no_retries(system
     runtime.start()
     for attempt in (1, 2, 3):
         runtime.levels.tick(background=False)
-        assert role(runtime, employee)["guidance_attempts"] == attempt
+        assert guide_record(runtime, employee)["attempts"] == attempt
         now[0] += 60 * attempt
-    assert role(runtime, employee)["guidance_state"] == "defaulted"
+    assert guide_record(runtime, employee)["state"] == "defaulted"
     assert role(runtime, employee)["scope_guidance"] == "specialist-adviser"
     with runtime.store.read() as db:
         (notice,) = db.execute("SELECT body FROM messages WHERE "
@@ -1112,8 +1119,8 @@ def test_pending_guidance_settles_without_notice_when_selection_is_unavailable(s
         runtime.levels.chooser = lambda _: pytest.fail("staffing off must not call")
     runtime.start()
     assert runtime.levels.tick(background=False) == []
-    assert role(runtime, employee)["guidance_state"] == "defaulted"
-    assert role(runtime, employee)["guidance_reason"] == reason
+    assert guide_record(runtime, employee)["state"] == "defaulted"
+    assert guide_record(runtime, employee)["reason"] == reason
     with runtime.store.read() as db:
         assert not db.execute("SELECT 1 FROM messages").fetchone()
 
@@ -1130,7 +1137,7 @@ def test_staffing_off_lifecycle_makes_no_guidance_requests_or_calls(tmp_path):
     runtime.start()
     assert runtime.levels.tick(background=False) == []
     for eid in ("founder", employee):
-        assert role(runtime, eid)["guidance_state"] is None
+        assert guide_record(runtime, eid) is None
         assert role(runtime, eid)["functional_guidance"] == "[]"
 
 
@@ -1142,11 +1149,11 @@ def test_due_status_is_rechecked_before_assessment_and_no_empty_call_is_made(sys
     with runtime.store.transaction() as db:
         db.execute("UPDATE hire_levels SET retry_at=? WHERE employee_id=?", (now[0] + 60, employee))
         db.execute(
-            "UPDATE roles SET guidance_retry_at=? WHERE employee_id=?", (now[0] + 60, employee)
+            "UPDATE role_guidance SET retry_at=? WHERE employee_id=?", (now[0] + 60, employee)
         )
     runtime.levels._assess(employee)
     assert record(runtime, employee)["attempts"] == 0
-    assert role(runtime, employee)["guidance_attempts"] == 0
+    assert guide_record(runtime, employee)["attempts"] == 0
 
 
 def test_long_default_reason_is_whole_in_storage_notice_and_inspection(system):
@@ -1164,7 +1171,7 @@ def test_long_default_reason_is_whole_in_storage_notice_and_inspection(system):
     for attempt in range(3):
         runtime.levels.tick(background=False)
         now[0] += 60 * (attempt + 1)
-    assert role(runtime, employee)["guidance_reason"] == reason
+    assert guide_record(runtime, employee)["reason"] == reason
     assert record(runtime, employee)["reason"] == reason
     with runtime.store.read() as db:
         assert (
@@ -1201,12 +1208,27 @@ def test_switching_staffing_off_still_settles_a_pending_hire_level(tmp_path):
     ]
     _set_staffing(runtime, False)
     runtime.start()
-    for _ in range(6):
-        runtime.levels.tick(background=False)
-        now[0] += 300
+    assert runtime.levels.tick(background=False) == []
     with runtime.store.read() as db:
-        assert runtime.levels.record(db, employee)["state"] != "pending"
+        level = runtime.levels.record(db, employee)
+        assert level["state"] == "defaulted" and level["reason"] == "staffing disabled"
         assert employee in [r["employee_id"] for r in runtime.admission_candidates(db)]
+
+
+def test_disabling_staffing_inflight_defaults_guidance_instead_of_choosing(system):
+    runtime, _ = system
+    employee = guide_hire(runtime)
+
+    def chooser(_):
+        _set_staffing(runtime, False)
+        return guidance_reply(scope_guidance="specialist-adviser", functional_guidance=["legal"])
+
+    runtime.levels.chooser = chooser
+    runtime.start()
+    runtime.levels.tick(background=False)
+    guide = guide_record(runtime, employee)
+    assert (guide["state"], guide["reason"]) == ("defaulted", "staffing disabled")
+    assert role(runtime, employee)["scope_guidance"] is None
 
 
 def test_a_stale_stored_revision_still_charges_and_settles_one_call(tmp_path):
@@ -1228,6 +1250,56 @@ def test_a_stale_stored_revision_still_charges_and_settles_one_call(tmp_path):
         runtime.levels.tick(background=False)
         now[0] += 300
     assert len(calls) == 1
-    assert role(runtime, "founder")["guidance_state"] == "chosen"
+    assert guide_record(runtime, "founder")["state"] == "chosen"
     with runtime.store.read() as db:
         assert "founder" in [r["employee_id"] for r in runtime.admission_candidates(db)]
+
+
+def test_background_chooser_drains_cleanly_on_stop_without_late_writes(system):
+    runtime, _ = system
+    employee = guide_hire(runtime)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_chooser(_):
+        entered.set()
+        assert release.wait(5)
+        return guidance_reply()
+
+    runtime.levels.chooser = slow_chooser
+    runtime.start()
+    started = runtime.levels.tick(background=True)
+    assert employee in started
+    assert entered.wait(2)
+    runtime.stop()
+    release.set()
+    runtime.levels.close(wait=True)
+    assert record(runtime, employee)["state"] == "pending"
+    assert record(runtime, employee)["attempts"] == 0
+    assert guide_record(runtime, employee)["state"] == "pending"
+    assert guide_record(runtime, employee)["attempts"] == 0
+    runtime.levels.chooser = lambda _: guidance_reply(scope_guidance="specialist-adviser")
+    runtime.start()
+    assert employee in runtime.levels.tick(background=False)
+    assert record(runtime, employee)["state"] == "chosen"
+    assert guide_record(runtime, employee)["state"] == "chosen"
+
+
+def test_single_transaction_settlement_rolls_back_both_decisions_on_second_write_error(
+    system, monkeypatch
+):
+    runtime, _ = system
+    employee = guide_hire(runtime)
+    runtime.levels.chooser = lambda _: guidance_reply(scope_guidance="specialist-adviser")
+    runtime.start()
+
+    def broken_apply(*args, **kwargs):
+        raise RuntimeError("disk failure")
+
+    monkeypatch.setattr(guidance, "apply", broken_apply)
+    with pytest.raises(RuntimeError, match="disk failure"):
+        runtime.levels.tick(background=False)
+    assert record(runtime, employee)["state"] == "pending"
+    assert record(runtime, employee)["attempts"] == 0
+    assert guide_record(runtime, employee)["state"] == "pending"
+    assert guide_record(runtime, employee)["attempts"] == 0

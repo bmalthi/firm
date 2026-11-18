@@ -648,8 +648,8 @@ def add_samples(runtime, machine, samples):
 def add_run(runtime, activation_id, **usage):
     with runtime.store.transaction() as db:
         db.execute(
-            "INSERT INTO sandbox_runs(activation_id,role_id,run_id,provider,deadline,"
-            "memory_peak_bytes,cpu_usec,oom_kills) VALUES(?,?,?,'codex',0,?,?,?)",
+            "INSERT INTO sandbox_runs(activation_id,role_id,run_id,execution_profile,deadline,"
+            "idle_timeout,memory_peak_bytes,cpu_usec,oom_kills) VALUES(?,?,?,'codex',0,1800,?,?,?)",
             (
                 activation_id,
                 "r-" + activation_id,
@@ -1173,7 +1173,8 @@ def test_summary_usage_captures_caller_configured_and_reported_model(system):
     with runtime.store.transaction() as db:
         db.execute("DELETE FROM analysis_events WHERE kind='summary.bound'")
     report = read(reader, "usage")
-    assert report["missing_model_identity"] == 1
+    # summary_runs.model keeps the configured model even when summary.bound events are absent.
+    assert report["missing_model_identity"] == 0
     assert report["resolved_models"] == ["reported-luna", None]
     assert report["missing_resolved_model_identity"] == 1
     assert report["summary_totals"]["output_tokens"]["value"] == 40
@@ -1776,7 +1777,8 @@ def test_readiness_guidance_fields_and_scope_source(system):
         config = runtime.accounts.config(db)
         config["staffing"] = {"classes": {}}
         db.execute("UPDATE firm SET config_json=?", (json.dumps(config),))
-        db.execute("UPDATE roles SET guidance_state='chosen',manager_id='other'")
+        db.execute("UPDATE roles SET manager_id='other'")
+        db.execute("UPDATE role_guidance SET state='chosen'")
     assert read(reader, "readiness")["rows"][0]["guidance"]["source"] == "chooser"
 
 
@@ -1828,13 +1830,13 @@ def test_real_guidance_operations_record_readable_timeline_events(system):
     runtime.owner.automatic_guidance(OWNER, "founder", "automatic")
     with runtime.store.transaction() as db:
         guidance.register(db, "founder")
-        request = runtime.store.role(db, "founder")
+        request = guidance.record(db, "founder")
     guidance.apply(
         runtime, "founder", request, {"scope": None, "functions": ["legal"]}, "Legal mandate"
     )
     with runtime.store.transaction() as db:
         guidance.register(db, "founder")
-        request = runtime.store.role(db, "founder")
+        request = guidance.record(db, "founder")
     guidance.failed(runtime, "founder", request, "Cannot select", retry=False)
     with runtime.store.transaction() as db:
         db.execute("UPDATE roles SET functional_guidance='[\"removed\"]'")
@@ -1879,3 +1881,23 @@ def test_readiness_distinguishes_conditional_review_from_offered_pending_mail(sy
     assert runtime.messaging.peek("founder")["threads"][0]["message_id"] == (
         result["message_id"]
     )
+
+
+def test_readiness_counts_non_borrowed_running_tasks_in_account_occupancy(system):
+    runtime, now, reader = system
+    first = start(runtime)
+    with runtime.store.transaction() as db:
+        bound_account = runtime.accounts.binding(db, first.session_id)["account_id"]
+        # First running task borrows the live caller's slot; second takes an extra slot.
+        for idx in (1, 2):
+            db.execute(
+                "INSERT INTO summary_runs(run_id,started_at,state,input_bytes,account_id,"
+                "profile,provider,kind,caller_activation_id) "
+                "VALUES(?,1001,'running',0,?,'main','codex','task',?)",
+                (f"t{idx}", bound_account, first.activation_id),
+            )
+    with runtime.store.transaction() as db:
+        rows = AnalysisReader.readiness(db, now[0])
+    founder = next(r for r in rows if r["employee_id"] == "founder")
+    option = next(o for o in founder["account_options"] if o["account_id"] == bound_account)
+    assert option["occupied"] == 2

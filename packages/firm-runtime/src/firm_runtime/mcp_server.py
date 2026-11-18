@@ -1,6 +1,7 @@
 """MCP role tools shared by the trusted stdio and authenticated HTTP transports."""
 
 import argparse
+import asyncio
 import inspect
 import os
 from collections.abc import Callable
@@ -131,6 +132,14 @@ def register_tools(server: FastMCP, runtime: Runtime, token: str | Callable[[], 
         else:
             method = getattr(runtime.tools(token), name)
 
+        rendered = _rendered(method, name)
+        if not inspect.iscoroutinefunction(rendered):
+
+            @wraps(rendered)
+            async def threaded(*args, _fn=rendered, **kwargs):
+                return await asyncio.to_thread(_fn, *args, **kwargs)
+
+            rendered = threaded
         server.tool(
             name=name,
             description=description,
@@ -174,7 +183,7 @@ def register_tools(server: FastMCP, runtime: Runtime, token: str | Callable[[], 
                 },
             ),
             structured_output=False,
-        )(_rendered(method, name))
+        )(rendered)
         # FastMCP otherwise silently drops unknown arguments. Fail closed so a
         # guessed actor/resource selector is never mistaken for an accepted choice.
         registered = server._tool_manager.get_tool(name)

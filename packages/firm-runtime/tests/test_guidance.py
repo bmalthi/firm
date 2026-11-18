@@ -28,6 +28,11 @@ def role(runtime, employee_id="founder"):
         return runtime.store.role(db, employee_id)
 
 
+def decision(runtime, employee_id="founder"):
+    with runtime.store.read() as db:
+        return guidance.record(db, employee_id)
+
+
 def selection(runtime, employee_id="founder"):
     with runtime.store.read() as db:
         return guidance.effective(
@@ -99,8 +104,9 @@ def test_org_chart_keeps_paused_and_exhausted_reports_then_restores_chooser_scop
         config = runtime.accounts.config(db)
         config["staffing"] = {"classes": {"medium": "main"}}
         db.execute("UPDATE firm SET config_json=?", (encoded(config),))
-        db.execute("UPDATE roles SET scope_guidance='specialist-adviser',guidance_state='chosen' "
-                   "WHERE employee_id=?", (lead,))
+        db.execute("UPDATE roles SET scope_guidance='specialist-adviser' WHERE employee_id=?",
+                   (lead,))
+        db.execute("INSERT INTO role_guidance(employee_id,state) VALUES(?,'chosen')", (lead,))
     assert selection(runtime, lead)["scope"] == "specialist-adviser"
     child = hire(runtime, lead, "child", temporary_periods=1)
     assert selection(runtime, lead)["scope"] == "team-leader"
@@ -118,21 +124,22 @@ def test_staffing_switch_changes_effective_selection_without_writes(system):
     employee = hire(runtime)
     with runtime.store.transaction() as db:
         db.execute(
-            "UPDATE roles SET scope_guidance='cross-team-lead',functional_guidance='[\"legal\"]',"
-            "guidance_state='chosen' WHERE employee_id=?",
+            "UPDATE roles SET scope_guidance='cross-team-lead',functional_guidance='[\"legal\"]' "
+            "WHERE employee_id=?",
             (employee,),
         )
+        db.execute("INSERT INTO role_guidance(employee_id,state) VALUES(?,'chosen')", (employee,))
         config = runtime.accounts.config(db)
         config["staffing"] = {"classes": {}}
         db.execute("UPDATE firm SET config_json=?", (encoded(config),))
-    original = role(runtime, employee)
+    original = (role(runtime, employee), decision(runtime, employee))
     assert selection(runtime)["scope"] == "firm-leader"
     assert selection(runtime, employee) == {"scope": "cross-team-lead", "functions": ["legal"]}
     with runtime.store.transaction() as db:
         config["staffing"] = False
         db.execute("UPDATE firm SET config_json=?", (encoded(config),))
     assert selection(runtime, employee) == {"scope": None, "functions": []}
-    assert role(runtime, employee) == original
+    assert (role(runtime, employee), decision(runtime, employee)) == original
     with runtime.store.transaction() as db:
         config["staffing"] = {"classes": {}}
         db.execute("UPDATE firm SET config_json=?", (encoded(config),))
@@ -156,18 +163,23 @@ def test_removed_guides_reconcile_once_keep_owner_or_request_current_revision(
         config["staffing"] = {"classes": {}}
         db.execute("UPDATE firm SET config_json=?", (encoded(config),))
         db.execute(
-            "UPDATE roles SET guidance_state=?,scope_guidance='removed-scope',"
-            "functional_guidance=?,guidance_attempts=2 WHERE employee_id=?",
-            ("owner" if owner else "chosen", encoded(["removed-function", *remaining]), employee),
+            "UPDATE roles SET scope_guidance='removed-scope',functional_guidance=? "
+            "WHERE employee_id=?",
+            (encoded(["removed-function", *remaining]), employee),
+        )
+        db.execute(
+            "INSERT INTO role_guidance(employee_id,state,attempts) VALUES(?,?,2)",
+            (employee, "owner" if owner else "chosen"),
         )
     runtime.start()
     result = role(runtime, employee)
+    guide = decision(runtime, employee)
     assert result["scope_guidance"] is None
     assert json.loads(result["functional_guidance"]) == remaining
-    assert result["guidance_state"] == ("owner" if owner else "pending")
+    assert guide["state"] == ("owner" if owner else "pending")
     if not owner:
-        assert result["guidance_revision"] == 0
-        assert result["guidance_attempts"] == 0
+        assert guide["revision"] == 0
+        assert guide["attempts"] == 0
     with runtime.store.read() as db:
         before = list(db.iterdump())
         (notice,) = db.execute(
@@ -185,15 +197,16 @@ def test_removed_guides_with_staffing_off_drop_ids_without_a_notice(system):
     employee = hire(runtime)
     with runtime.store.transaction() as db:
         db.execute(
-            "UPDATE roles SET guidance_state='chosen',scope_guidance='removed-scope',"
-            "functional_guidance=? WHERE employee_id=?",
+            "UPDATE roles SET scope_guidance='removed-scope',functional_guidance=? "
+            "WHERE employee_id=?",
             (encoded(["removed-function", "sales"]), employee),
         )
+        db.execute("INSERT INTO role_guidance(employee_id,state) VALUES(?,'chosen')", (employee,))
     runtime.start()
     result = role(runtime, employee)
     assert result["scope_guidance"] is None
     assert json.loads(result["functional_guidance"]) == ["sales"]
-    assert result["guidance_state"] == "chosen"
+    assert decision(runtime, employee)["state"] == "chosen"
     with runtime.store.read() as db:
         assert not db.execute(
             "SELECT 1 FROM messages WHERE body LIKE ?",
@@ -229,14 +242,13 @@ def test_owner_controls_validate_dimensions_authority_and_replay(system):
         == expected
     )
     runtime.lifecycle.revise_mandate("founder", employee, 0, "Changed", request_id="rev")
-    assert role(runtime, employee)["guidance_state"] == "owner"
+    assert decision(runtime, employee)["state"] == "owner"
     assert selection(runtime, employee) == expected
     assert runtime.owner.automatic_guidance(OWNER, employee, "auto") == {
         "scope": None,
         "functions": [],
     }
-    assert role(runtime, employee)["guidance_state"] is None
-    assert role(runtime, employee)["guidance_revision"] is None
+    assert decision(runtime, employee) is None
     assert runtime.owner.set_guidance(OWNER, employee, None, [], "empty") == {
         "scope": None,
         "functions": [],
@@ -294,6 +306,6 @@ def test_automatic_delivery_accepts_only_chooser_scopes_from_storage(system, sco
         config = runtime.accounts.config(db)
         config["staffing"] = {"classes": {}}
         db.execute("UPDATE firm SET config_json=?", (encoded(config),))
-        db.execute("UPDATE roles SET scope_guidance=?,guidance_state='chosen' WHERE employee_id=?",
-                   (scope, employee))
+        db.execute("UPDATE roles SET scope_guidance=? WHERE employee_id=?", (scope, employee))
+        db.execute("INSERT INTO role_guidance(employee_id,state) VALUES(?,'chosen')", (employee,))
     assert selection(runtime, employee) == {"scope": None, "functions": []}

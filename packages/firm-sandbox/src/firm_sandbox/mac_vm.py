@@ -509,8 +509,8 @@ printf '%s\\n' 'firmvm ALL=(root) NOPASSWD: {" ".join(CONTROLLER_COMMAND)}' > /e
             if not self.network.ready():
                 raise RuntimeError("VM network boundary is unavailable; stop the VM")
         else:
-            self.network.write_configuration()
             self.network.stop()
+            self.network.write_configuration()
             self.network.start()
             # Lima must reuse our filtered user-v2 endpoint. Its marker names the
             # network process, never this runtime, and exists only at boot.

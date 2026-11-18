@@ -399,3 +399,22 @@ def test_export_refuses_durable_symlink_before_staging(tmp_path, monkeypatch):
         exports.write(tmp_path, "test-firm")
     assert not list(external.iterdir())
     assert not (tmp_path / "export").exists()
+
+
+def test_export_includes_employee_sequence_and_egress_summary_when_present(
+    firm, monkeypatch, capsys
+):
+    durable = firm / "durable"
+    (durable / "firm.sqlite3.employee-sequence").write_text("5\n")
+    for vm_name in ("linux", "mac"):
+        (durable / vm_name / "scratch").mkdir(parents=True)
+        (durable / vm_name / "scratch" / "egress-summary.json").write_text('{"entries":[]}')
+    invoke(monkeypatch, capsys, "export", firm)
+    export = firm / "export"
+    manifest = exports.verify(export)
+    assert "firm.sqlite3.employee-sequence" in manifest["entries"]
+    assert "linux/scratch/egress-summary.json" in manifest["entries"]
+    assert "mac/scratch/egress-summary.json" in manifest["entries"]
+    assert (export / "firm.sqlite3.employee-sequence").read_text() == "5\n"
+    assert (export / "linux" / "scratch" / "egress-summary.json").read_text() == '{"entries":[]}'
+    assert (export / "mac" / "scratch" / "egress-summary.json").read_text() == '{"entries":[]}'

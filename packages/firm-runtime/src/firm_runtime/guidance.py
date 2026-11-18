@@ -15,6 +15,25 @@ from .store import encoded as encode_json
 
 ORG_CHART_SCOPES = ("firm-leader", "team-leader")
 _ID = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
+_UNSET = object()
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS role_guidance (
+    employee_id TEXT PRIMARY KEY REFERENCES roles(employee_id),
+    state TEXT NOT NULL CHECK(state IN ('pending','chosen','defaulted','owner')),
+    revision INTEGER,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    retry_at REAL,
+    reason TEXT
+);
+"""
+
+
+def record(db, employee_id: str) -> dict | None:
+    row = db.execute(
+        "SELECT * FROM role_guidance WHERE employee_id=?", (employee_id,)
+    ).fetchone()
+    return dict(row) if row else None
 
 
 @cache
@@ -85,9 +104,11 @@ def parse_selection(value: dict, entries: list[dict]) -> dict:
     return {"scope": scope, "functions": [f for f in ordered if f in functions]}
 
 
-def effective(db, role, config: dict) -> dict:
+def effective(db, role, config: dict, decision: dict | None = _UNSET) -> dict:
     """Compute delivery from the current org chart, staffing and owner override."""
-    if role["guidance_state"] == "owner":
+    if decision is _UNSET:
+        decision = record(db, role["employee_id"])
+    if decision and decision["state"] == "owner":
         return {
             "scope": role["scope_guidance"],
             "functions": json.loads(role["functional_guidance"]),
@@ -114,20 +135,23 @@ def encoded(selection: dict | None) -> str:
     return encode_json(selection or {"scope": None, "functions": []})
 
 
-def view(db, role, config: dict) -> dict:
-    selection = effective(db, role, config)
+def view(db, role, config: dict, decision: dict | None = _UNSET) -> dict:
+    if decision is _UNSET:
+        decision = record(db, role["employee_id"])
+    selection = effective(db, role, config, decision)
     scope = selection["scope"]
+    state = decision["state"] if decision else None
     return {
-        "state": role["guidance_state"],
+        "state": state,
         **selection,
         "source": "owner"
-        if role["guidance_state"] == "owner"
+        if state == "owner"
         else "org_chart"
         if scope in ORG_CHART_SCOPES
         else "chooser"
         if scope
         else None,
-        "reason": role["guidance_reason"],
+        "reason": decision["reason"] if decision else None,
     }
 
 
@@ -139,105 +163,125 @@ def describe(selection: dict) -> str:
 
 def register(db, employee_id: str, revision: int = 0) -> None:
     db.execute(
-        "UPDATE roles SET guidance_state='pending',guidance_revision=?,guidance_attempts=0,"
-        "guidance_retry_at=NULL,guidance_reason=NULL WHERE employee_id=?",
-        (revision, employee_id),
+        "INSERT INTO role_guidance(employee_id,state,revision,attempts,retry_at,reason) "
+        "VALUES(?,'pending',?,0,NULL,NULL) "
+        "ON CONFLICT(employee_id) DO UPDATE SET "
+        "state='pending',revision=excluded.revision,attempts=0,retry_at=NULL,reason=NULL",
+        (employee_id, revision),
     )
 
 
 def request_reassessment(db, employee_id: str, revision: int) -> None:
-    role = db.execute(
-        "SELECT guidance_state FROM roles WHERE employee_id=?", (employee_id,)
-    ).fetchone()
-    if role["guidance_state"] != "owner":
+    current = record(db, employee_id)
+    if current is None or current["state"] != "owner":
         register(db, employee_id, revision)
 
 
 def _current(db, employee_id, request):
-    row = db.execute("SELECT * FROM roles WHERE employee_id=?", (employee_id,)).fetchone()
+    role = db.execute("SELECT * FROM roles WHERE employee_id=?", (employee_id,)).fetchone()
+    current = record(db, employee_id)
     if (
-        row
-        and row["employment"] == "active"
-        and row["guidance_state"] == "pending"
-        and row["guidance_revision"] == request["guidance_revision"]
-        and row["guidance_attempts"] == request["guidance_attempts"]
+        role
+        and role["employment"] == "active"
+        and current
+        and current["state"] == "pending"
+        and current["revision"] == request["revision"]
+        and current["attempts"] == request["attempts"]
     ):
-        return dict(row)
+        return dict(role), current
     return None
 
 
-def apply(runtime, employee_id, request, selection, reason) -> bool:
+def apply(runtime, employee_id, request, selection, reason, *, db=None) -> bool:
     from .levels import _clip
 
-    with runtime.store.transaction() as db:
-        if not _current(db, employee_id, request):
-            return False
-        db.execute(
-            "UPDATE roles SET scope_guidance=?,functional_guidance=?,guidance_state='chosen',"
-            "guidance_attempts=guidance_attempts+1,guidance_retry_at=NULL,guidance_reason=? "
-            "WHERE employee_id=?",
-            (selection["scope"], encode_json(selection["functions"]), reason, employee_id),
-        )
-        analysis_history.record(
-            db,
-            runtime.store.clock(),
-            "guidance.chosen",
-            employee_id,
-            **selection,
-            reason=_clip(reason, 500),
-            attempts=request["guidance_attempts"] + 1,
-        )
-        return True
+    if db is None:
+        with runtime.store.transaction() as tx:
+            return apply(runtime, employee_id, request, selection, reason, db=tx)
+    current = _current(db, employee_id, request)
+    if not current:
+        return False
+    db.execute(
+        "UPDATE roles SET scope_guidance=?,functional_guidance=? WHERE employee_id=?",
+        (selection["scope"], encode_json(selection["functions"]), employee_id),
+    )
+    db.execute(
+        "UPDATE role_guidance SET state='chosen',attempts=attempts+1,retry_at=NULL,"
+        "reason=? WHERE employee_id=?",
+        (reason, employee_id),
+    )
+    analysis_history.record(
+        db,
+        runtime.store.clock(),
+        "guidance.chosen",
+        employee_id,
+        **selection,
+        reason=_clip(reason, 500),
+        attempts=request["attempts"] + 1,
+    )
+    return True
 
 
-def failed(runtime, employee_id, request, reason, *, retry=True, notice=True) -> dict | None:
-    """Charge only the pending request captured before the call; return a defaulted role."""
+def failed(
+    runtime, employee_id, request, reason, *, retry=True, notice=True, db=None
+) -> dict | None:
+    """Charge only the pending request captured before the call; return defaulted state."""
     from .levels import MAX_ATTEMPTS, RETRY_DELAY_SECONDS, _clip
 
-    with runtime.store.transaction() as db:
-        role = _current(db, employee_id, request)
-        if role is None:
-            return None
-        attempts = role["guidance_attempts"] + 1
-        pending = retry and attempts < MAX_ATTEMPTS
-        db.execute(
-            "UPDATE roles SET guidance_state=?,guidance_attempts=?,guidance_retry_at=?,"
-            "guidance_reason=? WHERE employee_id=?",
-            (
-                "pending" if pending else "defaulted",
-                attempts,
-                runtime.store.clock() + RETRY_DELAY_SECONDS * attempts if pending else None,
-                reason,
-                employee_id,
-            ),
-        )
-        if pending:
-            return None
-        analysis_history.record(
-            db,
-            runtime.store.clock(),
-            "guidance.defaulted",
+    if db is None:
+        with runtime.store.transaction() as tx:
+            return failed(
+                runtime, employee_id, request, reason, retry=retry, notice=notice, db=tx
+            )
+    current = _current(db, employee_id, request)
+    if current is None:
+        return None
+    role, decision = current
+    attempts = decision["attempts"] + 1
+    pending = retry and attempts < MAX_ATTEMPTS
+    db.execute(
+        "UPDATE role_guidance SET state=?,attempts=?,retry_at=?,reason=? "
+        "WHERE employee_id=?",
+        (
+            "pending" if pending else "defaulted",
+            attempts,
+            runtime.store.clock() + RETRY_DELAY_SECONDS * attempts if pending else None,
+            reason,
             employee_id,
-            attempts=attempts,
-            reason=_clip(reason, 500),
-        )
-        role.update(guidance_state="defaulted", guidance_attempts=attempts, guidance_reason=reason)
-        if notice:
-            default_notice(runtime, db, role)
-        return role
+        ),
+    )
+    if pending:
+        return None
+    analysis_history.record(
+        db,
+        runtime.store.clock(),
+        "guidance.defaulted",
+        employee_id,
+        attempts=attempts,
+        reason=_clip(reason, 500),
+    )
+    settled = {
+        **role,
+        "state": "defaulted",
+        "attempts": attempts,
+        "reason": reason,
+    }
+    if notice:
+        default_notice(runtime, db, settled)
+    return settled
 
 
-def default_notice(runtime, db, role, level=None):
-    selection = describe(effective(db, role, runtime.accounts.config(db)))
+def default_notice(runtime, db, guide, level=None):
+    selection = describe(effective(db, guide, runtime.accounts.config(db), guide))
     runtime.messaging.notice(
         db,
         [OWNER],
         render(
             "notices",
             "level_and_guidance_default" if level else "guidance_default",
-            address=role["address"],
-            attempts=role["guidance_attempts"],
-            reason=role["guidance_reason"],
+            address=guide["address"],
+            attempts=guide["attempts"],
+            reason=guide["reason"],
             selection=selection,
             model_class=level["model_class"] if level else "",
             effort=level["effort"] if level else "",
@@ -263,7 +307,8 @@ def reconcile(db, runtime) -> None:
                 role["employee_id"],
             ),
         )
-        owner = role["guidance_state"] == "owner"
+        decision = record(db, role["employee_id"])
+        owner = decision is not None and decision["state"] == "owner"
         staffing = config.get("staffing") is not False
         if not owner and staffing:
             revision = db.execute(

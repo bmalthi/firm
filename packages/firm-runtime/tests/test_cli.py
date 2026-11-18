@@ -1306,6 +1306,7 @@ def test_guidance_cli_sets_exact_selection_and_replays(
 def test_guidance_cli_automatic_uses_current_revision_in_both_staffing_modes(
     tmp_path, monkeypatch, capsys, staffing
 ):
+    from firm_runtime import guidance
     from firm_runtime.runtime import Runtime
     from firm_runtime.store import OWNER, Store
 
@@ -1324,9 +1325,12 @@ def test_guidance_cli_automatic_uses_current_revision_in_both_staffing_modes(
     assert _invoke(monkeypatch, capsys, "guidance", directory, "founder", "--automatic",
                    "--request-id", "auto") == {"scope": "firm-leader", "functions": []}
     with runtime.store.read() as db:
-        role = runtime.store.role(db, "founder")
-        assert role["guidance_state"] == ("pending" if staffing else None)
-        assert role["guidance_revision"] == (1 if staffing else None)
+        record = guidance.record(db, "founder")
+        if staffing:
+            assert record["state"] == "pending"
+            assert record["revision"] == 1
+        else:
+            assert record is None
 
 
 @pytest.mark.parametrize("flags", [

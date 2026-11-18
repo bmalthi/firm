@@ -594,6 +594,7 @@ def test_create_applies_resources_and_records_the_generation(vm, monkeypatch, tm
     assert record["base_image"]["key"] == "base-key"
     assert record["base_image"]["built"].endswith("+00:00")
     assert record["generation"] and record["firm_id"] == "firm" and record["ready"] is False
+    assert record["disk_gib"] == disk_gib
     assert record["subnet"] == vm.subnet and vm.subnet.startswith("192.168.")
     networks = yaml.safe_load((vm.paths.home / "_config" / "networks.yaml").read_text())
     assert networks["networks"]["user-v2"]["gateway"] == vm.subnet.replace("0/24", "1")
@@ -613,7 +614,7 @@ def test_create_applies_resources_and_records_the_generation(vm, monkeypatch, tm
     assert (definition["cpus"], definition["memory"], definition["os"]) == (12, "32GiB", "Linux")
     assert definition["disk"] == f"{disk_gib}GiB"
     record = json.loads(bigger.record.read_text())
-    assert (record["cpus"], record["memory_gib"]) == (12, 32)
+    assert (record["cpus"], record["memory_gib"], record["disk_gib"]) == (12, 32, disk_gib)
 
     other = linux_vm.LinuxVM(settings(vm.root, tmp_path, firm_id="other"), limactl=vm.lima)
     monkeypatch.setattr(other, "_lima", lima)

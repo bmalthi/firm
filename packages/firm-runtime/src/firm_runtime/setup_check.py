@@ -24,6 +24,7 @@ from .errors import FirmError
 from .lifecycle import validate_config
 from .provider_contract import ProviderSetupError
 from .providers import provider_adapter
+from .store import read_employee_sequence
 
 MIN_LIMA_VERSION = (2, 2, 0)
 HOST_MEMORY_RESERVE_GIB = 4
@@ -107,40 +108,11 @@ def _read_database(path: Path) -> tuple[dict | None, dict]:
 
 def _runtime_table_names() -> set[str]:
     """Read the schema declarations without constructing a Store or opening writes."""
-    from . import (
-        accounts,
-        analysis_history,
-        appointments,
-        github,
-        hosts,
-        levels,
-        mac_lease,
-        messaging,
-        reminders,
-        requests,
-        scheduling,
-        store,
-        summaries,
-        telemetry,
-    )
+    from .store import schema_modules
 
-    modules = (
-        accounts,
-        analysis_history,
-        appointments,
-        github,
-        hosts,
-        levels,
-        mac_lease,
-        messaging,
-        reminders,
-        requests,
-        scheduling,
-        store,
-        summaries,
-        telemetry,
-    )
-    return {name for module in modules for name in _TABLE_DECLARATION.findall(module.SCHEMA)}
+    return {
+        name for module in schema_modules() for name in _TABLE_DECLARATION.findall(module.SCHEMA)
+    }
 
 
 def database_initialization_state(path: Path) -> str:
@@ -162,6 +134,10 @@ def database_initialization_state(path: Path) -> str:
     if not stat.S_ISREG(details.st_mode):
         return "invalid"
     try:
+        read_employee_sequence(path.with_name(path.name + ".employee-sequence"))
+    except (OSError, ValueError):
+        return "invalid"
+    try:
         uri = path.resolve().as_uri() + "?mode=ro"
         with sqlite3.connect(uri, uri=True, isolation_level=None, timeout=2) as database:
             database.execute("PRAGMA query_only=ON")
@@ -179,6 +155,12 @@ def database_initialization_state(path: Path) -> str:
                 initialized = database.execute("SELECT COUNT(*) FROM firm").fetchone()[0]
                 if initialized:
                     if not expected_tables <= set(tables):
+                        return "invalid"
+                    view = database.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='view' AND name='scheduling_opportunities'"
+                    ).fetchone()
+                    if view is None:
                         return "invalid"
                     saved, _check = _read_database(path)
                     if saved is None:
@@ -214,6 +196,15 @@ def database_initialization_state(path: Path) -> str:
                     except sqlite3.Error:
                         return "invalid"
                     if sequence == [(1, 1)]:
+                        continue
+                if table in {"message_sequence", "message_read_sequence"}:
+                    try:
+                        sequence = database.execute(
+                            f"SELECT singleton,sequence FROM {table}"
+                        ).fetchall()
+                    except sqlite3.Error:
+                        return "invalid"
+                    if sequence == [(1, 0)]:
                         continue
                 return "invalid"
         return "partial"

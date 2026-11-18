@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS owner_requests (
     request_id TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
     employee_id TEXT NOT NULL REFERENCES roles(employee_id),
-    activation_id TEXT,
+    activation_id TEXT REFERENCES activations(activation_id),
     payload_json TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('pending','granted','denied','withdrawn')),
     created_at REAL NOT NULL,

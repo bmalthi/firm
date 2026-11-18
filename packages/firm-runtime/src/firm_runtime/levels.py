@@ -317,7 +317,23 @@ class Levels:
         # A provider-free chooser for controlled execution and tests.
         self.chooser: Callable[[str], dict[str, Any]] | None = None
         self._inflight: set[str] = set()
+        self._threads: set[threading.Thread] = set()
+        self._closed = False
         self._lock = threading.Lock()
+
+    def open(self) -> None:
+        with self._lock:
+            self._closed = False
+
+    def close(self, *, wait: bool = False) -> None:
+        with self._lock:
+            self._closed = True
+            threads = list(self._threads)
+        if wait:
+            current = threading.current_thread()
+            for thread in threads:
+                if thread is not current:
+                    thread.join()
 
     def record(self, db, employee_id: str) -> dict | None:
         row = db.execute("SELECT * FROM hire_levels WHERE employee_id=?", (employee_id,)).fetchone()
@@ -333,11 +349,11 @@ class Levels:
         return self.chooser is not None or self.runtime.summary_service.provider is not None
 
     @staticmethod
-    def _due(record, now, prefix=""):
+    def _due(record, now):
         return (
             record is not None
-            and record[prefix + "state"] == "pending"
-            and (record[prefix + "retry_at"] is None or record[prefix + "retry_at"] <= now)
+            and record["state"] == "pending"
+            and (record["retry_at"] is None or record["retry_at"] <= now)
         )
 
     def tick(self, *, background: bool = True) -> list[str]:
@@ -346,47 +362,91 @@ class Levels:
             if self.store.firm(db)["state"] != "running":
                 return []
             staffing = self.runtime.accounts.config(db).get("staffing") is not False
+            if not staffing:
+                now = self.store.clock()
+                model_class, effort = FALLBACK_LEVEL
+                pending_levels = db.execute(
+                    "SELECT h.employee_id,h.attempts,r.execution_profile FROM hire_levels h "
+                    "JOIN roles r USING(employee_id) "
+                    "WHERE h.state='pending' AND r.employment='active'"
+                ).fetchall()
+                db.execute(
+                    "UPDATE hire_levels SET state='defaulted',retry_at=NULL,model_class=?,"
+                    "effort=?,reason='staffing disabled',updated_at=? "
+                    "WHERE state='pending' AND employee_id IN ("
+                    "SELECT employee_id FROM roles WHERE employment='active')",
+                    (model_class, effort, now),
+                )
+                for row in pending_levels:
+                    analysis_history.record(
+                        db,
+                        now,
+                        "level.defaulted",
+                        row["employee_id"],
+                        model_class=model_class,
+                        effort=effort,
+                        profile=row["execution_profile"],
+                        reason="staffing disabled",
+                        attempts=row["attempts"],
+                    )
             if not staffing or not self.can_select():
                 reason = "staffing disabled" if not staffing else "no isolated runner"
                 pending = db.execute(
-                    "SELECT employee_id,guidance_attempts FROM roles "
-                    "WHERE guidance_state='pending' AND employment='active'"
+                    "SELECT g.employee_id,g.attempts FROM role_guidance g "
+                    "JOIN roles r USING(employee_id) "
+                    "WHERE g.state='pending' AND r.employment='active'"
                 ).fetchall()
                 db.execute(
-                    "UPDATE roles SET guidance_state='defaulted',guidance_retry_at=NULL,"
-                    "guidance_reason=? WHERE guidance_state='pending' AND employment='active'",
+                    "UPDATE role_guidance SET state='defaulted',retry_at=NULL,reason=? "
+                    "WHERE state='pending' AND employee_id IN ("
+                    "SELECT employee_id FROM roles WHERE employment='active')",
                     (reason,),
                 )
-                for role in pending:
+                for row in pending:
                     analysis_history.record(
-                        db, self.store.clock(), "guidance.defaulted", role["employee_id"],
-                        reason=reason, attempts=role["guidance_attempts"],
+                        db,
+                        self.store.clock(),
+                        "guidance.defaulted",
+                        row["employee_id"],
+                        reason=reason,
+                        attempts=row["attempts"],
                     )
             now = self.store.clock()
-            due = (
-                [
-                    r["employee_id"]
-                    for r in db.execute(
-                        "SELECT r.employee_id FROM roles r "
-                        "LEFT JOIN hire_levels h USING(employee_id) "
-                        "WHERE r.employment='active' AND ((h.state='pending' AND "
-                        "(h.retry_at IS NULL OR h.retry_at<=?)) OR (r.guidance_state='pending' AND "
-                        "(r.guidance_retry_at IS NULL OR r.guidance_retry_at<=?))) "
-                        "ORDER BY COALESCE(h.updated_at,r.created_at),r.address",
-                        (now, now),
-                    )
-                ]
-            )
+            due = [
+                r["employee_id"]
+                for r in db.execute(
+                    "SELECT r.employee_id FROM roles r "
+                    "LEFT JOIN hire_levels h USING(employee_id) "
+                    "LEFT JOIN role_guidance g USING(employee_id) "
+                    "WHERE r.employment='active' AND ((h.state='pending' AND "
+                    "(h.retry_at IS NULL OR h.retry_at<=?)) OR (? AND g.state='pending' AND "
+                    "(g.retry_at IS NULL OR g.retry_at<=?))) "
+                    "ORDER BY COALESCE(h.updated_at,r.created_at),r.address",
+                    (now, staffing, now),
+                )
+            ]
         with self._lock:
+            if self._closed:
+                return []
             due = [e for e in due if e not in self._inflight]
             self._inflight.update(due)
-        for employee_id in due:
             if background:
-                threading.Thread(
-                    target=self._assess, args=(employee_id,), daemon=True, name="firm-level"
-                ).start()
-            else:
-                self._assess(employee_id)
+                started = []
+                for employee_id in due:
+                    thread = threading.Thread(
+                        target=self._assess, args=(employee_id,), daemon=True, name="firm-level"
+                    )
+                    self._threads.add(thread)
+                    try:
+                        thread.start()
+                    except BaseException:
+                        self._threads.discard(thread)
+                        self._inflight.discard(employee_id)
+                        raise
+                    started.append(employee_id)
+                return started
+        for employee_id in due:
+            self._assess(employee_id)
         return due
 
     def _assess(self, employee_id: str) -> None:
@@ -394,6 +454,8 @@ class Levels:
         try:
             try:
                 with self.store.read() as db:
+                    if self.store.firm(db)["state"] != "running":
+                        return
                     role = self.store.role(db, employee_id)
                     config = self.runtime.accounts.config(db)
                     if role["employment"] != "active":
@@ -404,8 +466,10 @@ class Levels:
                     # Staffing off stops guidance selection only; a pending level still fails
                     # and defaults through the usual bounded retries rather than staying pending.
                     staffing = config.get("staffing") is not False
-                    due_guides = staffing and self._due(role, now, "guidance_")
-                    guide_request = role if due_guides else None
+                    guide_record = guidance.record(db, employee_id)
+                    guide_request = (
+                        guide_record if (staffing and self._due(guide_record, now)) else None
+                    )
                     if level_request is None and guide_request is None:
                         return
                     prompt, _revision = build_prompt(
@@ -426,10 +490,11 @@ class Levels:
                     retry=not isinstance(exc, SummaryInputTooLarge),
                 )
                 return
+            parsed_level = parsed_guide = None
             level_error = guide_error = None
             if level_request is not None:
                 try:
-                    self._apply(employee_id, *parse_level(value), request=level_request)
+                    parsed_level = parse_level(value)
                 except (FirmError, ValueError) as exc:
                     level_error = str(exc)
             if guide_request is not None:
@@ -438,55 +503,103 @@ class Levels:
                     reason = value.get("reason", "")
                     if not isinstance(reason, str):
                         raise ValueError("chooser reason must be a string")
-                    guidance.apply(
-                        self.runtime, employee_id, guide_request, selection,
-                        _clip(reason.strip(), MAX_CHOICE_REASON_CHARS),
-                    )
+                    parsed_guide = (selection, _clip(reason.strip(), MAX_CHOICE_REASON_CHARS))
                 except (FirmError, ValueError) as exc:
                     guide_error = str(exc)
-            self._fail_decisions(
-                employee_id,
-                level_request if level_error else None,
-                guide_request if guide_error else None,
-                level_error or guide_error or "",
-                guide_reason=guide_error,
-            )
+            with self.store.transaction() as db:
+                if self.store.firm(db)["state"] != "running":
+                    return
+                staffing = self.runtime.accounts.config(db).get("staffing") is not False
+                if level_request is not None and level_error is None:
+                    try:
+                        self._apply(employee_id, *parsed_level, request=level_request, db=db)
+                    except (FirmError, ValueError) as exc:
+                        level_error = str(exc)
+                if guide_request is not None:
+                    if not staffing:
+                        guidance.failed(
+                            self.runtime,
+                            employee_id,
+                            guide_request,
+                            "staffing disabled",
+                            retry=False,
+                            notice=False,
+                            db=db,
+                        )
+                        guide_error = None
+                    elif guide_error is None:
+                        guidance.apply(
+                            self.runtime, employee_id, guide_request, *parsed_guide, db=db
+                        )
+                if level_error or guide_error:
+                    self._fail_decisions(
+                        employee_id,
+                        level_request if level_error else None,
+                        guide_request if guide_error else None,
+                        level_error or guide_error or "",
+                        guide_reason=guide_error,
+                        db=db,
+                    )
         finally:
             with self._lock:
                 self._inflight.discard(employee_id)
+                self._threads.discard(threading.current_thread())
 
     def _fail_decisions(
-        self, employee_id, level_request, guide_request, reason, *, retry=True, guide_reason=None
+        self,
+        employee_id,
+        level_request,
+        guide_request,
+        reason,
+        *,
+        retry=True,
+        guide_reason=None,
+        db=None,
     ):
         # Defer notices so a call that defaults both decisions sends one message.
-        with self.store.transaction() as db:
-            level = (
-                self._failed(employee_id, reason, retry=retry, request=level_request, notice=False)
-                if level_request is not None
-                else None
-            )
-            guide = (
-                guidance.failed(
-                    self.runtime,
+        if db is None:
+            with self.store.transaction() as tx:
+                return self._fail_decisions(
                     employee_id,
+                    level_request,
                     guide_request,
-                    guide_reason or reason,
+                    reason,
                     retry=retry,
-                    notice=False,
+                    guide_reason=guide_reason,
+                    db=tx,
                 )
-                if guide_request is not None
-                else None
+        if self.store.firm(db)["state"] != "running":
+            return
+        level = (
+            self._failed(
+                employee_id, reason, retry=retry, request=level_request, notice=False, db=db
             )
-            if guide:
-                guidance.default_notice(self.runtime, db, guide, level)
-            elif level:
-                role = self.store.role(db, employee_id)
-                self.runtime.messaging.notice(
-                    db,
-                    [OWNER],
-                    render("notices", "level_default", address=role["address"], **level),
-                    subject=render("notices", "level_default_subject"),
-                )
+            if level_request is not None
+            else None
+        )
+        guide = (
+            guidance.failed(
+                self.runtime,
+                employee_id,
+                guide_request,
+                guide_reason or reason,
+                retry=retry,
+                notice=False,
+                db=db,
+            )
+            if guide_request is not None
+            else None
+        )
+        if guide:
+            guidance.default_notice(self.runtime, db, guide, level)
+        elif level:
+            role = self.store.role(db, employee_id)
+            self.runtime.messaging.notice(
+                db,
+                [OWNER],
+                render("notices", "level_default", address=role["address"], **level),
+                subject=render("notices", "level_default_subject"),
+            )
 
     def _choose(self, prompt: str) -> dict:
         check_prompt_size(prompt, MAX_STAFFING_PROMPT_BYTES)
@@ -519,95 +632,101 @@ class Levels:
             raise ValueError("chooser reply must be a JSON object")
         return value
 
-    def _apply(self, employee_id, model_class, effort, reason, *, request) -> None:
+    def _apply(self, employee_id, model_class, effort, reason, *, request, db=None) -> None:
+        if db is None:
+            with self.store.transaction() as tx:
+                return self._apply(employee_id, model_class, effort, reason, request=request, db=tx)
         now = self.store.clock()
-        with self.store.transaction() as db:
-            record = self.record(db, employee_id)
-            if (
-                record is None
-                or record["state"] != "pending"
-                or self.store.role(db, employee_id)["employment"] != "active"
-                or record["attempts"] != request["attempts"]
-            ):
-                return
-            # The owner may have edited the configuration while the chooser ran.
-            config = self.runtime.accounts.config(db)
-            profile = (config.get("staffing") or {}).get("classes", {}).get(model_class)
-            if profile is None or profile not in config.get("profiles", {}):
-                raise FirmError(
-                    f"hiring level {model_class!r} no longer maps to a configured profile"
-                )
-            db.execute(
-                "UPDATE roles SET execution_profile=?,effort=? WHERE employee_id=?",
-                (profile, effort, employee_id),
+        record = self.record(db, employee_id)
+        if (
+            record is None
+            or record["state"] != "pending"
+            or self.store.role(db, employee_id)["employment"] != "active"
+            or record["attempts"] != request["attempts"]
+        ):
+            return
+        # The owner may have edited the configuration while the chooser ran.
+        config = self.runtime.accounts.config(db)
+        profile = (config.get("staffing") or {}).get("classes", {}).get(model_class)
+        if profile is None or profile not in config.get("profiles", {}):
+            raise FirmError(
+                f"hiring level {model_class!r} no longer maps to a configured profile"
             )
-            db.execute(
-                "UPDATE hire_levels SET state='chosen',attempts=attempts+1,retry_at=NULL,"
-                "model_class=?,effort=?,reason=?,updated_at=? WHERE employee_id=?",
-                (model_class, effort, reason, now, employee_id),
-            )
-            analysis_history.record(
-                db,
-                now,
-                "level.chosen",
-                employee_id,
-                model_class=model_class,
-                effort=effort,
-                profile=profile,
-                reason=_clip(reason, 500),
-                attempts=record["attempts"] + 1,
-            )
+        db.execute(
+            "UPDATE roles SET execution_profile=?,effort=? WHERE employee_id=?",
+            (profile, effort, employee_id),
+        )
+        db.execute(
+            "UPDATE hire_levels SET state='chosen',attempts=attempts+1,retry_at=NULL,"
+            "model_class=?,effort=?,reason=?,updated_at=? WHERE employee_id=?",
+            (model_class, effort, reason, now, employee_id),
+        )
+        analysis_history.record(
+            db,
+            now,
+            "level.chosen",
+            employee_id,
+            model_class=model_class,
+            effort=effort,
+            profile=profile,
+            reason=_clip(reason, 500),
+            attempts=record["attempts"] + 1,
+        )
 
     def _failed(
-        self, employee_id: str, reason: str, *, request, retry=True, notice=True
+        self, employee_id: str, reason: str, *, request, retry=True, notice=True, db=None
     ) -> dict | None:
+        if db is None:
+            with self.store.transaction() as tx:
+                return self._failed(
+                    employee_id, reason, request=request, retry=retry, notice=notice, db=tx
+                )
         now = self.store.clock()
-        with self.store.transaction() as db:
-            record = self.record(db, employee_id)
-            if (
-                record is None
-                or record["state"] != "pending"
-                or self.store.role(db, employee_id)["employment"] != "active"
-                or record["attempts"] != request["attempts"]
-            ):
-                return
-            attempts = record["attempts"] + 1
-            if retry and attempts < MAX_ATTEMPTS:
-                db.execute(
-                    "UPDATE hire_levels SET attempts=?,retry_at=?,reason=?,updated_at=? "
-                    "WHERE employee_id=?",
-                    (attempts, now + RETRY_DELAY_SECONDS * attempts, reason, now, employee_id),
-                )
-                return
-            role = self.store.role(db, employee_id)
-            model_class, effort = FALLBACK_LEVEL
+        record = self.record(db, employee_id)
+        if (
+            record is None
+            or record["state"] != "pending"
+            or self.store.role(db, employee_id)["employment"] != "active"
+            or record["attempts"] != request["attempts"]
+        ):
+            return
+        attempts = record["attempts"] + 1
+        if retry and attempts < MAX_ATTEMPTS:
             db.execute(
-                "UPDATE hire_levels SET state='defaulted',attempts=?,retry_at=NULL,"
-                "model_class=?,effort=?,reason=?,updated_at=? WHERE employee_id=?",
-                (attempts, model_class, effort, reason, now, employee_id),
+                "UPDATE hire_levels SET attempts=?,retry_at=?,reason=?,updated_at=? "
+                "WHERE employee_id=?",
+                (attempts, now + RETRY_DELAY_SECONDS * attempts, reason, now, employee_id),
             )
-            analysis_history.record(
+            return
+        role = self.store.role(db, employee_id)
+        model_class, effort = FALLBACK_LEVEL
+        db.execute(
+            "UPDATE hire_levels SET state='defaulted',attempts=?,retry_at=NULL,"
+            "model_class=?,effort=?,reason=?,updated_at=? WHERE employee_id=?",
+            (attempts, model_class, effort, reason, now, employee_id),
+        )
+        analysis_history.record(
+            db,
+            now,
+            "level.defaulted",
+            employee_id,
+            model_class=model_class,
+            effort=effort,
+            profile=role["execution_profile"],
+            reason=_clip(reason, 500),
+            attempts=attempts,
+        )
+        result = {
+            "model_class": model_class,
+            "effort": effort,
+            "reason": reason,
+            "attempts": attempts,
+        }
+        if notice:
+            self.runtime.messaging.notice(
                 db,
-                now,
-                "level.defaulted",
-                employee_id,
-                model_class=model_class,
-                effort=effort,
-                profile=role["execution_profile"],
-                reason=_clip(reason, 500),
-                attempts=attempts,
+                [OWNER],
+                render("notices", "level_default", address=role["address"], **result),
+                subject=render("notices", "level_default_subject"),
             )
-            result = {
-                "model_class": model_class,
-                "effort": effort,
-                "reason": reason,
-                "attempts": attempts,
-            }
-            if notice:
-                self.runtime.messaging.notice(
-                    db,
-                    [OWNER],
-                    render("notices", "level_default", address=role["address"], **result),
-                    subject=render("notices", "level_default_subject"),
-                )
-            return result
+        return result

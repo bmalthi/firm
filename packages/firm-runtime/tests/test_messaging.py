@@ -772,3 +772,19 @@ def test_summary_programming_errors_propagate_without_marking_read(mailroom, mon
         mail.introduce(alice, source["message_id"], [bob], [], True, "Join", request_id="intro")
     assert states(store, alice)[source["message_id"]] == "pending"
     assert scalar(store, "SELECT COUNT(*) FROM messages") == 1
+
+
+def test_sequence_counters_keep_single_row_across_rollbacks_and_reopen(mailroom):
+    store, mail, founder, (alice, *_), _ = mailroom
+    first = mail.send(founder, [alice], [], "First", request_id="s1")
+    with pytest.raises(RuntimeError):
+        with store.transaction():
+            mail.send(founder, [alice], [], "Rolled back", request_id="s2")
+            raise RuntimeError("abort")
+    mail.read(alice, first["message_id"])
+    reopened = Messaging(Store.scratch(store.path))
+    second = reopened.send(founder, [alice], [], "Second", request_id="s3")
+    assert (first["message_id"], second["message_id"]) == ("m1", "m2")
+    assert scalar(store, "SELECT COUNT(*) FROM message_sequence") == 1
+    assert scalar(store, "SELECT COUNT(*) FROM message_read_sequence") == 1
+    assert scalar(store, "SELECT sequence FROM message_read_sequence") == 1

@@ -893,7 +893,7 @@ def test_guidance_initial_wait_is_only_for_unborn_roles_with_staffing_and_select
     assert (admitted is None) == waits
     if waits:
         with runtime.store.transaction() as db:
-            db.execute("UPDATE roles SET guidance_state='defaulted'")
+            db.execute("UPDATE role_guidance SET state='defaulted'")
         assert runtime.admit() is not None
 
 
@@ -901,6 +901,8 @@ def test_guidance_initial_wait_is_only_for_unborn_roles_with_staffing_and_select
     "event", ["mail", "handoff", "recovery", "renewal", "promotion", "route", "stop-resume"]
 )
 def test_ordinary_events_reuse_guidance_without_an_assessment(tmp_path, event):
+    from firm_runtime import guidance
+
     runtime = Runtime(Store.scratch(tmp_path / "firm.sqlite3"))
     runtime.lifecycle.initialize("test", "Build", {
         "max_active": 4, "profiles": {"main": {"provider": "codex", "model": "test"}},
@@ -919,6 +921,8 @@ def test_ordinary_events_reuse_guidance_without_an_assessment(tmp_path, event):
     current = run(runtime)
     assert current.employee_id == employee
     before = guidance_role(runtime, employee)
+    with runtime.store.read() as db:
+        before_guide = guidance.record(db, employee)
     if event == "mail":
         runtime.owner.send_mail(OWNER, [employee], "Work", request_id="mail")
         runtime.finish(current.activation_id)
@@ -941,11 +945,17 @@ def test_ordinary_events_reuse_guidance_without_an_assessment(tmp_path, event):
     assert runtime.levels.tick(background=False) == []
     assert len(calls) == 2
     after = guidance_role(runtime, employee)
-    assert {k: v for k, v in before.items() if k.startswith("guidance_") or k in (
-        "scope_guidance", "functional_guidance"
-    )} == {k: v for k, v in after.items() if k.startswith("guidance_") or k in (
-        "scope_guidance", "functional_guidance"
-    )}
+    with runtime.store.read() as db:
+        after_guide = guidance.record(db, employee)
+    assert (
+        before["scope_guidance"],
+        before["functional_guidance"],
+        before_guide,
+    ) == (
+        after["scope_guidance"],
+        after["functional_guidance"],
+        after_guide,
+    )
     assert founder.employee_id == "founder"
 
 
@@ -975,7 +985,7 @@ def test_hire_birth_waits_for_guidance_after_its_level_succeeds(tmp_path):
     assert runtime.admit() is None
     with runtime.store.transaction() as db:
         assert runtime.levels.record(db, employee)["state"] == "chosen"
-        db.execute("UPDATE roles SET guidance_state='defaulted' WHERE employee_id=?", (employee,))
+        db.execute("UPDATE role_guidance SET state='defaulted' WHERE employee_id=?", (employee,))
     assert runtime.admit().employee_id == employee
 
 
@@ -1378,3 +1388,59 @@ def test_small_idle_snapshot_advances_past_lower_priority_oldest_thread(system, 
     assert snapshot_ids(runtime, second.context["inbox"]) == [newer["message_id"]]
     runtime.finish(second.activation_id)
     assert runtime.admit() is None
+
+
+def test_interrupted_or_failed_activation_preserves_wake_priority(system):
+    runtime, founder, now = system
+    runtime.start()
+    born = run(runtime)
+    runtime.finish(born.activation_id)
+    with runtime.store.transaction() as db:
+        runtime.messaging.notice(
+            db, [founder], "Control wake", subject="Control wake", priority=2
+        )
+    admitted = runtime.admit()
+    assert admitted is not None
+    runtime.finish(admitted.activation_id, "interrupted", category="owner_stop")
+    with runtime.store.read() as db:
+        row = db.execute(
+            "SELECT reason,priority FROM execution_requests WHERE employee_id=?",
+            (founder,),
+        ).fetchone()
+        assert dict(row) == {"reason": "interrupted_work", "priority": 2}
+    restarted = run(runtime)
+    runtime.finish(restarted.activation_id, "failed", category="transient")
+    with runtime.store.read() as db:
+        row = db.execute(
+            "SELECT reason,priority FROM execution_requests WHERE employee_id=?",
+            (founder,),
+        ).fetchone()
+        assert dict(row) == {"reason": "recovery", "priority": 2}
+
+
+def test_prestart_interrupted_idle_review_does_not_escalate_when_firm_busy(system):
+    runtime, founder, _ = system
+    with runtime.store.transaction() as db:
+        config = runtime.accounts.config(db)
+        config["max_active"] = 2
+        db.execute("UPDATE firm SET config_json=?", (encoded(config),))
+    peer = runtime.lifecycle.hire(
+        founder, "peer", "Help", "default", request_id="peer"
+    )["employee_id"]
+    runtime.start()
+    drain_births(runtime)
+    runtime.owner.send_mail(OWNER, [founder], "FYI only", action_recipients=[], request_id="fyi")
+    idle = runtime.admit()
+    assert idle is not None and idle.context.get("idle_inbox_review") is True
+    runtime.finish(idle.activation_id, "interrupted", category="owner_stop")
+    assert count(runtime, "scheduling_opportunities") == 0
+    assert frontier(runtime, founder) == 0
+    runtime.owner.send_mail(OWNER, [peer], "Action for peer", request_id="peer-work")
+    busy = run(runtime)
+    assert busy.employee_id == peer
+    assert runtime.admit() is None
+    runtime.finish(busy.activation_id)
+    reopened = runtime.admit()
+    assert reopened is not None
+    assert reopened.employee_id == founder
+    assert reopened.context.get("idle_inbox_review") is True

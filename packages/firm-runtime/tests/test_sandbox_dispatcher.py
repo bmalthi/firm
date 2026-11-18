@@ -501,7 +501,7 @@ def test_settlement_stores_usage_without_reclaim(system):
         row = db.execute("SELECT * FROM sandbox_run_settlements").fetchone()
         assert row["run_id"] == run_id
         assert json.loads(row["usage_json"]) == box.usage
-        assert row["reclaim_json"] is None
+        assert "reclaim_json" not in row.keys()
 
 
 def test_unresolved_slice_keeps_admission_until_cleanup_retries_successfully(system, monkeypatch):
@@ -1113,14 +1113,25 @@ def test_host_restart_preserves_activity_history_without_resuming_role(system):
         box.invocations[run_id][2] = b'{"session":"native-session"}'
         dispatcher.tick()
     with runtime.store.read() as db:
-        before = dict(db.execute("SELECT * FROM execution_activity").fetchone())
+        before = dict(
+            db.execute(
+                "SELECT activation_id,idle_timeout,output_digest FROM sandbox_runs"
+            ).fetchone()
+        )
         deadline = db.execute("SELECT deadline FROM sandbox_runs").fetchone()["deadline"]
     recovered = Runtime(Store.scratch(runtime.store.path, clock=runtime.store.clock))
     with host((recovered, box, provider)) as dispatcher:
         dispatcher.reconcile()
         assert len(box.stops) == 1
         with recovered.store.read() as db:
-            assert dict(db.execute("SELECT * FROM execution_activity").fetchone()) == before
+            assert (
+                dict(
+                    db.execute(
+                        "SELECT activation_id,idle_timeout,output_digest FROM sandbox_runs"
+                    ).fetchone()
+                )
+                == before
+            )
             row = db.execute("SELECT deadline,stop_cause FROM sandbox_runs").fetchone()
             assert row["deadline"] == deadline
             assert row["stop_cause"] == "host_restart"
@@ -2304,10 +2315,11 @@ def test_agy_model_quota_refused_again_after_its_reset_pauses_again_at_no_cost(
     assert len(set(seen)) == 3
 
 
-def test_expiry_poisoned_agy_resume_uses_existing_bounded_role_retry(system, monkeypatch):
+def test_poisoned_agy_result_error_discards_session_for_fresh_retry(system, monkeypatch):
     from test_agy_provider import FIXTURES, encode
 
     from firm_runtime.agy_provider import parse_result
+    from firm_runtime.provider_contract import ProviderResult
 
     runtime, box, provider = system
     clock = [runtime.store.clock()]
@@ -2317,28 +2329,41 @@ def test_expiry_poisoned_agy_resume_uses_existing_bounded_role_retry(system, mon
     parsed = parse_result(logs, 0)
     assert not parsed.success and not parsed.interrupted
     assert parsed.provider_session_id and parsed.error.category == "unknown"
+    provider.name = "agy"
     provider.parse_result = lambda *_: parse_result(logs, 0)
-    session = None
+    sessions = []
     with host(system) as dispatcher:
         dispatcher.start()
-        for attempt in range(4):
+        for attempt in range(2):
             invocation = launch(dispatcher, runtime)
-            session = session or invocation.session_id
-            assert invocation.session_id == session
+            sessions.append(invocation.session_id)
             run = next(reversed(box.invocations))
+            if attempt == 1:
+                with runtime.store.transaction() as db:
+                    db.execute(
+                        "UPDATE activations SET mcp_catalog_listed_at=? WHERE activation_id=?",
+                        (clock[0], invocation.activation_id),
+                    )
+                provider.parse_result = lambda *_: ProviderResult(
+                    parsed.provider_session_id, True, "recovered", None
+                )
             box.complete(run)
             assert dispatcher.tick() == []
             with runtime.store.read() as db:
                 activation = runtime._activation(db, invocation.activation_id)
                 role = runtime.store.role(db, "founder")
-                assert activation["state"] == "failed"
-                assert role["attempt_count"] == attempt + 1
-                if attempt < 3:
+                if attempt == 0:
+                    assert activation["state"] == "failed"
+                    assert role["attempt_count"] == 1
+                    assert role["session_id"] is None
                     assert role["hold_reason"] is None
                     clock[0] = role["retry_at"]
                 else:
-                    assert role["hold_reason"] == "attempts_exhausted"
-        assert provider.resumed == [None, *([parsed.provider_session_id] * 3)]
+                    assert activation["state"] == "completed"
+                    assert role["attempt_count"] == 0
+                    assert role["hold_reason"] is None
+        assert len(set(sessions)) == 2
+        assert provider.resumed == [None, None]
         assert dispatcher.tick() == []
         assert runtime.accounts.status()["incidents"] == []
 
@@ -2367,7 +2392,7 @@ def test_completed_handoff_cleanup_is_consumed_by_next_started_period(system, cl
         assert launched_spec(dispatcher, box, following).clean_up is False
 
 
-def test_idle_handoff_cleanup_repeats_after_dispatcher_reopen(system, monkeypatch):
+def test_idle_handoff_cleanup_does_not_repeat_after_dispatcher_reopen(system, monkeypatch):
     runtime, box, _ = system
     with host(system) as dispatcher:
         dispatcher.start()
@@ -2380,7 +2405,7 @@ def test_idle_handoff_cleanup_repeats_after_dispatcher_reopen(system, monkeypatc
     with host(system) as reopened:
         (next_period,) = reopened.tick()
         assert launched_spec(reopened, box, next_period).clean_up is False
-        assert box.disposals == ["r-founder", "r-founder"]
+        assert box.disposals == ["r-founder"]
 
 
 def test_prestart_failure_keeps_handoff_cleanup_obligation(system, monkeypatch):
@@ -2531,7 +2556,8 @@ def test_waiting_handoff_is_cleaned_once_without_another_period(
         box.complete(sandbox_run_id(actor.activation_id))
         assert dispatcher.tick() == []
         assert box.disposals == ["r-founder"]
-        assert actor.activation_id in dispatcher._cleaned
+        with runtime.store.read() as db:
+            assert runtime._activation(db, actor.activation_id)["cleaned_up_at"] is not None
         assert "Idle-role cleanup for r-founder" in caplog.text
         assert "reclaim" in caplog.text
         dispatcher.tick()
@@ -2565,7 +2591,8 @@ def test_handoff_disposal_exception_backs_off_but_next_start_still_cleans(system
         now[0] += 1
         dispatcher.tick()
         assert attempts == ["r-founder", "r-founder"]
-        assert actor.activation_id not in dispatcher._cleaned
+        with runtime.store.read() as db:
+            assert runtime._activation(db, actor.activation_id)["cleaned_up_at"] is None
         runtime.owner.send_mail(OWNER, ["founder"], "New work", request_id="wake")
         (next_period,) = dispatcher.tick()
         assert launched_spec(dispatcher, box, next_period).clean_up is True
@@ -2653,8 +2680,8 @@ def test_expired_appointment_disposes_once_keeps_identity_and_can_expire_again(
         assert dispatcher.tick() == []
         assert dispatcher.tick() == []
         assert box.disposals == [role_id] and box.retirements == []
-        assert analyst.activation_id in dispatcher._cleaned
         with runtime.store.read() as db:
+            assert runtime._activation(db, analyst.activation_id)["cleaned_up_at"] is not None
             role = runtime.store.role(db, analyst.employee_id)
             assert role["employment"] == "active" and role["session_id"] == analyst.session_id
             assert runtime.appointments.terms(db, analyst.employee_id)["remaining_periods"] == 0
@@ -2667,10 +2694,11 @@ def test_expired_appointment_disposes_once_keeps_identity_and_can_expire_again(
         box.complete(sandbox_run_id(next_period.activation_id))
         assert dispatcher.tick() == []
         assert box.disposals == [role_id, role_id]
-        assert next_period.activation_id in dispatcher._cleaned
+        with runtime.store.read() as db:
+            assert runtime._activation(db, next_period.activation_id)["cleaned_up_at"] is not None
     with host(system) as reopened:
         assert reopened.tick() == []
-        assert box.disposals == [role_id] * 3
+        assert box.disposals == [role_id] * 2
         assert box.retirements == []
 
 
@@ -2758,7 +2786,8 @@ def test_expiry_exception_backs_off_and_does_not_add_next_launch_fallback(system
         now[0] += 1
         dispatcher.tick()
         assert attempts == [role_id, role_id]
-        assert analyst.activation_id not in dispatcher._cleaned
+        with runtime.store.read() as db:
+            assert runtime._activation(db, analyst.activation_id)["cleaned_up_at"] is None
         tools.renew_temporary(analyst.employee_id, 1, "renew")
         (next_period,) = dispatcher.tick()
         assert launched_spec(dispatcher, box, next_period).clean_up is False
@@ -2816,4 +2845,5 @@ def test_renewal_after_expiry_selection_skips_disposal(system, monkeypatch):
         assert next_period.employee_id == analyst.employee_id
         assert launched_spec(dispatcher, box, next_period).clean_up is False
         assert box.disposals == [] and box.retirements == []
-        assert analyst.activation_id not in dispatcher._cleaned
+        with runtime.store.read() as db:
+            assert runtime._activation(db, analyst.activation_id)["cleaned_up_at"] is None
