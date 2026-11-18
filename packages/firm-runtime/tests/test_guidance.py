@@ -47,8 +47,8 @@ def hire(runtime, manager="founder", slug="worker", **kwargs):
 
 
 def test_packaged_catalog_and_all_bodies():
-    assert len(guidance.catalog()) == 20
-    assert len(guidance.chooser_entries()) == 18
+    assert len(guidance.catalog()) == 22
+    assert len(guidance.chooser_entries()) == 20
     assert all(guidance.body(e["id"]).startswith("### ") for e in guidance.catalog())
 
 

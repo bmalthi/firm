@@ -17,7 +17,7 @@ from firm_runtime.provider_contract import (
     SubscriptionObservation,
 )
 from firm_runtime.runtime import Runtime
-from firm_runtime.sandbox_dispatcher import SandboxDispatcher
+from firm_runtime.sandbox_dispatcher import SandboxDispatcher, _offered_catalog
 from firm_runtime.store import OWNER, Store
 from firm_runtime.workspaces import grants_for, sandbox_role_id, sandbox_run_id
 
@@ -464,8 +464,17 @@ def test_role_launch_request_carries_catalog_and_configured_task_deadline(system
         assert request.run_id == sandbox_run_id(call.activation_id)
         assert request.mcp_url == "http://127.0.0.1:9000/mcp"
         assert request.provider_session_id is None
-        assert request.offered_tools == tuple(tool["name"] for tool in dispatcher._tool_catalog)
+        expected = tuple(
+            tool["name"]
+            for tool in _offered_catalog(
+                dispatcher._tool_catalog, {"mac": False, "github": False}
+            )
+        )
+        assert request.offered_tools == expected
         assert "task" in request.offered_tools
+        assert "request_access" in request.offered_tools
+        assert "create_repository" not in request.offered_tools
+        assert not any(t.startswith(("mac_", "desktop_")) for t in request.offered_tools)
         assert request.task_timeout_seconds == 947
 
 
@@ -1652,7 +1661,7 @@ def test_grants_separate_private_workspace_and_name_no_other_line(system):
 def test_launch_adds_github_helper_and_identity_only_with_github(system, monkeypatch, configured):
     from firm_runtime import github
 
-    runtime, box, _ = system
+    runtime, box, provider = system
     if configured:
         monkeypatch.setattr(
             github,
@@ -1677,6 +1686,17 @@ def test_launch_adds_github_helper_and_identity_only_with_github(system, monkeyp
     spec = box.specs[sandbox_run_id(invocation.activation_id)]
     assert ("github-credential" in spec.secrets) is configured
     assert invocation.context["capabilities"]["github"] is configured
+    offered = provider.requests[-1].offered_tools
+    assert ("create_repository" in offered) is configured
+    assert "request_access" in offered
+    provenance_path = (
+        runtime.store.path.parent
+        / "inputs/activations"
+        / invocation.activation_id
+        / "provenance.json"
+    )
+    provenance = json.loads(provenance_path.read_text())
+    assert tuple(t["name"] for t in provenance["offered_role_tools"]) == offered
     if configured:
         assert spec.env["FIRM_GITHUB_URL"] == "http://127.0.0.1:9000/github/token"
         assert spec.env["GIT_AUTHOR_NAME"] == spec.env["GIT_COMMITTER_NAME"] == "founder"
@@ -1721,7 +1741,7 @@ def test_launch_adds_the_image_key_only_with_google_cloud(system, tmp_path, conf
 def test_launch_describes_the_mac_available_to_the_sandbox(system, mac_source):
     from dataclasses import replace
 
-    runtime, box, _ = system
+    runtime, box, provider = system
     configured = mac_source != "none"
     box.config = replace(
         box.config, mac_image=str(box.config.root / "image") if mac_source == "image" else None
@@ -1731,6 +1751,10 @@ def test_launch_describes_the_mac_available_to_the_sandbox(system, mac_source):
         dispatcher.start()
         invocation = launch(dispatcher, runtime)
     assert invocation.context["capabilities"]["mac"] is configured
+    offered = provider.requests[-1].offered_tools
+    assert ("mac_acquire" in offered) is configured
+    assert ("desktop_capture" in offered) is configured
+    assert any(t.startswith(("mac_", "desktop_")) for t in offered) is configured
 
 
 def test_single_host_covers_database_and_sandbox(system, tmp_path):

@@ -39,6 +39,17 @@ RUN_JOURNAL_RETENTION = 7 * 24 * 60 * 60  # A week for postmortems; host history
 RUN_JOURNAL_SWEEP_INTERVAL = 60 * 60
 
 
+def _offered_catalog(catalog: list[dict], capabilities: dict) -> list[dict]:
+    mac = capabilities.get("mac") is True
+    github = capabilities.get("github") is True
+    return [
+        tool
+        for tool in catalog
+        if (mac or not tool["name"].startswith(("mac_", "desktop_")))
+        and (github or tool["name"] != "create_repository")
+    ]
+
+
 class SandboxDispatcher:
     def __init__(
         self,
@@ -1111,6 +1122,7 @@ class SandboxDispatcher:
                         {"project": image_access["project"]} if image_access else None
                     ),
                 }
+                offered = _offered_catalog(self._tool_catalog, invocation.context["capabilities"])
                 profile = binding["profile"] if binding else role["execution_profile"]
                 if session and session["execution_profile"] != profile:
                     raise FirmError("retained conversation cannot silently change providers")
@@ -1131,7 +1143,7 @@ class SandboxDispatcher:
                         run_id=run_id,
                         mcp_url=self.mcp_url,
                         provider_session_id=session["native_session_id"] if session else None,
-                        offered_tools=tuple(tool["name"] for tool in self._tool_catalog),
+                        offered_tools=tuple(tool["name"] for tool in offered),
                         task_timeout_seconds=config["task"]["timeout_seconds"],
                     ),
                     layout=layout,
@@ -1168,7 +1180,7 @@ class SandboxDispatcher:
                         "session_id": invocation.session_id,
                         "native_session_id": session["native_session_id"] if session else None,
                         "execution_profile": profile,
-                        "offered_role_tools": self._tool_catalog,
+                        "offered_role_tools": offered,
                     },
                 )
             except Exception as exc:

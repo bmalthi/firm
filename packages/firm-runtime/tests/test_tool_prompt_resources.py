@@ -64,11 +64,14 @@ def test_tool_descriptions_are_resource_backed_and_keep_registered_operations():
 def test_request_access_names_its_kinds_resources_and_refusals():
     text = TOOL_DESCRIPTIONS["request_access"]
     for term in (
-        "network_host", "resource", "pending", "cause", "finish normally",
-        "access_kind_unknown", "access_resource_invalid", "access_denied",
+        "network_host", "github_repository", "resource", "pending", "cause",
+        "access_kind_unknown", "access_resource_invalid", "github_not_configured",
+        "github_unavailable", "access_denied",
     ):
         assert term in text
-    assert "hand off only when you need a fresh start" in text
+    assert "finish normally" not in text
+    assert "finish normally" in render("results", "access_pending")
+    assert "hand off only when you need a fresh start" in render("results", "access_pending")
     assert "ask the owner" not in text.lower() and "host" not in text.split("Kinds:")[0]
 
 
@@ -225,13 +228,11 @@ def test_handoff_cleanup_parameter_and_description_contract(tmp_path):
         "Before your next work period, stopped Docker containers, dangling images and "
         "build cache are removed and scratch is emptied; tagged images and volumes stay.")
     assert (
-        "Set clean_up only when the work in scratch and Docker is finished: "
-        "before your next work period, "
-        "stopped containers, dangling images and build cache are removed and scratch is emptied "
-        "(tagged images and volumes stay). Leave it unset for a fresh start mid-task, and name "
-        "anything in scratch the next period relies on in your notes. "
+        "Set clean_up only when work in scratch and Docker is finished; leave it unset "
+        "mid-task and name anything in scratch the next period relies on in your notes. "
         "Identical retries apply within this period."
     ) in TOOL_DESCRIPTIONS["handoff"]
+    assert "dangling images" not in TOOL_DESCRIPTIONS["handoff"]
 
 
 
@@ -278,6 +279,7 @@ def test_prompts_use_us_english_and_task_worker_prompt_is_resource_backed():
         r"(?:un)?authoris(?:e|ed|ing)|"
         r"recognis(?:e|ed|ing|able)|"
         r"labell(?:ed|ing)|"
+        r"cancell(?:ed|ing)|"
         r"honour(?:s|ed|ing)?|"
         r"labour(?:s|ed|ing)?|"
         r"artefacts?|"

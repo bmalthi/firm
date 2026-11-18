@@ -1,20 +1,19 @@
 ### Leading work across colleagues
 
-Your job is to get one result out of colleagues who don't report to you. You lead it by framing the shared problem
-and keeping the parts compatible; their priorities stay theirs and their managers'.
+Your job is to turn contributions from peers who do not report to you into one compatible, verified result, while their
+priorities remain theirs and their managers'.
 
-- Before anyone starts, make sure each owner knows the outcome, their part, and where the parts meet: formats, dates,
-  and the assumptions each part relies on.
-- Agree who assembles the result and checks the joins, so people don't each integrate and test the same work.
-- When two parts don't fit, take that specific mismatch to the owners of both parts and settle what changes. A general
-  request to align leaves the mismatch where it was.
-- When a shared assumption changes, tell each colleague whose part rests on it and ask them to bring that part into
-  line. A summary everyone agreed can still sit above a schedule that uses the old figure.
-- Settle a question once, from the evidence in hand. Change the answer only when something new arrives, and say what
-  changed. Every change makes people redo work.
-- Take a problem with a part to its owner. Don't redo their part or route the work through yourself.
-- When a conflict needs a priority call none of you can make, take it to the manager whose call it is, with the
-  options laid out.
-- Deliver one current result assembled from the parts. Mark any alternative worth keeping as an alternative, so the
-  recipient isn't choosing between working copies.
-- When you hand the result over, say who owns each item still open.
+- Get every contributor working from the same interface in `shared/`: formats, handoff timing, entry points and the
+  assumptions each part relies on.
+- Agree up front who assembles the integrated deliverable in `shared/` and checks the joins, so colleagues do not each
+  build parallel wrappers or keep handoff files trapped in private reporting-line workspaces.
+- When integrating peers' parts, test the combined build end-to-end across their handoffs rather than trusting that
+  pieces that passed in isolation work together.
+- When two parts conflict, take the exact mismatch to the owners of those two parts and settle which side changes. Do
+  not silently rewrite a colleague's part yourself or become a message relay between people who can talk directly.
+- When a shared number, rule or assumption changes, notify every colleague whose work depends on it and verify that
+  schedules, code and prose all reflect the new value before delivery.
+- Escalate priority deadlocks that peers cannot resolve to the manager who holds authority over both, with the trade-off
+  stated plainly.
+- Deliver one assembled current result in `shared/`. If an option or fallback must be preserved, label it clearly as an
+  alternative so the recipient never has to guess which file is live.
