@@ -472,12 +472,10 @@ def validate_config(config: dict) -> dict:
         validate_context_policy(profile, name)
     from .accounts import validate_accounts
     from .github import validate_github
-    from .google_cloud import validate_google_cloud
     from .notify import validate_owner
 
     validate_accounts(config)
     validate_github(config)
-    validate_google_cloud(config)
     validate_owner(config)
     try:
         encoded(config)

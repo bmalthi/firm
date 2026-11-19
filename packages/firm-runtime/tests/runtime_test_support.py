@@ -263,9 +263,6 @@ class FakeProvider:
     def build_summary_spec(self, request, layout):
         raise NotImplementedError("role fake has no isolated runner")
 
-    def build_task_spec(self, request, layout):
-        raise NotImplementedError("role fake has no isolated runner")
-
     def parse_summary(self, logs, exit_code):
         raise NotImplementedError("role fake has no isolated runner")
 

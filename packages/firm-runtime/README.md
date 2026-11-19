@@ -46,6 +46,6 @@ uv run pytest -q packages/firm-runtime/tests/test_analysis.py
 
 ## Experimental AGY
 
-The experimental `agy` subscription provider uses CLI 1.5.3 and yields long turns
+The experimental `agy` subscription provider uses CLI 1.5.11 and yields long turns
 before token expiry; see [setup and limits](../../docs/installation.md#experimental-agy-integration)
 and [runtime configuration](../../docs/runtime.md#experimental-agy-configuration).

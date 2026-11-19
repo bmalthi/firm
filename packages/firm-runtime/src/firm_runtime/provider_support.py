@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import re
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
@@ -13,9 +12,11 @@ from .prompt_resources import prompt, render
 from .runtime import Invocation
 from .store import OWNER
 
+MCP_TIMEOUT_SECONDS = 120
+
 
 def role_mcp_settings(request) -> tuple[tuple[str, ...], int]:
-    """Validate Firm exposure and budget a native call beyond task cleanup."""
+    """Validate Firm exposure and return the MCP call timeout in seconds."""
     # Keep metadata-only provider imports independent of the MCP implementation.
     from .mcp_server import TOOL_DESCRIPTIONS
 
@@ -30,12 +31,7 @@ def role_mcp_settings(request) -> tuple[tuple[str, ...], int]:
         or not set(names) <= TOOL_DESCRIPTIONS.keys()
     ):
         raise ValueError("offered Firm tools must be a unique subset of the Firm catalog")
-    timeout = request.task_timeout_seconds
-    # Task cancellation permits a 60-second stop_child RPC. Five more seconds
-    # allow its result to cross the MCP transport. Claude's native timer is int32 ms.
-    if type(timeout) not in (int, float) or not 0 < timeout <= 2_147_418:
-        raise ValueError("task timeout must be finite, positive and at most 2147418 seconds")
-    return names, math.ceil(timeout) + 65
+    return names, MCP_TIMEOUT_SECONDS
 
 
 def canonical_uuid(value: str, label: str) -> str:
@@ -114,17 +110,26 @@ def standing(context: dict) -> str:
     capabilities = context.get("capabilities") or {}
     if not isinstance(capabilities, dict):
         raise ValueError("invocation capabilities must be an object")
+    llm_clis = [
+        name for name in (capabilities.get("llm") or ())
+        if isinstance(name, str) and name in {"claude", "codex", "agy"}
+    ]
+    if llm_clis:
+        plural = "" if len(llm_clis) == 1 else "s"
+        llm_section = [render("workplace", "llm_intro", plural=plural), ""]
+        llm_section.extend(render("workplace", f"llm_{name}") for name in llm_clis)
+        llm_section.append("")
+        llm_section.append(
+            render(
+                "workplace",
+                "llm_boundaries",
+                max_concurrent=capabilities.get("llm_max_concurrent", 2),
+            )
+        )
+        workplace.append("\n" + "\n".join(llm_section) + "\n")
     enabled = []
     if capabilities.get("github") is True:
         enabled.append(render("workplace", "capability_github"))
-    google_cloud = capabilities.get("google_cloud")
-    if isinstance(google_cloud, dict) and isinstance(google_cloud.get("project"), str):
-        if google_cloud["project"]:
-            enabled.append(
-                render(
-                    "workplace", "capability_google_cloud", project=google_cloud["project"]
-                )
-            )
     if capabilities.get("mac") is True:
         enabled.append(render("workplace", "capability_mac"))
     if enabled:

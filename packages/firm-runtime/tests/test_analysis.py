@@ -1167,7 +1167,7 @@ def test_summary_usage_captures_caller_configured_and_reported_model(system):
     model = next(
         r for r in report["rows"] if r["type"] == "model" and r["label"][1] != "captured-model"
     )
-    assert model["label"] == ["codex", "gpt-6-luna"]
+    assert model["label"] == ["codex", "gpt-6.1-terra"]
     assert model["resolved_models"] == ["reported-luna"]
     assert model["missing_resolved_model_identity"] == 0
     with runtime.store.transaction() as db:
@@ -1180,7 +1180,7 @@ def test_summary_usage_captures_caller_configured_and_reported_model(system):
     assert report["summary_totals"]["output_tokens"]["value"] == 40
 
 
-def test_task_usage_is_separate_attributed_and_keeps_unknowns(system):
+def test_llm_usage_is_separate_attributed_and_keeps_unknowns(system):
     runtime, _, reader = system
     invocation = start(runtime)
     runtime.record_usage(invocation.activation_id, ProviderUsage(input_tokens=100, source="test"))
@@ -1196,7 +1196,7 @@ def test_task_usage_is_separate_attributed_and_keeps_unknowns(system):
             db.execute(
                 "INSERT INTO summary_runs(run_id,started_at,finished_at,state,reason,input_bytes,"
                 "input_tokens,resolved_model,kind,caller_activation_id,provider,account_id) "
-                "VALUES(?,?,1010,?,?,0,?,?,'task',?,'codex','a')",
+                "VALUES(?,?,1010,?,?,0,?,?,'llm',?,'codex','a')",
                 (run_id, at, state, reason, tokens, model, invocation.activation_id),
             )
             analysis_history.summary_bound(
@@ -1211,30 +1211,30 @@ def test_task_usage_is_separate_attributed_and_keeps_unknowns(system):
     }
     assert report["role_totals"]["input_tokens"]["value"] == 100
     assert report["summary_totals"]["input_tokens"]["value"] == 20
-    assert report["task_totals"]["input_tokens"] == {
+    assert report["llm_totals"]["input_tokens"] == {
         "value": 30, "measured": 1, "eligible": 2, "complete": False,
     }
-    tasks = read(reader, "usage", row_type="task", employee_id="founder")
-    assert tasks["total_rows"] == 2
-    assert tasks["role_labels"]["founder"]["address"] == "founder"
-    assert tasks["coverage"]["limits"]
-    assert all(row["activation_id"] == invocation.activation_id for row in tasks["rows"])
-    succeeded = next(row for row in tasks["rows"] if row["run_id"] == "worker-ok")
+    llms = read(reader, "usage", row_type="llm", employee_id="founder")
+    assert llms["total_rows"] == 2
+    assert llms["role_labels"]["founder"]["address"] == "founder"
+    assert llms["coverage"]["limits"]
+    assert all(row["activation_id"] == invocation.activation_id for row in llms["rows"])
+    succeeded = next(row for row in llms["rows"] if row["run_id"] == "worker-ok")
     assert succeeded["model"] == "worker-model"
     assert succeeded["resolved_model"] == "reported-worker"
     assert dump(runtime) == before
     # Missing best-effort binding history loses configured model, not durable caller identity.
     with runtime.store.transaction() as db:
         db.execute("DELETE FROM analysis_events WHERE kind='summary.bound'")
-    tasks = reader.read("usage", from_at=1001, until=1020, row_type="task", employee_id="founder")
-    assert tasks["total_rows"] == 2  # Caller admission is outside this window.
-    assert tasks["task_totals"]["input_tokens"]["value"] == 30
-    assert tasks["role_totals"]["input_tokens"]["eligible"] == 0
-    assert all(row["model"] is None for row in tasks["rows"])
-    assert tasks["role_labels"]["founder"]["address"] == "founder"
+    llms = reader.read("usage", from_at=1001, until=1020, row_type="llm", employee_id="founder")
+    assert llms["total_rows"] == 2  # Caller admission is outside this window.
+    assert llms["llm_totals"]["input_tokens"]["value"] == 30
+    assert llms["role_totals"]["input_tokens"]["eligible"] == 0
+    assert all(row["model"] is None for row in llms["rows"])
+    assert llms["role_labels"]["founder"]["address"] == "founder"
 
 
-def test_task_timeline_outcomes_overlap_and_unconfirmed_cleanup(system):
+def test_llm_timeline_outcomes_overlap_and_unconfirmed_cleanup(system):
     runtime, now, reader = system
     invocation = start(runtime)
     now[0] = 1030
@@ -1246,15 +1246,15 @@ def test_task_timeline_outcomes_overlap_and_unconfirmed_cleanup(system):
         ):
             db.execute(
                 "INSERT INTO summary_runs(run_id,started_at,finished_at,state,reason,input_bytes,"
-                "kind,caller_activation_id) VALUES(?,1002,?,?,?,0,'task',?)",
+                "kind,caller_activation_id) VALUES(?,1002,?,?,?,0,'llm',?)",
                 (run_id, finished, state, reason, invocation.activation_id),
             )
     before = dump(runtime)
     report = reader.read(
-        "timeline", from_at=1010, until=1025, row_type="task", employee_id="founder"
+        "timeline", from_at=1010, until=1025, row_type="llm", employee_id="founder"
     )
     rows = {row["run_id"]: row for row in report["rows"]}
-    assert report["activation_count"] == 1 and report["task_count"] == 3
+    assert report["activation_count"] == 1 and report["llm_count"] == 3
     assert rows["complete"]["outcome"] == "completed"
     assert rows["timeout"]["reason"] == "timeout"
     assert rows["timeout"]["outcome"] == "unavailable"
@@ -1268,11 +1268,11 @@ def test_task_timeline_outcomes_overlap_and_unconfirmed_cleanup(system):
     assert report["coverage"]["limits"]
     assert "instruction" not in json.dumps(report)
     assert "answer" not in json.dumps(report)
-    page = read(reader, "timeline", row_type="task", limit=1)
-    rest = read(reader, "timeline", row_type="task", limit=2, cursor=page["next_cursor"])
+    page = read(reader, "timeline", row_type="llm", limit=1)
+    rest = read(reader, "timeline", row_type="llm", limit=2, cursor=page["next_cursor"])
     assert {r["id"] for r in page["rows"]}.isdisjoint({r["id"] for r in rest["rows"]})
     assert len(rest["rows"]) == 2
-    assert "include child tasks" in read(reader, "resources")["semantics"]
+    assert "include guest LLM CLI processes" in read(reader, "resources")["semantics"]
     assert dump(runtime) == before
 
 
@@ -1883,17 +1883,17 @@ def test_readiness_distinguishes_conditional_review_from_offered_pending_mail(sy
     )
 
 
-def test_readiness_counts_non_borrowed_running_tasks_in_account_occupancy(system):
+def test_readiness_counts_non_borrowed_running_llm_calls_in_account_occupancy(system):
     runtime, now, reader = system
     first = start(runtime)
     with runtime.store.transaction() as db:
         bound_account = runtime.accounts.binding(db, first.session_id)["account_id"]
-        # First running task borrows the live caller's slot; second takes an extra slot.
+        # First same-account CLI call borrows the live caller's slot; second takes an extra slot.
         for idx in (1, 2):
             db.execute(
                 "INSERT INTO summary_runs(run_id,started_at,state,input_bytes,account_id,"
                 "profile,provider,kind,caller_activation_id) "
-                "VALUES(?,1001,'running',0,?,'main','codex','task',?)",
+                "VALUES(?,1001,'running',0,?,'main','codex','llm',?)",
                 (f"t{idx}", bound_account, first.activation_id),
             )
     with runtime.store.transaction() as db:

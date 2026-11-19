@@ -66,8 +66,8 @@ CLI; all VM lifecycle operations go through `Sandbox`.
 Sandbox-only `init` validates the configuration and owner-controlled state directory
 without creating a runtime database or starting a VM. No release marker is required.
 
-The guest recipe pins AGY CLI **1.5.3** (experimental, Linux ARM64 glibc) and
-verifies its vendor SHA-512 before extraction. `src/firm_sandbox/assets/linux-base.yaml`
+The guest recipe pins Claude Code **2.1.327**, Codex **0.170.0**, and AGY CLI **1.5.11**
+(experimental, Linux ARM64 glibc), and verifies AGY's vendor SHA-512 before extraction. `src/firm_sandbox/assets/linux-base.yaml`
 records the URL/checksum from the
 [official installer's](https://antigravity.google/cli/install.sh)
 [ARM64 manifest](https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_arm64.json).

@@ -111,8 +111,8 @@ def test_omitted_staffing_enables_chooser_with_same_provider_and_accounts(tmp_pa
     assert chooser["accounts"] == ["personal"]
     assert chooser["effort"] == "medium"
     assert [resolved["profiles"][staffing["classes"][c]]["model"] for c in levels.CLASSES] == list(
-        {"codex": ("gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra"),
-         "claude": ("sonnet", "opus", "claude-fable-5-1")}[provider]
+        {"codex": ("gpt-6.1-terra", "gpt-6.2-sol", "gpt-6.2-astra"),
+         "claude": ("sonnet", "opus", "fable")}[provider]
     )
     assert all(p["provider"] == provider for p in resolved["profiles"].values())
     assert (role(runtime, "founder")["execution_profile"], role(runtime, "founder")["effort"]) == (

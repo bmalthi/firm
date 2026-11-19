@@ -63,7 +63,7 @@ def test_defaults_keep_provider_class_and_context_on_each_route(system):
         model_index = 0 if level == "chooser" else index
         assert (first["provider"], first["model"], first["accounts"], first["context_window"]) == (
             "codex",
-            ("gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra")[model_index],
+            ("gpt-6.1-terra", "gpt-6.2-sol", "gpt-6.2-astra")[model_index],
             ["c1", "c2"],
             256000,
         )
@@ -72,7 +72,7 @@ def test_defaults_keep_provider_class_and_context_on_each_route(system):
             second["model"],
             second["accounts"],
             second["context_window"],
-        ) == ("claude", ("sonnet", "opus", "claude-fable-5-1")[model_index], ["a1", "a2"], 500000)
+        ) == ("claude", ("sonnet", "opus", "fable")[model_index], ["a1", "a2"], 500000)
         assert first["effort"] == ("medium" if level in {"high", "chooser"} else "high")
         assert second["effort"] == ("medium" if level == "chooser" else "high")
 

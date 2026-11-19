@@ -70,16 +70,16 @@ def _prepare_home(runtime_session_id: str) -> None:
     _directory(session_root)
     sessions = session_root / "sessions"
     _directory(sessions)
+    generated_images = session_root / "generated_images"
+    _directory(generated_images)
 
     codex_home = _codex_home()
     codex_home.mkdir(mode=0o700)
     auth = codex_home / "auth.json"
-    if os.environ.get("FIRM_TASK_RUN") == "1":
-        auth.symlink_to(_auth_source())
-    else:
-        shutil.copyfile(_auth_source(), auth)
-        auth.chmod(0o600)
+    shutil.copyfile(_auth_source(), auth)
+    auth.chmod(0o600)
     (codex_home / "sessions").symlink_to(sessions, target_is_directory=True)
+    (codex_home / "generated_images").symlink_to(generated_images, target_is_directory=True)
 
 
 def _safe_code(value: object) -> str | None:
@@ -95,6 +95,30 @@ def _event(kind: str, code: str | None = None) -> None:
     print(json.dumps(event), flush=True)
 
 
+def safe_call_id(value: object) -> str | None:
+    """Return a bounded ASCII tool call identifier, or None if malformed."""
+    if (
+        isinstance(value, str)
+        and 0 < len(value) <= 128
+        and all((char.isascii() and char.isalnum()) or char in "._:-" for char in value)
+    ):
+        return value
+    return None
+
+
+def _image_generation_event(payload: dict) -> dict:
+    """Project a secret-free image generation tool call telemetry record."""
+    event: dict[str, object] = {
+        "type": "firm.telemetry",
+        "provider": "codex",
+        "tool_call": "image_generation",
+    }
+    call_id = safe_call_id(payload.get("call_id")) or safe_call_id(payload.get("id"))
+    if call_id is not None:
+        event["call_id"] = call_id
+    return event
+
+
 def _usage_event(record: object) -> dict | None:
     """Project Codex usage and model identity; never emit transcript content."""
     if not isinstance(record, dict):
@@ -102,13 +126,23 @@ def _usage_event(record: object) -> dict | None:
     payload = record.get("payload")
     if not isinstance(payload, dict):
         return None
-    if record.get("type") == "turn_context":
+    record_type = record.get("type")
+    if record_type == "turn_context":
         model = payload.get("model")
         if isinstance(model, str) and model.strip():
             return {"type": "firm.telemetry", "provider": "codex", "model": model}
         return None
-    if record.get("type") != "event_msg":
+    if record_type == "response_item":
+        if payload.get("type") == "image_generation_call" or (
+            payload.get("type") == "function_call"
+            and payload.get("name") in {"image_gen", "image_gen.generation"}
+        ):
+            return _image_generation_event(payload)
         return None
+    if record_type != "event_msg":
+        return None
+    if payload.get("type") == "image_generation_end":
+        return _image_generation_event(payload)
     if payload.get("type") == "context_compacted":
         return {"type": "firm.telemetry", "provider": "codex", "native_compaction": True}
     if payload.get("type") != "token_count":
@@ -220,10 +254,7 @@ def _run(command: list[str], sessions: Path) -> int:
     if os.environ.get("FIRM_CREDENTIALS_URL"):
         mirror = runpy.run_path(str(_auth_source().parent / "credential-mirror"))
         try:
-            auth = _auth_source() if os.environ.get("FIRM_TASK_RUN") == "1" else (
-                sessions.parent / "auth.json"
-            )
-            with mirror["CredentialMirror"](auth):
+            with mirror["CredentialMirror"](sessions.parent / "auth.json"):
                 return _run_process(command, sessions)
         except mirror["MirrorUnavailable"]:
             return 72
@@ -314,6 +345,13 @@ def main() -> int:
             raise ValueError("missing activation token")
         if not _begin_activation(os.environ["FIRM_ACTIVATION_START_URL"], token):
             return 70
+        if llm_url := os.environ.pop("FIRM_LLM_URL", None):
+            runpy.run_path(str(_auth_source().parent / "llm-cli"))["install_shims"](
+                _absolute("FIRM_STATE_DIR"),
+                _absolute("FIRM_CREDENTIALS_DIR"),
+                _absolute("FIRM_PRIVATE_HOME"),
+                llm_url,
+            )
         codex_home = _codex_home()
         os.environ["CODEX_HOME"] = str(codex_home)
         return _run(command, codex_home / "sessions")

@@ -26,7 +26,7 @@ from .provider_contract import (
     token_count,
     tool_name,
 )
-from .provider_definitions import PROVIDER_DEFINITIONS
+from .provider_definitions import PROVIDER_DEFINITIONS, resolve_model
 from .provider_support import (
     activation_url,
     canonical_uuid,
@@ -67,15 +67,16 @@ def native_model_id(model, effort):
             code="invalid_effort",
             message="AGY supports low, medium, high and the Firm xhigh mapping",
         )
-    if not isinstance(model, str) or model not in {
-        "gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen"
+    resolved = resolve_model("agy", model) if isinstance(model, str) else None
+    if resolved not in {
+        "gemini-4-hydrogen", "gemini-4-neon", "gemini-4-carbon", "gemini-4-argon"
     }:
         raise ProviderSetupError(
             category="config",
             code="invalid_model",
             message="AGY requires a supported base Gemini model without effort",
         )
-    return "gemini-4-argon-high" if effort == "xhigh" else f"{model}-{effort}"
+    return "gemini-4-carbon-high" if effort == "xhigh" else f"{resolved}-{effort}"
 
 
 def _unique(pairs):
@@ -337,7 +338,7 @@ def parse_failed_tool_calls(logs):
 def parse_summary(logs, exit_code):
     result, usage = parse_result(logs, exit_code, tool_free=True), parse_usage(logs)
     counters = dict(usage.__dict__) if usage else {}
-    # Summary/chooser sessions are fresh, just like isolated task sessions.
+    # Summary/chooser sessions are fresh one-shot sessions.
     for name in ("input_tokens", "output_tokens", "cached_input_tokens", "reasoning_output_tokens"):
         counters[name] = counters.get("session_" + name)
     return SummaryOutput(
@@ -357,7 +358,7 @@ class AgyProvider:
 
     def __init__(self, *, model, effort, auth_file, executable=None):
         native_model_id(model, effort)
-        self.model, self.effort = model, effort
+        self.model, self.effort = resolve_model("agy", model), effort
         if not isinstance(auth_file, Path):
             raise TypeError("auth_file must be a Path")
         self.auth_file = auth_file
@@ -447,7 +448,6 @@ class AgyProvider:
                     "/activation/start" if role else "/summary/start", "/credentials"
                 ),
                 **({} if role else {"FIRM_SUMMARY_RUN": "1"}),
-                **({"FIRM_TASK_RUN": "1"} if mode == "task" else {}),
             },
             secrets={
                 token_name: token.encode(),
@@ -504,8 +504,6 @@ class AgyProvider:
         )
 
     def _one_shot(self, request, layout, mode):
-        from .task_runner import WORKER_INSTRUCTIONS
-
         if request.provider not in (None, self.name):
             raise ProviderSetupError(
                 category="config", code="provider_mismatch", message="AGY summary provider mismatch"
@@ -518,8 +516,7 @@ class AgyProvider:
             layout=layout,
             model=request.model or self.model,
             effort=request.effort or self.effort,
-            instructions=request.instructions
-            or (WORKER_INSTRUCTIONS if mode == "task" else summary_instructions()),
+            instructions=request.instructions or summary_instructions(),
             prompt=request.prompt,
             start_url=request.start_url,
             token=request.start_token,
@@ -527,9 +524,6 @@ class AgyProvider:
 
     def build_summary_spec(self, request, layout):
         return self._one_shot(request, layout, "tool_free")
-
-    def build_task_spec(self, request, layout):
-        return self._one_shot(request, layout, "task")
 
     def parse_result(self, logs, exit_code):
         result = parse_result(logs, exit_code)

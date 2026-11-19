@@ -32,7 +32,7 @@ from .provider_contract import (
     token_count,
     tool_name,
 )
-from .provider_definitions import PROVIDER_DEFINITIONS
+from .provider_definitions import PROVIDER_DEFINITIONS, resolve_model
 from .provider_support import (
     activation_url,
     canonical_uuid,
@@ -59,7 +59,7 @@ class ClaudeProvider:
         executable: str | None = None,
     ) -> None:
         try:
-            self.model = text_setting(model, "model")
+            self.model = resolve_model("claude", text_setting(model, "model"))
         except ValueError as exc:
             raise ProviderSetupError(
                 category="config", code="invalid_model", message=str(exc)
@@ -201,7 +201,7 @@ class ClaudeProvider:
                 "FIRM_PRIVATE_HOME": layout.private,
                 # Telemetry and update checks stay off the firm's allowlist.
                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-                # Firm task() must return its bounded result in the calling turn.
+                # Keep Firm MCP tool responses synchronous in the calling turn.
                 "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "0",
             },
             secrets={
@@ -236,15 +236,6 @@ class ClaudeProvider:
 
     def build_summary_spec(self, request: SummaryLaunch, layout: Layout) -> RunSpec:
         """Build a foreground Claude summary with the CLI tool set empty."""
-        return self._build_one_shot_spec(request, layout, task=False)
-
-    def build_task_spec(self, request: SummaryLaunch, layout: Layout) -> RunSpec:
-        """Build a fresh worker with ordinary tools and no firm authority."""
-        return self._build_one_shot_spec(request, layout, task=True)
-
-    def _build_one_shot_spec(
-        self, request: SummaryLaunch, layout: Layout, *, task: bool
-    ) -> RunSpec:
         if request.provider not in (None, self.name):
             raise ProviderSetupError(
                 category="config", code="provider_mismatch", message="summary provider mismatch"
@@ -279,16 +270,8 @@ class ClaudeProvider:
             effort,
             "--setting-sources",
             "",
-            *(
-                [
-                    "--permission-mode", "bypassPermissions",
-                    "--permission-prompts", "none",
-                    "--dangerously-skip-permissions",
-                    "--tools", "Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch,NotebookEdit",
-                    "--disallowedTools", "SendMessage", "ListAgents", "Task", "Agent", "Skill",
-                ]
-                if task else ["--tools", ""]
-            ),
+            "--tools",
+            "",
             "--settings",
             json.dumps({
                 "autoMemoryEnabled": False,
@@ -303,7 +286,6 @@ class ClaudeProvider:
             "--no-session-persistence",
             "--disable-slash-commands",
             "--strict-mcp-config",
-            *(["--mcp-config", '{"mcpServers":{}}'] if task else []),
         ]
         auth_kind, auth = claude_auth.read_auth(self.auth_file)
         secret_env = {}
@@ -311,7 +293,7 @@ class ClaudeProvider:
             secret_env["CLAUDE_CODE_OAUTH_TOKEN"] = "claude-auth"
         return RunSpec(
             role_id=summary_role_id(request.run_id, request.stateless_slot),
-            stateless=not task,
+            stateless=True,
             run_id=request.run_id,
             argv=(layout.python, layout.credential("claude-launcher")),
             env={
@@ -321,7 +303,6 @@ class ClaudeProvider:
                 "FIRM_STATE_DIR": layout.state,
                 "FIRM_PRIVATE_HOME": layout.private,
                 "FIRM_SUMMARY_RUN": "1",
-                **({"FIRM_TASK_RUN": "1"} if task else {}),
                 "CLAUDE_CODE_MAX_RETRIES": "0",
                 "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1",
                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",

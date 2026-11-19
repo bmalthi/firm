@@ -30,7 +30,7 @@ from .provider_contract import (
     token_count,
     tool_name,
 )
-from .provider_definitions import PROVIDER_DEFINITIONS
+from .provider_definitions import PROVIDER_DEFINITIONS, resolve_model
 from .provider_support import (
     activation_url,
     canonical_uuid,
@@ -43,7 +43,9 @@ from .provider_support import (
 from .summaries import SummaryLaunch, SummaryOutput, summary_role_id
 
 # Completed items that are work the role asked for, rather than its own prose or reasoning.
-TOOL_ITEMS = frozenset({"command_execution", "file_change", "mcp_tool_call", "web_search"})
+TOOL_ITEMS = frozenset(
+    {"command_execution", "file_change", "image_generation", "mcp_tool_call", "web_search"}
+)
 
 
 class CodexProvider:
@@ -60,7 +62,7 @@ class CodexProvider:
         executable: str | None = None,
     ) -> None:
         try:
-            self.model = text_setting(model, "model")
+            self.model = resolve_model("codex", text_setting(model, "model"))
         except ValueError as exc:
             raise ProviderSetupError(
                 category="config", code="invalid_model", message=str(exc)
@@ -128,6 +130,8 @@ class CodexProvider:
             'sandbox_mode="danger-full-access"',
             "-c",
             "tools.web_search=true",
+            "-c",
+            "features.image_generation=true",
             "-c",
             "include_collaboration_mode_instructions=false",
             "-c",
@@ -221,15 +225,6 @@ class CodexProvider:
 
     def build_summary_spec(self, request: SummaryLaunch, layout: Layout) -> RunSpec:
         """Build a foreground summary run with no role authority or tools."""
-        return self._build_one_shot_spec(request, layout, task=False)
-
-    def build_task_spec(self, request: SummaryLaunch, layout: Layout) -> RunSpec:
-        """Build a fresh worker with ordinary tools and no firm authority."""
-        return self._build_one_shot_spec(request, layout, task=True)
-
-    def _build_one_shot_spec(
-        self, request: SummaryLaunch, layout: Layout, *, task: bool
-    ) -> RunSpec:
         if request.provider not in (None, self.name):
             raise ProviderSetupError(
                 category="config", code="provider_mismatch", message="summary provider mismatch"
@@ -267,11 +262,13 @@ class CodexProvider:
             "-c",
             "skills.include_instructions=false",
             "-c",
-            f"features.shell_tool={str(task).lower()}",
+            "features.shell_tool=false",
             "-c",
-            f"features.view_image={str(task).lower()}",
+            "features.view_image=false",
             "-c",
-            'web_search="live"' if task else 'web_search="disabled"',
+            "features.image_generation=false",
+            "-c",
+            'web_search="disabled"',
             "-c",
             "project_root_markers=[]",
             "-c",
@@ -295,18 +292,17 @@ class CodexProvider:
             "-c",
             f"model_reasoning_effort={json.dumps(effort)}",
             "exec",
-            *([] if task else ["--ephemeral"]),
+            "--ephemeral",
             "--ignore-user-config",
             "--ignore-rules",
             "--strict-config",
             "--skip-git-repo-check",
             "--json",
-            *(["--dangerously-bypass-approvals-and-sandbox"] if task else []),
             "-",
         ]
         return RunSpec(
             role_id=summary_role_id(request.run_id, request.stateless_slot),
-            stateless=not task,
+            stateless=True,
             run_id=request.run_id,
             argv=(layout.python, layout.credential("codex-launcher")),
             env={
@@ -315,7 +311,6 @@ class CodexProvider:
                 "FIRM_STATE_DIR": layout.state,
                 "FIRM_PRIVATE_HOME": layout.private,
                 "FIRM_SUMMARY_RUN": "1",
-                **({"FIRM_TASK_RUN": "1"} if task else {}),
                 "FIRM_SUMMARY_START_URL": request.start_url,
                 "FIRM_CREDENTIALS_URL": request.start_url.replace("/summary/start", "/credentials"),
             },
@@ -392,6 +387,35 @@ def _usage_payload(event: dict) -> dict | None:
     return None
 
 
+def _image_generation_event(event: dict) -> tuple[bool, str | None]:
+    """Return (True, call_id) when event records a Codex image generation call."""
+    event_type = event.get("type")
+    if (
+        event_type == "firm.telemetry"
+        and event.get("provider") == "codex"
+        and event.get("tool_call") == "image_generation"
+    ):
+        return True, codex_launch.safe_call_id(event.get("call_id"))
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return False, None
+    payload_type = payload.get("type")
+    is_response_img = event_type == "response_item" and (
+        payload_type == "image_generation_call"
+        or (
+            payload_type == "function_call"
+            and payload.get("name") in {"image_gen", "image_gen.generation"}
+        )
+    )
+    is_end_img = event_type == "event_msg" and payload_type == "image_generation_end"
+    if is_response_img or is_end_img:
+        call_id = codex_launch.safe_call_id(payload.get("call_id")) or codex_launch.safe_call_id(
+            payload.get("id")
+        )
+        return True, call_id
+    return False, None
+
+
 def parse_tool_calls(logs: bytes | str) -> dict[str, int]:
     """Count completed tool items by name, never their arguments or results.
 
@@ -409,7 +433,17 @@ def parse_tool_calls(logs: bytes | str) -> dict[str, int]:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(event, dict) or event.get("type") != "item.completed":
+        if not isinstance(event, dict):
+            continue
+        is_image_gen, call_id = _image_generation_event(event)
+        if is_image_gen:
+            if call_id is not None:
+                if call_id in seen:
+                    continue
+                seen.add(call_id)
+            tally["image_generation"] += 1
+            continue
+        if event.get("type") != "item.completed":
             continue
         item = event.get("item")
         if not isinstance(item, dict) or item.get("type") not in TOOL_ITEMS:
@@ -456,7 +490,8 @@ def parse_usage(logs: bytes | str) -> ProviderUsage | None:
         if not isinstance(event, dict):
             continue
         if event.get("type") == "firm.telemetry" and event.get("provider") == "codex":
-            rollout_observed = True
+            if "model" in event or "native_compaction" in event or "usage" in event:
+                rollout_observed = True
             model = event.get("model")
             if isinstance(model, str) and model.strip():
                 resolved_model = model

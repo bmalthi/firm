@@ -6,13 +6,11 @@ from pathlib import Path
 from .accounts import validate_accounts
 from .errors import FirmError
 from .prompt_records import record_inputs
-from .provider_contract import ExecutionProvider, ProviderSetupError, incident_code
+from .provider_contract import ExecutionProvider, ProviderSetupError
 from .provider_registry import provider_implementation
 from .provider_support import activation_url
 from .store import OWNER
-from .summaries import SandboxSummaryRunner, SummaryLaunch, SummaryService, summary_role_id
-from .task_runner import WORKER_INSTRUCTIONS, GuestTaskRunner
-from .tasks import TaskExecutionError
+from .summaries import SandboxSummaryRunner, summary_role_id
 
 
 def provider_adapter(profile, account) -> ExecutionProvider:
@@ -135,119 +133,3 @@ class Providers:
             start_url=summary_url,
             start_allowed=lambda: self.runtime.status()["state"] == "running",
         )
-
-    def task_runner(self, sandbox, *, mcp_url):
-        """Fresh workers on the caller's bound account and child Linux identity."""
-        start_url = activation_url(mcp_url).replace("/activation/start", "/summary/start")
-
-        def build(request, parent):
-            with self.runtime.store.read() as db:
-                account = self.runtime.accounts.config(db)["accounts"].get(request.account_id)
-            if not account or account["provider"] != request.provider:
-                raise FirmError("task account/provider binding changed")
-            adapter = provider_adapter(
-                {"provider": request.provider, "model": request.model, "effort": request.effort},
-                account,
-            )
-            launch = SummaryLaunch(
-                run_id=request.run_id, prompt=request.instruction,
-                timeout=max(0, request.deadline - self.runtime.store.clock()),
-                account_id=request.account_id, provider=request.provider,
-                model=request.model, effort=request.effort, start_url=start_url,
-                start_token=request.start_token, kind="task", instructions=WORKER_INSTRUCTIONS,
-                tools_enabled=True,
-            )
-            spec = adapter.build_task_spec(
-                launch, sandbox.child_layout(parent.role_id, request.run_id)
-            )
-            record_inputs(
-                self.runtime.store.path.parent / "inputs",
-                request.run_id,
-                spec,
-                kind="tasks",
-                metadata={
-                    "run_id": request.run_id,
-                    "caller_activation_id": request.caller_activation_id,
-                    "provider": request.provider,
-                    "model": request.model,
-                    "offered_role_tools": [],
-                    "tool_policy": {
-                        "provider_native_tools": "enabled",
-                        "firm_tools": "disabled",
-                        "delegation": "disabled",
-                    },
-                },
-            )
-            return spec
-
-        def parse(request, logs, exit_code, *, apply_holds):
-            return record_task_output(
-                self.runtime, request.run_id, request.provider, request.account_id, logs, exit_code,
-                apply_holds=apply_holds, model=request.model,
-            )
-
-        return GuestTaskRunner(self.runtime, sandbox, build_spec=build, parse_output=parse)
-
-
-def record_task_output(
-    runtime, run_id, provider, account_id, logs, exit_code, *, apply_holds, model=None
-):
-    parser = provider_implementation(provider)
-    result = parser.parse_result(logs, exit_code)
-    observed = parser.parse_usage(logs)
-    if apply_holds:
-        reading = parser.parse_subscription(logs)
-        if reading is not None:
-            runtime.accounts.record_subscription(
-                account_id,
-                list(reading.windows),
-                status=reading.status,
-                warning=reading.warning,
-            )
-    counters = dict(observed.__dict__) if observed else {}
-    # Every task owns a fresh session, so session totals are task totals even
-    # if cancellation prevented the final turn.completed event.
-    for name in ("input_tokens", "cached_input_tokens", "output_tokens",
-                 "reasoning_output_tokens"):
-        if counters.get(name) is None:
-            counters[name] = counters.get("session_" + name)
-    usage = SummaryService._safe_usage(counters) or {}
-    with runtime.store.transaction() as db:
-        db.execute(
-            "UPDATE summary_runs SET input_tokens=COALESCE(?,input_tokens),"
-            "cached_input_tokens=COALESCE(?,cached_input_tokens),"
-            "output_token_usage=COALESCE(?,output_token_usage),"
-            "output_tokens=COALESCE(?,output_tokens),"
-            "reasoning_output_tokens=COALESCE(?,reasoning_output_tokens),"
-            "provider_context_window=COALESCE(?,provider_context_window),"
-            "native_compactions=COALESCE(?,native_compactions),"
-            "resolved_model=COALESCE(?,resolved_model) WHERE run_id=? AND kind='task'",
-            (usage.get("input_tokens"), usage.get("cached_input_tokens"),
-             usage.get("output_tokens"), usage.get("output_tokens"),
-             usage.get("reasoning_output_tokens"), usage.get("provider_context_window"),
-             usage.get("native_compactions"), usage.get("resolved_model"), run_id),
-        )
-        error = result.error
-        # The task's own model or setup failed. A model whose allowance is spent counts:
-        # it is the task setting's problem, and the account's other models still run.
-        rejected_setup = bool(apply_holds and error and (
-            error.category == "config" or error.code == "model_quota_reached"
-        ))
-        if rejected_setup:
-            # This says nothing about the account or the role's profile: refuse the
-            # call, tell the owner once, hold nothing.
-            runtime.accounts.report_task_setup(db, provider, model, incident_code(error.code))
-        elif apply_holds and error and error.category in {"auth", "quota"}:
-            limits = []
-            if error.reset_at is not None:
-                limits.append(error.reset_at)
-            if error.retry_after_seconds is not None:
-                limits.append(runtime.store.clock() + error.retry_after_seconds)
-            until = max(limits) if limits else None
-            runtime.accounts.hold(
-                db, "account", account_id, error.category,
-                until if error.category == "quota" else None, code=error.code,
-            )
-    if result.error:
-        raise TaskExecutionError("configuration" if rejected_setup else "provider_failure")
-    return result.final_text

@@ -362,9 +362,6 @@ def render_tool_result(name: str, result: dict) -> str:
                 render("results", "hire_temporary", remaining_periods=terms["remaining_periods"])
             )
         lines.append(render("results", "hire_followup"))
-    elif name == "task":
-        lines = [result["answer"] if result["status"] == "completed"
-                 else "unavailable: " + result["reason"]]
     elif name in {"send", "reply", "introduce"} and result.get("status") == "sent":
         lines = _delivery(result)
     elif name in {"read", "dismiss"} and result.get("status") != "blocked":

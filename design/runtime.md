@@ -33,7 +33,7 @@ Neither the hiring manager nor the new employee chooses or sees model names (`[s
 
 | Axis | Values | Default Provider Mapping |
 | :--- | :--- | :--- |
-| **Model Class** | `low`, `medium`, `high` | **Codex:** `gpt-6-luna` / `gpt-6.1-sol` / `gpt-6-astra`<br>**Claude:** `sonnet` / `opus` / `claude-fable-5-1` |
+| **Model Class** | `low`, `medium`, `high` | **Codex:** `gpt-6.1-terra` / `gpt-6.2-sol` / `gpt-6.2-astra`<br>**Claude:** `sonnet` / `opus` / `fable`<br>**AGY:** `gemini-4-hydrogen` / `gemini-4-neon` / `gemini-4-neon` (`xhigh` → `gemini-4-carbon-high`) |
 | **Effort** | `low`, `medium`, `high`, `xhigh` | Passed to the provider CLI for reasoning depth. |
 
 * **Non-blocking registration:** `hire` registers the role immediately on the fallback level (`medium` class, `high` effort) with state `pending`. Admission skips roles while `pending`, and the dispatcher runs the chooser turn before admitting work. After 3 failed assessments (or an oversized >256 KiB prompt on the first try), the role defaults to `medium`/`high` and Operations notifies the owner.
@@ -176,11 +176,11 @@ Named `[profiles.<name>]` configure provider (`codex`, `claude`, or experimental
 
 `provider_definitions.py` owns immutable configured defaults, supported efforts, soft context windows, and service constraints. It imports no runtime implementations. `provider_registry.py` lazily selects the built-in constructor and stateless parsers; metadata consumers use definitions directly.
 
-The `ExecutionProvider` protocol separates role launches from tool-free summary/staffing turns and native-tool task workers. Every role adapter receives a `RoleLaunchRequest` with its invocation, sandbox identities, MCP URL, retained native session ID, offered Firm tool catalog, and configured task-service deadline. Codex restricts Firm discovery with `enabled_tools`; Claude excludes the complement of the authoritative Firm catalog through `--disallowedTools`, preserving ordinary native tools and existing delegation restrictions. AGY 1.5.3 uses [`enabledTools`](https://antigravity.google/docs/mcp#mcp-configuration-properties) for exposure and eagerly registers each offered schema; empty catalogs are explicitly unsupported because native empty-allowlist behavior has not been verified. Each adapter rejects malformed or unknown tool names. Server authorization remains enforced independently of client discovery.
+The `ExecutionProvider` protocol separates role launches from tool-free summary/staffing turns. Every role adapter receives a `RoleLaunchRequest` with its invocation, sandbox identities, MCP URL, retained native session ID, and offered Firm tool catalog. Codex restricts Firm discovery with `enabled_tools`; Claude excludes the complement of the authoritative Firm catalog through `--disallowedTools`, preserving ordinary native tools and existing delegation restrictions. AGY 1.5.3 uses [`enabledTools`](https://antigravity.google/docs/mcp#mcp-configuration-properties) for exposure and eagerly registers each offered schema; empty catalogs are explicitly unsupported because native empty-allowlist behavior has not been verified. Each adapter rejects malformed or unknown tool names. Server authorization remains enforced independently of client discovery.
 
-Native Firm calls receive `ceil(task.timeout_seconds) + 65` seconds: the task still reaches its execution deadline at the configured time, with 60 seconds for the existing child-stop RPC and five seconds for transport and result delivery. This bounds the native call without guaranteeing cleanup completes. Codex writes `tool_timeout_sec`, AGY writes integer `timeoutSeconds`, and Claude writes per-server integer milliseconds in `timeout`, which also raises its HTTP idle timeout for a silent call. Claude role launches disable automatic MCP backgrounding so a long task result remains synchronous. Requests outside the shared supported timer range (positive task deadlines up to 2,147,418 seconds) fail before launch rather than silently clamping or disabling a deadline. Claude and Codex MCP startup settings are unchanged; AGY's native `timeoutSeconds` also controls connection and discovery.
+Native Firm MCP calls use the fixed 120-second transport timeout (`MCP_TIMEOUT_SECONDS` in `provider_support.py`). Codex writes `tool_timeout_sec`, AGY writes integer `timeoutSeconds`, and Claude writes per-server integer milliseconds in `timeout`, which also raises its HTTP idle timeout for a silent call. Claude role launches disable automatic MCP backgrounding so MCP tool results remain synchronous. Claude and Codex MCP startup settings are unchanged; AGY's native `timeoutSeconds` also controls connection and discovery.
 
-Active roles parse results through their model-bound adapter instance, preserving configured/native model attribution on errors. Summary and task output uses stateless parsers selected from the provider captured when the work launched, without constructing an adapter or reading current credentials. Builders still reject an account that has changed provider. Unknown telemetry remains unknown, historical logs do not create fresh subscription readings, and AGY subscription parsing returns no observation.
+Active roles parse results through their model-bound adapter instance, preserving configured/native model attribution on errors. Summary and guest LLM CLI runs use stateless parsers selected from the provider captured when the work launched, without constructing an adapter or reading current credentials. Builders still reject an account that has changed provider. Unknown telemetry remains unknown, historical logs do not create fresh subscription readings, and AGY subscription parsing returns no observation.
 
 ### Session Binding & Account Selection
 * **Retained sessions stay pinned:** A warm session is bound to its provider, account, and model settings; lowering an account's `max_active` steers *new* sessions away without stranding warm ones.
@@ -203,13 +203,14 @@ Active roles parse results through their model-bound adapter instance, preservin
 
 ---
 
-## Tasks
+## Guest LLM CLIs
 
-`task(instruction, request_id)` gives a role a bounded, single-turn text answer from a fresh worker session running in a child cgroup:
-* **No Firm authority:** Task workers run in the caller's Linux account with provider-native file, shell and search capabilities, but receive **no** Firm MCP tools, mail access or parent conversation history. Native tool restrictions are configured by the provider adapter.
-* **Slot borrowing:** A role's first active task borrows the waiting caller's own execution slot; a second concurrent task (`max_concurrent = 2`) requires a free slot on the same account.
-* **Defaults:** Uses `[task.codex]` (`gpt-6.1-sol`, `medium`), `[task.claude]` (`opus`, `medium`), or `[task.agy]` (`gemini-4-hydrogen`, `high`), as defined in `provider_definitions.py`.
-* **Why `task()` instead of provider-native subagents?** Provider-native subagents can inherit parent instructions and Firm MCP authority. Launching a fresh worker through the guest controller lets Firm control its lifecycle, slot accounting, credential projection and Firm-tool exposure. Native tool behavior remains provider-specific; the adapters do not establish identical native tool enforcement.
+Roles can invoke host-brokered non-interactive `claude` (`-p`), `codex` (`exec`), and `agy` (`-p`) CLIs directly from Linux shell scripts via shims installed on `PATH` (`<state_dir>/bin/{claude,codex,agy}` -> `llm_cli.py`) backed by `LlmService` (`llm_service.py`) over `/llm/start`, `/llm/heartbeat`, `/llm/finish`, and lease-gated `/credentials`:
+* **No Firm authority or secret bleed:** Guest CLI shims scrub `FIRM_*`, `GH_TOKEN`, `GITHUB_TOKEN`, and raw API key env vars, inject `FIRM_LLM_CHILD=1` (preventing nested CLI recursion), pass no Firm MCP configuration, and stage short-lived credentials transiently under `<state_dir>/llm/<run_id>/<provider>` on `/run` tmpfs (deleted in `finally:`).
+* **Cross-provider routing & slot borrowing:** Roles may invoke any configured CLI provider regardless of the role's own provider. At most one active CLI call on the caller's own bound account borrows the waiting caller's slot; additional concurrent calls (`max_concurrent = 2`) or calls to other accounts require a free account slot.
+* **Session persistence & output:** Conversations persist across calls and work periods under `<private_home>/.firm/cli/<provider>`. Shims write only the final answer to `stdout` and emit session IDs (`firm: session <id>`) and waiting-mail/control cues on `stderr`.
+* **Defaults:** Uses `[llm.codex]` (`gpt-6.2-sol`, `medium`), `[llm.claude]` (`opus`, `medium`), or `[llm.agy]` (`gemini-4-neon`, `medium`), as defined in `provider_definitions.py`.
+* **Why host-brokered CLIs instead of provider-native subagents?** Provider-native subagents can inherit parent instructions and Firm MCP authority. Brokering CLI runs through the host runtime lets Firm enforce slot accounting, ephemeral credential leases, recursion prevention, model/MCP pinning, and clean stdout/stderr separation. Native tool behavior remains provider-specific.
 
 ---
 
@@ -260,8 +261,8 @@ When a role calls a tool that hits an owner-controlled gate, the tool opens a pe
 * **Per-activation 1-hour tokens:** Linux roles get a `github-credential` helper and `/usr/local/bin/gh` wrapper that call the host's `/github/token` endpoint using the run's activation token. Minted tokens are scoped to the role's granted repositories and restricted to `contents`, `pull_requests`, and `issues` (never `administration`).
 * **Durable revocations:** `firm github revoke <dir> <repo>` records a standing refusal in `github_revocations` so a role whose push fails and immediately re-requests access gets a pending Owner Request (`github_owner_revoked`) instead of an automatic re-grant.
 
-### Generative Images (`[google_cloud]`)
-* When `[google_cloud]` names a project, the host stages `~/.config/firm-runtime/credentials/google-cloud-<project>.key` into the Linux role's per-run credentials directory as `GEMINI_API_KEY` on each launch. Spend caps are enforced in Google AI Studio.
+### Generative Images
+* Codex (`features.image_generation`) and AGY (`generate_image`) provide native subscription-backed image generation and editing for roles and guest CLI runs without external API keys; Claude-only firms have no raster image-generation provider, while Claude roles can call `codex exec` or `agy -p` when those providers are configured.
 
 ### The Mac Lease (`mac_acquire` / `mac_release` / `mac_status`)
 * A firm with `[mac]` in `sandbox.toml` exposes `1 to 8` macOS desktop stations (`firmstation1..8`). Any Linux role can lease one free station at a time during an activation.

@@ -28,7 +28,7 @@ Every role is asked to maintain three lightweight workspace files (with no rigid
 Every provider receives the same assembled standing text. Codex receives it via `model_instructions_file`; Claude Code via `--system-prompt-file`; AGY as the body of its `firm-role` agent definition. Each receives the wake/transition update separately as input.
 
 1. **Layer 1 — Standing Instructions (Byte-Stable System Prompt):**
-   * Role identity, manager, verbatim own mandate, accessible workspace/drive paths (`workplace.json`), and only the optional capabilities (`[github]`, `[google_cloud]`, `[mac]`) actually enabled for this firm.
+   * Role identity, manager, verbatim own mandate, accessible workspace/drive paths (`workplace.json`), configured guest LLM CLIs (from `[llm]` and available accounts), and only the optional capabilities (`[github]`, `[mac]`) actually enabled for this firm.
    * First, two common resources in fixed order: `standing-physics.md` (workspace records, mail, working memory, task switches and handoff, tools, Linux environment summary with `~/scratch` vs durable `<drive>`, outside services and access) and `standing-good-worker.md` (outcomes, follow-through, investigation and escalation, communication, deliverable hygiene, evidence and rendered visual inspection, usable results, shared time and resources).
    * Then `guidance-introduction.md` and selected bodies from `guidance/`, scope first and functions in catalog order; omit the introduction when no guides apply. `standing-limits.md` comes last for every role. Physics describes the environment; good-worker and role guides describe craft and yield to the mandate. Limits hold firm-wide rules that no mandate, profile, mail, guide or tool result changes.
    * Contains no timestamps, inbox counts, or token counters so provider prompt caches stay warm. The common resources are fixed for a running host; the assembled text changes only when the role's identity, mandate, paths, capabilities or effective guidance change. Prompt resource edits load only after restarting the host.
@@ -53,7 +53,7 @@ Prompt resource files live in `packages/firm-runtime/src/firm_runtime/prompts/`:
 
 | Resource File | Purpose |
 | :--- | :--- |
-| `workplace.json` | Role identity, mandate, workspace paths, and conditionally rendered capability blocks (GitHub, Gemini, Mac). |
+| `workplace.json` | Role identity, mandate, workspace paths, and conditionally rendered capability blocks (LLM CLIs, GitHub, Mac). |
 | `standing-physics.md` | Common workplace physics: workspace records, mail, working memory, task switches and handoff, tools, Linux environment, outside services and access. |
 | `standing-good-worker.md` | Common good-worker guidance: how to do useful work with others. |
 | `guidance/catalog.json`, `guidance/*.md`, `guidance-introduction.md` | Validated scope and function guides, composed only when selected. |
@@ -63,7 +63,7 @@ Prompt resource files live in `packages/firm-runtime/src/firm_runtime/prompts/`:
 | `mac-acquired.md` | Detailed macOS/Xcode/Device Hub workflow notes delivered when `mac_acquire` succeeds. |
 | `tools.json`, `results.json`, `references.json` | MCP tool schemas (gated at launch by configured `[mac]` and `[github]` capabilities), return-state explanations, and actionable error messages. |
 | `notices.json` | Templates for attributed Operations messages (bounces, request grants/denials, mandate updates). |
-| `runtime_summary.md`, `runtime_level-choice.md`, `runtime_task.md` | Isolated infrastructure prompts for thread summarization (`read` with `summarize`, `introduce` with `summarize`), level and guidance selection (`[staffing]`), and bounded `task` workers. Never shown to employees. |
+| `runtime_summary.md`, `runtime_level-choice.md`, `runtime_llm.md` | Isolated infrastructure prompts for thread summarization (`read` with `summarize`, `introduce` with `summarize`), level and guidance selection (`[staffing]`), and guest LLM CLI sessions (`[llm]`). Never injected into role activations. |
 | `tracking.md` | Maintainer reference mapping how standing and activation prompt layers are ordered across the four activation occasions (not injected at runtime). |
 
 The founder automatically receives `firm-leader`; every other role with non-retired direct reports receives

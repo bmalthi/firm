@@ -14,18 +14,15 @@ from pathlib import Path
 
 from firm_sandbox import Run, Sandbox
 
-from . import google_cloud
 from .errors import FirmError
 from .execution_activity import DEFAULT_IDLE_TIMEOUT, record_activity
 from .prompt_records import record_inputs, role_tool_catalog
 from .provider_contract import ExecutionProvider, ProviderSetupError, RoleLaunchRequest
-from .provider_definitions import incompatible_service
 from .provider_support import activation_url
 from .public_profiles import ingest_public_profiles
 from .runtime import Runtime
 from .store import encoded
 from .summaries import summary_role_id
-from .task_runner import reconcile_tasks
 from .workspaces import (
     ensure_runtime_role,
     grants_for,
@@ -76,7 +73,6 @@ class SandboxDispatcher:
         self._retired = set()
         self._retire_not_before = {}
         self._summary_runner = None
-        self._task_runner = None
         self._provision_role = None
         self._next_journal_sweep = 0
         self._preflight_failures: frozenset[tuple[str, str, str]] | None = None
@@ -163,17 +159,10 @@ class SandboxDispatcher:
                     self.sandbox, mcp_url=self.mcp_url
                 )
                 self.runtime.summary_service.provider = self._summary_runner
-            self._open_task_runner()
             return self
         except BaseException:
             self._release()
             raise
-
-    def _open_task_runner(self):
-        if self._task_runner is None or self._task_runner.closed:
-            if hasattr(self.providers, "task_runner"):
-                self._task_runner = self.providers.task_runner(self.sandbox, mcp_url=self.mcp_url)
-            self.runtime.task_service.runner = self._task_runner
 
     def _validate_binding(self, db, existing, root: str, firm_id: str, identity: str) -> None:
         if (existing["sandbox_firm_id"], existing["sandbox_identity"]) != (firm_id, identity):
@@ -217,7 +206,7 @@ class SandboxDispatcher:
 
     def _summary_records(self, run_ids=()):
         with self.runtime.store.read() as db:
-            query = "SELECT * FROM summary_runs WHERE kind!='task' AND (state='running'"
+            query = "SELECT * FROM summary_runs WHERE kind!='llm' AND (state='running'"
             if run_ids:
                 query += " OR run_id IN (" + ",".join("?" for _ in run_ids) + ")"
             query += ")"
@@ -300,7 +289,6 @@ class SandboxDispatcher:
                     # Failed preparation must close admission there as well.
                     self.runtime.stop(force=True)
                     raise
-            self._open_task_runner()
             with self.runtime.store.transaction() as db:
                 infrastructure = db.execute(
                     "SELECT infrastructure_state FROM execution_host WHERE singleton=1"
@@ -344,17 +332,32 @@ class SandboxDispatcher:
         self._preflight_failures = failures
         return report
 
+    def _sweep_expired_llm_runs(self):
+        now = self.runtime.store.clock()
+        with self.runtime.store.read() as db:
+            stale = db.execute(
+                "SELECT 1 FROM summary_runs t LEFT JOIN activations a "
+                "ON a.activation_id=t.caller_activation_id "
+                "LEFT JOIN sandbox_runs s ON s.activation_id=a.activation_id "
+                "WHERE t.kind='llm' AND t.state='running' "
+                "AND ((t.deadline IS NOT NULL AND t.deadline<=?) "
+                "OR (t.lease_until IS NOT NULL AND t.lease_until<=?) "
+                "OR a.activation_id IS NULL OR a.state!='running' OR s.stop_cause IS NOT NULL "
+                "OR (s.deadline IS NOT NULL AND s.deadline<=?)) LIMIT 1",
+                (now, now, now),
+            ).fetchone()
+        if stale is not None:
+            with self.runtime.store.transaction() as db:
+                self.runtime.llm_service._sweep_expired(db, self.runtime.store.clock())
+
     def reconcile(self):
         """Reattach matching runs. Missing runs count as exited only after a healthy inventory."""
         self._require_open()
+        self._sweep_expired_llm_runs()
         ingest_public_profiles(
             self.runtime.store,
             files=self.sandbox.file_server,
         )
-        if self._task_runner:
-            self._task_runner.reconcile(stopping=self.runtime.status()["state"] == "stopping")
-        else:
-            reconcile_tasks(self.runtime, self.sandbox)
         summary_candidates = {row["run_id"] for row in self._summary_records()}
         summary_protected = self.runtime.summary_service.inflight()
         if self._summary_runner:
@@ -445,7 +448,7 @@ class SandboxDispatcher:
                 "WHERE a.state NOT IN ('admitted','running') AND a.finished_at<?", (cutoff,),
             )}
             summaries = {row[0]: row[1] for row in db.execute(
-                "SELECT run_id,stateless_slot FROM summary_runs WHERE kind!='task' "
+                "SELECT run_id,stateless_slot FROM summary_runs WHERE kind!='llm' "
                 "AND state!='running' AND finished_at<?",
                 (cutoff,),
             )}
@@ -831,8 +834,6 @@ class SandboxDispatcher:
         # summary launches before the host-only hard stop. A failed guest stop is
         # intentionally tolerated; VM shutdown and inventory reconciliation are
         # the authoritative exit proof.
-        if self._task_runner:
-            self._task_runner.cancel_all()
         self.runtime.levels.close()
         self.runtime.summary_service.close()
         if self._summary_runner:
@@ -841,11 +842,8 @@ class SandboxDispatcher:
         self.sandbox.down(force=True)
         if self.sandbox.infrastructure_status()["running"] is not False:
             raise FirmError("firm VM shutdown is not confirmed")
-        if self._task_runner:
-            self._task_runner.close()
-            if self.sandbox.infrastructure_status()["running"] is not False:
-                raise FirmError("Task cleanup is not confirmed after launch settled")
-        self._tasks_host_stopped()
+        with self.runtime.store.transaction() as db:
+            self.runtime.llm_service.settle_all(db, reason="cancelled")
         summary_pending = self._summary_runner.pending_launches() if self._summary_runner else set()
         if summary_before - summary_pending:
             # A summary launch may have settled after the first power-off. No late
@@ -887,14 +885,6 @@ class SandboxDispatcher:
                 self.runtime._settle_stop(db)
             self.runtime.github.settle()
         return []
-
-    def _tasks_host_stopped(self):
-        # Called only after VM shutdown proof and closing this host's launch gate.
-        with self.runtime.store.read() as db:
-            ids = [row[0] for row in db.execute(
-                "SELECT run_id FROM summary_runs WHERE kind='task' AND state='running'"
-            )]
-        self.runtime.task_service.recover_confirmed(ids)
 
     def _cleanup_activation(self, db, employee_id):
         row = db.execute(
@@ -1020,12 +1010,8 @@ class SandboxDispatcher:
                 raise FirmError(
                     "firm VMs stopped while a launch was in flight; ownership is unresolved"
                 )
-            if self._task_runner:
-                self._task_runner.close()
-                # Closing waits for launch RPCs; recheck the external boundary.
-                if self.sandbox.infrastructure_status()["running"] is not False:
-                    raise FirmError("Task cleanup is not confirmed")
-            self._tasks_host_stopped()
+            with self.runtime.store.transaction() as db:
+                self.runtime.llm_service.settle_all(db, reason="cancelled")
             for row in self._records(active_only=True):
                 self._missing(row)
             self.runtime.levels.close()
@@ -1056,6 +1042,7 @@ class SandboxDispatcher:
             else:
                 self._save_run(aid, run)
         inventory = self.reconcile()
+        self._sweep_expired_llm_runs()
         # After reconciliation has ended this tick's exited activations: free their
         # Mac lease before a graceful drain or the next admission.
         self.runtime.mac.refresh()
@@ -1114,13 +1101,11 @@ class SandboxDispatcher:
                         (invocation.session_id,),
                     ).fetchone()
                     binding = self.runtime.accounts.binding(db, invocation.session_id)
-                image_access = config.get("google_cloud")
                 invocation.context["capabilities"] = {
                     "mac": self.sandbox.mac is not None,
                     "github": bool(config.get("github")),
-                    "google_cloud": (
-                        {"project": image_access["project"]} if image_access else None
-                    ),
+                    "llm": self.runtime.llm_service.enabled_clis(config),
+                    "llm_max_concurrent": config.get("llm", {}).get("max_concurrent", 2),
                 }
                 offered = _offered_catalog(self._tool_catalog, invocation.context["capabilities"])
                 profile = binding["profile"] if binding else role["execution_profile"]
@@ -1129,13 +1114,6 @@ class SandboxDispatcher:
                 adapter = self._provider(
                     {"execution_profile": profile, "session_id": invocation.session_id}
                 )
-                provider_name = adapter.name
-                service = incompatible_service(provider_name, config)
-                if service is not None:
-                    raise FirmError(
-                        f"{provider_name.upper()} subscription inference cannot coexist "
-                        f"with [{service}]"
-                    )
                 spec = adapter.build_spec(
                     RoleLaunchRequest(
                         invocation=invocation,
@@ -1144,7 +1122,6 @@ class SandboxDispatcher:
                         mcp_url=self.mcp_url,
                         provider_session_id=session["native_session_id"] if session else None,
                         offered_tools=tuple(tool["name"] for tool in offered),
-                        task_timeout_seconds=config["task"]["timeout_seconds"],
                     ),
                     layout=layout,
                 )
@@ -1158,7 +1135,13 @@ class SandboxDispatcher:
                         invocation.employee_id,
                         activation_url(self.mcp_url).replace("/activation/start", "/github/token"),
                     ),
-                    google_cloud.launch_settings(self.runtime.store),
+                    (
+                        self.runtime.llm_service.launch_settings(
+                            activation_url(self.mcp_url).replace("/activation/start", "/llm")
+                        )
+                        if "accounts" in config
+                        else None
+                    ),
                 ):
                     if settings is None:
                         continue
@@ -1268,11 +1251,6 @@ class SandboxDispatcher:
     def __exit__(self, exc_type, exc, traceback):
         try:
             self.runtime.levels.close()
-            if self._task_runner:
-                self._task_runner.close()
-                if self.runtime.task_service.runner is self._task_runner:
-                    self.runtime.task_service.runner = None
-                self._task_runner = None
             self.runtime.summary_service.close()
             if self._summary_runner:
                 self._summary_runner.close()

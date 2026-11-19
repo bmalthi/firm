@@ -84,7 +84,6 @@ def test_provider_parity_and_literal_source_across_memory_states(tmp_path, state
                 mcp_url='http://firm.local/mcp',
                 provider_session_id=native,
                 offered_tools=tuple(TOOL_DESCRIPTIONS),
-                task_timeout_seconds=600,
             ),
             layout=Layout(),
         )
@@ -162,7 +161,7 @@ def test_workspace_path_is_supplied_while_prompt_records_stay_relative(birth):
         "context-handoff.md",
         "runtime_summary.md",
         "runtime_level-choice.md",
-        "runtime_task.md",
+        "runtime_llm.md",
     ],
 )
 def test_standalone_prompt_resources_are_packaged_and_nonempty(name):
@@ -197,21 +196,18 @@ def test_standing_describes_only_configured_optional_capabilities():
     baseline = standing(context())
     assert "No optional external service or Mac capability is configured" in baseline
     assert "GitHub is configured" not in baseline
-    assert "The firm has enabled the Gemini API" not in baseline
+    assert "## Configured LLM CLIs" not in baseline
+    assert "built-in image generation and editing" not in baseline
     configured = standing(
         context(
             capabilities={
                 "github": True,
-                "google_cloud": {"project": "firm-project"},
                 "mac": True,
             }
         )
     )
     assert "GitHub is configured" in configured
-    assert "The firm has enabled the Gemini API" in configured
-    assert "GEMINI_API_KEY" in configured and "GOOGLE_CLOUD_PROJECT" in configured
-    assert "configured Google Cloud project is firm-project" in configured
-    assert "task workers and the Mac do not receive these settings" in configured
+    assert "task workers" not in configured
     assert "A Mac is configured for this firm" in configured
     assert "mac_status to check availability without taking a lease" in configured
     assert "mac_acquire when work needs macOS" in configured
@@ -221,7 +217,26 @@ def test_standing_describes_only_configured_optional_capabilities():
     assert "Clone and push from Linux" in github_only
     assert "Within your mandate, choose branches, pull requests, reviews and merges" in github_only
     assert "Name your role address in pull request bodies" in github_only
-    assert "The firm has enabled the Gemini API" not in github_only
+    assert "## Configured LLM CLIs" not in github_only
+
+    claude_only = standing(context(capabilities={"llm": ["claude"], "llm_max_concurrent": 2}))
+    assert "## Configured LLM CLIs" in claude_only
+    assert "`claude`:" in claude_only
+    assert "built-in image generation and editing" not in claude_only
+
+    llm_configured = standing(
+        context(capabilities={"llm": ["claude", "codex"], "llm_max_concurrent": 3})
+    )
+    assert "## Configured LLM CLIs" in llm_configured
+    assert "`claude`:" in llm_configured
+    assert "`codex`:" in llm_configured
+    assert "`agy`:" not in llm_configured
+    assert "built-in image generation and editing" in llm_configured
+    assert "at most 3 may run concurrently in your role" in llm_configured
+
+    agy_only = standing(context(capabilities={"llm": ["agy"], "llm_max_concurrent": 1}))
+    assert "`agy`:" in agy_only
+    assert "built-in image generation and editing" in agy_only
 
 
 @pytest.mark.parametrize(
@@ -444,13 +459,29 @@ def test_mail_physics_wording_and_discussion_craft():
     assert "Preserve message IDs" in " ".join(prompt("runtime_summary.md").split())
 
 
+def test_image_generation_and_cli_output_guidance():
+    physics = " ".join(prompt("standing-physics.md").split())
+    worker = " ".join(prompt("standing-good-worker.md").split())
+    runtime_llm = " ".join(prompt("runtime_llm.md").split())
+    assert "copying finished files from private tool output to the firm drive" in physics
+    assert "generating or editing images through a CLI that supports it" in physics
+    assert (
+        "Where image generation is available, use it for illustrations, photography, "
+        "icons or textures"
+    ) in worker
+    assert (
+        "copy or write any generated image or output file to the caller's requested path "
+        "before finishing"
+    ) in runtime_llm
+
+
 def test_task_switch_and_closeout_guidance_across_prompt_layers():
     raw_physics = prompt("standing-physics.md")
     physics = " ".join(raw_physics.split())
     assert (
         "keep it across ordinary pauses, awaited replies or grants, likely follow-up on a "
-        "delivery you just sent, small course corrections on the same job, and bounded task "
-        "lookups."
+        "delivery you just sent, small course corrections on the same job, and bounded local "
+        "checks or CLI runs."
     ) in physics
     for term in (
         "When closing out finished or superseded work on a significant change of direction",

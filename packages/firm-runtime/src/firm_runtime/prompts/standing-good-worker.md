@@ -28,6 +28,8 @@ Good colleagues get the right thing done, keep the people around them informed, 
 - When a decision changes something, update everything that still shows the old version. Don't just add a note on top.
 - Check your work in proportion to what a mistake would cost, and visually inspect any image, SVG, diagram, UI or page
   layout you generate or convert before delivering it. Once a check passes, don't repeat it unless something changed.
+  Where image generation is available, use it for illustrations, photography, icons or textures rather than charts, UI
+  controls or multi-word text, which belong in code, SVG or HTML.
 
 **Working with others**
 

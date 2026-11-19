@@ -631,12 +631,6 @@ class Sandbox:
     def layout(self, role_id):
         return Layout.for_role(role_id)
 
-    def child_layout(self, role_id, run_id):
-        role = self.layout(role_id)
-        root = f"/var/lib/firm/task-homes/{identifier(run_id)}"
-        return replace(role, private=f"{root}/home", state=f"{root}/state",
-                       credentials=f"/run/firm/{identifier(role_id)}/tasks/{run_id}/credentials")
-
     # ---- the Mac lease --------------------------------------------------------------
 
     def _lease_tunnel(self, lease_id, station=None):
@@ -887,43 +881,6 @@ class Sandbox:
         run = self._admit(spec, drive)
         self._events.write("run.started", run)
         return run
-
-    @lifecycle()
-    def start_child(self, parent: Run, *, run_id: str, argv, seconds_remaining: float,
-                    env=None, secrets=None, secret_env=None, stdin=b""):
-        """Launch only inside this live parent; the guest derives all identity/state.
-
-        A task gets its parent role's egress proxy settings, as every run does.
-        """
-        self.linux._check_run(parent)
-        self._check_admission()
-        env, secrets, secret_env = proxied(
-            self.linux.network.proxy_url(parent.role_id), env or {}, secrets or {},
-            secret_env or {},
-        )
-        return self.linux.rpc(
-            "start-child", parent_run_id=parent.run_id, run_id=identifier(run_id),
-            argv=list(argv), seconds_remaining=seconds_remaining, env=env,
-            secrets={key: base64.b64encode(value).decode() for key, value in secrets.items()},
-            secret_env=secret_env, stdin=base64.b64encode(stdin).decode(),
-            host_time=time.time(),
-        )
-
-    @lifecycle()
-    def child_status(self, run_id: str):
-        return self.linux.rpc("child-status", run_id=identifier(run_id))
-
-    @lifecycle()
-    def child_logs(self, run_id: str, *, offset=0, limit=1024 * 1024):
-        result = self.linux.rpc(
-            "child-logs", run_id=identifier(run_id), offset=offset, limit=limit,
-        )
-        return base64.b64decode(result["data"], validate=True)
-
-    @lifecycle()
-    def stop_child(self, run_id: str):
-        # Also fences a launch whose reply was lost, or which has not arrived yet.
-        return self.linux.rpc("stop-child", run_id=identifier(run_id), timeout=60)
 
     @lifecycle()
     def stop(self, run: Run, timeout=STOP_TIMEOUT):

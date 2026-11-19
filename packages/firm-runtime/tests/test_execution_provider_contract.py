@@ -1,5 +1,6 @@
 """Exercise the shared launch boundary with all three real native adapters."""
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -12,7 +13,6 @@ from firm_sandbox import Layout
 from test_agy_credentials import account
 from test_agy_provider import encode, stream
 from test_codex_provider import invocation
-from test_task_providers import logs as worker_logs
 
 from firm_runtime import agy_launch
 from firm_runtime.errors import FirmError
@@ -24,12 +24,32 @@ from firm_runtime.provider_contract import (
     incident_code,
 )
 from firm_runtime.provider_registry import provider_implementation
-from firm_runtime.provider_support import render_invocation, standing
-from firm_runtime.providers import Providers, provider_adapter, record_task_output
+from firm_runtime.provider_support import MCP_TIMEOUT_SECONDS, render_invocation, standing
+from firm_runtime.providers import Providers, provider_adapter
 from firm_runtime.runtime import Runtime
 from firm_runtime.store import Store
 from firm_runtime.summaries import SummaryLaunch
-from firm_runtime.task_runner import WORKER_INSTRUCTIONS
+
+
+def worker_logs(name):
+    session = "11111111-1111-4111-8111-111111111111"
+    if name == "claude":
+        events = [
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "Done",
+                "session_id": session,
+            }
+        ]
+    else:
+        events = [
+            {"type": "thread.started", "thread_id": session},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "Done"}},
+            {"type": "turn.completed"},
+        ]
+    return "\n".join(json.dumps(event) for event in events).encode()
 
 
 @pytest.mark.parametrize("code,kept", [
@@ -92,8 +112,7 @@ def test_real_role_request_preserves_native_mcp_and_resume_behavior(
     request = RoleLaunchRequest(
         invocation=call, role_id="r-contract", run_id="run-contract",
         mcp_url="http://firm.local:8421/mcp", provider_session_id=native,
-        offered_tools=("peek", "handoff", "task"),
-        task_timeout_seconds=645.25,
+        offered_tools=("peek", "handoff"),
     )
     assert adapter.validate_credentials() is None
     spec = adapter.build_spec(request, layout=Layout())
@@ -109,7 +128,7 @@ def test_real_role_request_preserves_native_mcp_and_resume_behavior(
         assert mcp == {"mcpServers": {"firm": {
             "type": "http", "url": request.mcp_url,
             "headers": {"Authorization": "Bearer ${FIRM_ACTIVATION_TOKEN}"},
-            "timeout": 711000,
+            "timeout": MCP_TIMEOUT_SECONDS * 1000,
         }}}
         assert "--strict-mcp-config" in command
         flag = "--resume" if resumed else "--session-id"
@@ -126,8 +145,8 @@ def test_real_role_request_preserves_native_mcp_and_resume_behavior(
             f'mcp_servers.firm.url="{request.mcp_url}"',
             'mcp_servers.firm.bearer_token_env_var="FIRM_ACTIVATION_TOKEN"',
             "mcp_servers.firm.required=true",
-            'mcp_servers.firm.enabled_tools=["peek", "handoff", "task"]',
-            "mcp_servers.firm.tool_timeout_sec=711",
+            'mcp_servers.firm.enabled_tools=["peek", "handoff"]',
+            f"mcp_servers.firm.tool_timeout_sec={MCP_TIMEOUT_SECONDS}",
         ]
         assert ("resume" in command) == resumed
         if resumed:
@@ -142,7 +161,7 @@ def test_real_role_request_preserves_native_mcp_and_resume_behavior(
         assert agy_launch._mcp_settings("role") == {"mcpServers": {"firm": {
             "serverUrl": request.mcp_url,
             "headers": {"Authorization": "Bearer " + call.token},
-            "timeoutSeconds": 711,
+            "timeoutSeconds": MCP_TIMEOUT_SECONDS,
             "enabledTools": list(request.offered_tools),
             "tools": {tool: {"eager": True} for tool in request.offered_tools},
         }}}
@@ -156,13 +175,13 @@ def test_real_role_request_preserves_native_mcp_and_resume_behavior(
     assert request.invocation.context["launch_annotation"] == "mutable"
 
 
-@pytest.mark.parametrize("tools", [tuple(TOOL_DESCRIPTIONS), ("peek", "task"), ()])
+@pytest.mark.parametrize("tools", [tuple(TOOL_DESCRIPTIONS), ("peek", "send"), ()])
 def test_real_role_catalog_policy_handles_full_subset_and_empty(real_provider, tools):
     name, adapter, _, _ = real_provider
     request = RoleLaunchRequest(
         invocation=invocation(), role_id="r-policy", run_id="run-policy",
         mcp_url="http://firm.local:8421/mcp", provider_session_id=None,
-        offered_tools=tools, task_timeout_seconds=600,
+        offered_tools=tools,
     )
     if name == "agy" and not tools:
         with pytest.raises(ProviderSetupError) as caught:
@@ -173,57 +192,51 @@ def test_real_role_catalog_policy_handles_full_subset_and_empty(real_provider, t
     command = json.loads(spec.env[f"FIRM_{name.upper()}_ARGV"])
     if name == "codex":
         assert f"mcp_servers.firm.enabled_tools={json.dumps(tools)}" in command
-        assert "mcp_servers.firm.tool_timeout_sec=665" in command
+        assert f"mcp_servers.firm.tool_timeout_sec={MCP_TIMEOUT_SECONDS}" in command
     elif name == "claude":
         denied = {value for value in command if value.startswith("mcp__firm__")}
         assert denied == {f"mcp__firm__{tool}" for tool in TOOL_DESCRIPTIONS if tool not in tools}
         assert json.loads(command[command.index("--mcp-config") + 1])["mcpServers"]["firm"][
             "timeout"
-        ] == 665000
+        ] == MCP_TIMEOUT_SECONDS * 1000
     else:
-        assert spec.env["FIRM_AGY_MCP_TIMEOUT"] == "665"
+        assert spec.env["FIRM_AGY_MCP_TIMEOUT"] == str(MCP_TIMEOUT_SECONDS)
 
 
 @pytest.mark.parametrize("changes", [
     {"offered_tools": ("unknown_tool",)}, {"offered_tools": ("peek*",)},
     {"offered_tools": ("peek", "peek")}, {"offered_tools": (1,)},
-    {"offered_tools": "peek"}, {"task_timeout_seconds": 0},
-    {"task_timeout_seconds": -1}, {"task_timeout_seconds": True},
-    {"task_timeout_seconds": float("nan")}, {"task_timeout_seconds": float("inf")},
-    {"task_timeout_seconds": 2_147_418.01}, {"task_timeout_seconds": "600"},
+    {"offered_tools": "peek"},
 ])
 def test_real_role_rejects_invalid_mcp_policy_before_launch(real_provider, changes):
     _, adapter, _, _ = real_provider
     request = RoleLaunchRequest(
         invocation=invocation(), role_id="r-policy", run_id="run-policy",
         mcp_url="http://firm.local:8421/mcp", provider_session_id=None,
-        offered_tools=tuple(TOOL_DESCRIPTIONS), task_timeout_seconds=600,
+        offered_tools=tuple(TOOL_DESCRIPTIONS),
     )
     with pytest.raises(ProviderSetupError) as caught:
         adapter.build_spec(replace(request, **changes), layout=Layout())
     assert (caught.value.category, caught.value.code) == ("config", "invalid_invocation")
 
 
-@pytest.mark.parametrize("deadline,budget", [(0.25, 66), (600, 665), (2_147_418, 2_147_483)])
-def test_native_mcp_deadline_rounding_and_supported_limit(deadline, budget):
+def test_role_mcp_settings_returns_fixed_timeout():
     from firm_runtime.provider_support import role_mcp_settings
 
-    request = SimpleNamespace(offered_tools=("task",), task_timeout_seconds=deadline)
-    assert role_mcp_settings(request) == (("task",), budget)
+    request = SimpleNamespace(offered_tools=("peek",))
+    assert role_mcp_settings(request) == (("peek",), MCP_TIMEOUT_SECONDS)
 
 
-@pytest.mark.parametrize("task", [False, True])
-def test_real_isolated_builders_preserve_tools_and_have_no_role_authority(real_provider, task):
+def test_real_summary_builders_disable_tools_and_have_no_role_authority(real_provider):
     name, adapter, _, _ = real_provider
     request = SummaryLaunch(
         run_id="s-" + uuid4().hex, prompt="Read this exact input.", timeout=30,
         provider=name, model=adapter.model, effort="high",
         start_url="http://firm.local:8421/summary/start", start_token="summary-secret",
-        instructions=WORKER_INSTRUCTIONS if task else "Summarize only the supplied input.",
-        tools_enabled=task, kind="task" if task else "summary",
+        instructions="Summarize only the supplied input.",
+        tools_enabled=False, kind="summary",
     )
-    builder = adapter.build_task_spec if task else adapter.build_summary_spec
-    spec = builder(request, Layout())
+    spec = adapter.build_summary_spec(request, Layout())
     assert spec.secrets["summary-token"] == b"summary-secret"
     assert spec.secrets["summary-instructions"] == request.instructions.encode()
     assert spec.secret_env["FIRM_SUMMARY_TOKEN"] == "summary-token"
@@ -232,28 +245,21 @@ def test_real_isolated_builders_preserve_tools_and_have_no_role_authority(real_p
     command = json.loads(spec.env[f"FIRM_{name.upper()}_ARGV"])
     if name == "claude":
         assert "--strict-mcp-config" in command
-        if task:
-            assert json.loads(command[command.index("--mcp-config") + 1]) == {"mcpServers": {}}
-        else:
-            assert "--mcp-config" not in command
-        tools = command[command.index("--tools") + 1]
-        assert ("Bash" in tools and "Read" in tools) if task else tools == ""
-        if task:
-            assert "Agent" in command and "Task" in command
+        assert "--mcp-config" not in command
+        assert command[command.index("--tools") + 1] == ""
     elif name == "codex":
         assert "mcp_servers={}" in command
         assert "features.multi_agent=false" in command and "agents.enabled=false" in command
-        assert ("--dangerously-bypass-approvals-and-sandbox" in command) == task
-        assert ("features.shell_tool=false" in command) != task
-        assert ('web_search="disabled"' in command) != task
+        assert "--dangerously-bypass-approvals-and-sandbox" not in command
+        assert "features.shell_tool=false" in command
+        assert 'web_search="disabled"' in command
     else:
-        mode = "task" if task else "tool_free"
-        assert spec.env["FIRM_AGY_MODE"] == mode
+        assert spec.env["FIRM_AGY_MODE"] == "tool_free"
         assert spec.env["FIRM_AGY_MCP_URL"] == ""
-        assert agy_launch._mcp_settings(mode) is None
-        settings = agy_launch._settings(mode)
+        assert agy_launch._mcp_settings("tool_free") is None
+        settings = agy_launch._settings("tool_free")
         assert "mcp(*)" in settings["permissions"]["deny"]
-        assert settings["toolPermission"] == ("always-proceed" if task else "strict")
+        assert settings["toolPermission"] == "strict"
 
 
 def provider_runtime(tmp_path, profile, account_settings):
@@ -293,7 +299,7 @@ def test_retained_execution_uses_captured_model_and_only_matching_current_creden
     assert retained.parse_result(b"", 1).error.model == expected_model
 
 
-def test_stateless_summary_and_task_parsing_survive_changed_accounts_and_credentials(
+def test_stateless_summary_and_llm_parsing_survive_changed_accounts_and_credentials(
     tmp_path, real_provider, monkeypatch
 ):
     name, adapter, profile, settings = real_provider
@@ -301,7 +307,18 @@ def test_stateless_summary_and_task_parsing_survive_changed_accounts_and_credent
     providers = Providers(runtime)
     runner = providers.summary_runner(object(), mcp_url="http://firm.local/mcp")
     request = SummaryLaunch("captured-summary", "Input", 30, provider=name, account_id="personal")
+    runtime.start()
+    call = runtime.admit()
+    runtime.mark_started(call.activation_id)
     with runtime.store.transaction() as db:
+        now = runtime.store.clock()
+        db.execute(
+            "INSERT INTO summary_runs(run_id,started_at,state,input_bytes,account_id,provider,"
+            "model,deadline,token_hash,provider_started_at,kind,caller_activation_id) "
+            "VALUES('captured-llm',?,'running',0,'personal',?,?,?,?,?,'llm',?)",
+            (now, name, adapter.model, now + 60, hashlib.sha256(b"llm-tok").hexdigest(), now,
+             call.activation_id),
+        )
         config = runtime.accounts.config(db)
         config["accounts"]["personal"] = {"provider": "changed", "auth_file": "/missing"}
         config["profiles"]["main"].update(provider="changed", model="changed", effort="invalid")
@@ -313,14 +330,9 @@ def test_stateless_summary_and_task_parsing_survive_changed_accounts_and_credent
         if name == "agy" else worker_logs(name)
     expected = "FIRM_OK" if name == "agy" else "Done"
     assert runner.parse_output(request, output, 0).text == expected
-    assert record_task_output(
-        runtime, "captured-task", name, "personal", output, 0, apply_holds=False
-    ) == expected
+    assert runtime.llm_service.finish("llm-tok", exit_code=0, logs=output)["status"] == "completed"
     with pytest.raises(FirmError, match="summary account/provider binding changed"):
         runner.build_spec(request)
-    task_runner = providers.task_runner(object(), mcp_url="http://firm.local/mcp")
-    with pytest.raises(FirmError, match="task account/provider binding changed"):
-        task_runner.build_spec(SimpleNamespace(account_id="personal", provider=name), object())
     assert adapter.parse_subscription(b"") is None
 
 

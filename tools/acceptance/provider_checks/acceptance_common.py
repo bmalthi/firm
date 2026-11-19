@@ -9,8 +9,11 @@ from firm_runtime.agy_auth import profile_home
 from firm_runtime.provider_contract import ProviderSetupError
 
 PROVIDERS = ("codex", "claude", "agy")
-AGY_MODELS = {f"{model}-{effort}" for model in ("gemini-4-hydrogen", "gemini-4-argon")
-              for effort in ("low", "medium", "high")}
+AGY_MODELS = {
+    f"{model}-{effort}"
+    for model in ("gemini-4-hydrogen", "gemini-4-neon", "gemini-4-carbon", "gemini-4-argon")
+    for effort in ("low", "medium", "high")
+}
 
 
 def selected_profile(source, name, provider=None):
@@ -22,8 +25,6 @@ def selected_profile(source, name, provider=None):
         raise ValueError("--profile must select --provider")
     accounts = {key: source["accounts"][key] for key in profile["accounts"]}
     if profile["provider"] == "agy":
-        if source.get("google_cloud"):
-            raise ValueError("AGY subscription acceptance cannot use [google_cloud]")
         for account in accounts.values():
             if account.get("provider") != "agy":
                 raise ValueError("AGY acceptance requires AGY accounts")
@@ -34,7 +35,7 @@ def selected_profile(source, name, provider=None):
     return profile, accounts
 
 
-# This exact validator also runs in the task guest. It reads the access projection,
+# This exact validator also runs in the guest. It reads the access projection,
 # never the host profile, and returns only fixed labels and booleans.
 AGY_PROJECTION_CHECK = r'''
 def agy_projection_evidence(raw):
@@ -86,7 +87,7 @@ def agy_launch_evidence(spec):
     except (ValueError, TypeError, AttributeError, IndexError):
         model = None
     mode = spec.env.get("FIRM_AGY_MODE")
-    mode = mode if mode in {"role", "task", "tool_free"} else None
+    mode = mode if mode in {"role", "tool_free"} else None
     return {"provider": "agy", "route": "native-subscription", "mode": mode,
             "native_model": model, "credential_projection": projection,
             "quota": "unavailable", "context": "unavailable",
@@ -110,21 +111,8 @@ def capture_agy_launches(box, directory):
     return launches
 
 
-def provider_output(logs):
-    """Remove only the task wrapper's final receipt before native protocol parsing."""
-    lines = logs.splitlines(keepends=True)
-    if lines:
-        try:
-            event = json.loads(lines[-1])
-        except (ValueError, UnicodeError):
-            event = None
-        if isinstance(event, dict) and set(event) == {"task_auth_files"}:
-            return b"".join(lines[:-1])
-    return logs
-
-
 def agy_output_evidence(logs, *, expected_model=None, expected_id=None, exit_code=0):
-    stream = provider_output(logs)
+    stream = logs
     lines = stream.splitlines(keepends=True)
     if lines and expected_id is not None:
         try:
@@ -152,7 +140,7 @@ def agy_output_evidence(logs, *, expected_model=None, expected_id=None, exit_cod
 
 def native_id_from_output(logs):
     """Keep a native ID only in memory for equality checks, never in JSON evidence."""
-    for line in provider_output(logs).splitlines():
+    for line in logs.splitlines():
         try:
             event = json.loads(line)
         except (ValueError, UnicodeError):

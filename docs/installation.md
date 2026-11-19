@@ -41,7 +41,7 @@ If `firm` is not on your shell's `PATH` after installation, run `uv tool update-
 
 ### Path (A): For Coding Agents (Recommended — Non-Interactive CLI Setup)
 
-> **Suggested Way to Run Firm:** Run your host coding agent on a medium-effort model (e.g. `opus` at `medium` effort, or `gpt-6.1-sol` at `medium` effort) and ask it to start the firm, poll `firm status` / `firm analyze --section inbox` every 5 minutes, summarize progress for you, and use `firm send` to message the Founder on your behalf—while you occasionally open the Owner Console (`http://127.0.0.1:8766/`) to preview deliverables.
+> **Suggested Way to Run Firm:** Run your host coding agent on a medium-effort model (e.g. `opus` at `medium` effort, or `gpt-6.2-sol` at `medium` effort) and ask it to start the firm, poll `firm status` / `firm analyze --section inbox` every 5 minutes, summarize progress for you, and use `firm send` to message the Founder on your behalf—while you occasionally open the Owner Console (`http://127.0.0.1:8766/`) to preview deliverables.
 
 Because bare `firm start` requires an interactive TTY (`sys.stdin.isatty()`), a coding agent (Claude Code, Codex, Cursor, etc.) setting up Firm on behalf of a user should use the explicit file-based and JSON-emitting CLI workflow below.
 
@@ -105,7 +105,7 @@ Write three files inside `"$FIRM_DIR"`:
 
      [profiles.codex]                   # or [profiles.claude] with provider = "claude", model = "sonnet"
      provider = "codex"
-     model = "gpt-6-luna"
+     model = "gpt-6.1-terra"
      effort = "medium"
      accounts = ["codex-personal"]      # or ["claude-personal"]
 
@@ -113,7 +113,7 @@ Write three files inside `"$FIRM_DIR"`:
      provider = "codex"
      max_active = 4
      ```
-   * **Single-model account override:** Automatic staffing (`gpt-6-luna` / `gpt-6.1-sol` / `gpt-6-astra` for Codex; `sonnet` / `opus` / `claude-fable-5-1` for Claude), correspondence `[summary]`, and `[task]` workers each have their own default models. If the user's account only has access to a single model (`<MODEL>`), pin all three in `firm.toml`:
+   * **Single-model account override:** Automatic staffing (`gpt-6.1-terra` / `gpt-6.2-sol` / `gpt-6.2-astra` for Codex; `sonnet` / `opus` / `fable` for Claude), correspondence `[summary]`, and `[llm]` guest CLI calls each have their own default models. If the user's account only has access to a single model (`<MODEL>`), pin all three in `firm.toml`:
      ```toml
      max_active = 2
      staffing = false
@@ -133,7 +133,7 @@ Write three files inside `"$FIRM_DIR"`:
      model = "<MODEL>"
      effort = "medium"
 
-     [task.codex]                       # or [task.claude]
+     [llm.codex]                        # or [llm.claude]
      model = "<MODEL>"
      effort = "medium"
      ```
@@ -215,7 +215,7 @@ Firm stores owner data under `firms/` in the current directory by default. Run t
 
 Every guest VM's network interfaces are locked down at the host boundary: there is no direct internet route, no UDP/DNS, and no access to your Mac's loopback or private LAN. All outbound HTTP/HTTPS traffic from roles goes through the host's egress proxy (`packages/firm-sandbox/src/firm_sandbox/egress_proxy.py`).
 
-* **Web Search works out of the box:** Provider-native web search (`web_search` in Codex, `WebSearch` in Claude Code, and `search_web` in AGY roles and tasks) is enabled by default and executes on the provider's servers over the pre-allowed provider API hosts. Firm denies AGY's native page fetch (`read_url`); AGY tool-free runs do not enable search.
+* **Web Search works out of the box:** Provider-native web search (`web_search` in Codex, `WebSearch` in Claude Code, and `search_web` in AGY roles and guest CLI runs) is enabled by default and executes on the provider's servers over the pre-allowed provider API hosts. Firm denies AGY's native page fetch (`read_url`); AGY tool-free runs do not enable search.
 * **Default mode (`egress = "observe"`):** Allows all public HTTP/HTTPS hosts while blocking private/loopback/LAN ranges and logging per-role traffic. Observe is the default because the baseline already includes GitHub, PyPI, npm and Docker Hub, which can receive data, so hostname allowlisting offers little protection while blocking legitimate sites.
 * **Stricter opt-in (`egress = "enforce"`):** Allows the built-in baseline, `[network] allow_hosts`, and owner-granted hosts:
   * **Providers & Web Search:** `*.anthropic.com`, `*.claude.com`, `*.openai.com`, `chatgpt.com`, `*.chatgpt.com`
@@ -248,7 +248,7 @@ login and file-backed credentials. Claude uses `setup-token`; Firm captures the
 token without printing it and saves it in its owner-only credential store. If setup
 is interrupted, rerun `firm start` and choose the incomplete firm to resume.
 
-The first Codex founder defaults to `gpt-6-luna`; Claude defaults to Sonnet. Generated
+The first Codex founder defaults to `gpt-6.1-terra`; Claude defaults to Sonnet. Generated
 firms enable automatic staffing: hires can use the provider's low, medium or high model
 tier rather than the founder's model. The founder is guided to delegate distinct areas
 of work. Guidance selection also consumes subscription quota at initialization, hire
@@ -256,7 +256,7 @@ and mandate revision, with up to three attempts per assessment. See
 [hiring levels](runtime.md#hiring-levels) for the tier models and efforts. Set
 `staffing = false` in `firm.toml` before initialization to keep roles on the founder's
 profile and disable automatic function-guide selection; org-chart guidance still applies.
-For single-model accounts, also pin summary and task models as described in the
+For single-model accounts, also pin summary and `[llm]` models as described in the
 [single-model setup](#path-a-for-coding-agents-recommended--non-interactive-cli-setup).
 These are starting choices, not a promise that every account or workspace exposes every model.
 If a model is unavailable, edit `firm.toml` and apply it with
@@ -347,36 +347,6 @@ The default is under `firms/` in the directory where you launched guided setup.
 [Runtime operations](runtime.md#github) cover the recommended organization settings,
 grants for existing repositories, what roles receive and revoking access.
 
-## Optional: generative images
-
-Image generation is off unless `firm.toml` has a `[google_cloud]` table. To give roles
-one Google Gemini API key, in a Google Cloud project you own:
-
-1. Enable the API, and create a key that can reach it and nothing else:
-
-   ```sh
-   gcloud services enable generativelanguage.googleapis.com apikeys.googleapis.com --project <project>
-   gcloud services api-keys create --project <project> --display-name=firm-images \
-     --api-target=service=generativelanguage.googleapis.com
-   ```
-
-2. Write the key string, alone on one line, to
-   `~/.config/firm-runtime/credentials/google-cloud-<project>.key`, mode `0600`.
-
-3. Add to `firm.toml`:
-
-   ```toml
-   [google_cloud]
-   project = "<project>"
-   ```
-
-4. Put a monthly spend cap on the project in [AI Studio](https://aistudio.google.com/),
-   under **Spend → Monthly spend cap**. Nothing in the firm counts spending, and the key
-   works until Google stops it.
-
-[Runtime operations](runtime.md#generative-images) cover what roles receive, applying it
-to a running firm, and why a Cloud Billing budget is a backstop rather than a cap.
-
 ## Advanced: a Mac with stations
 
 A firm may add one Mac VM carrying several stations, each an account any role can
@@ -408,7 +378,7 @@ See [release procedures](releases.md) and [source and attribution](provenance.md
 AGY is an **experimental subscription provider** in the first-run chooser. Install
 the native host CLI with the [vendor's installer](https://antigravity.google/cli/install.sh);
 the `agy` executable must be on the PATH of the process that runs `firm start`.
-Firm does not fetch it through npm. The guest package pins CLI 1.5.3.
+Firm does not fetch it through npm. The guest package pins CLI 1.5.11.
 
 `firm login ACCOUNT --provider agy` opens the interactive native
 `agy acp --login --include-default-customizations=false` flow in a dedicated
@@ -427,8 +397,7 @@ in native config disable credit overages. Refresh credentials stay on the host;
 guests receive an access-only projection with a blank refresh token and no email
 or unknown fields. Repeating login retries sign-in in the same profile; login
 does not prove model entitlement. Quota/context telemetry are unavailable.
-`[google_cloud]` cannot coexist with AGY because image API-key injection could
-change inference billing. `gemini` is not a provider alias.
+`gemini` is not a provider alias.
 
 Long turns yield after roughly 45–55 minutes and resume the same conversation
 with fresh credentials. AGY reads its token once; replacing it mid-turn cannot

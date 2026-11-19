@@ -42,12 +42,12 @@ launch-time correction, not continuous synchronization during an existing run.
 Each hired role is provisioned on the Linux VM in two phases (recording the identity in the guest ledger before creating the user so interrupted provisioning is idempotent):
 * **Dedicated Account & Slice:** `firmrole-<hash>` with a `0700` home directory, a reserved 65,536-ID subordinate UID/GID range, and `user-<uid>.slice`.
 * **Rootless Docker:** The user manager (`user@<uid>.service`) runs in its default slice (required by `systemd` `OwnerUID` checks so rootless `runc` can allocate container scopes) while all role commands run inside `user-<uid>.slice`.
-* **Task Cgroups:** Short-lived [`task()`](runtime.md#tasks) workers run as child processes inside dedicated root-owned leaf cgroups under the role's slice, killed via `cgroup.kill` on timeout or cancellation.
+* **Guest LLM CLI Shims:** Non-interactive `claude`, `codex`, and `agy` shims installed under `<state_dir>/bin` stage ephemeral credentials on `/run` tmpfs only for an active host `/llm/*` lease, deleting them on exit; the role's existing `user-<uid>.slice` contains all child processes.
 
 ### 20-Second Settlement & Explicit Disposal
 
 Nothing of a role runs between activations (`logind` lingering is off). When an activation ends, settlement runs under a 20-second deadline:
-1. **Kill task children** and read the slice's `memory.peak`, CPU usage, and OOM counters before removing the cgroup.
+1. **Signal slice processes** and read the slice's `memory.peak`, CPU usage, and OOM counters before removing the cgroup.
 2. **Stop the daemon & `user-<uid>.slice`**, then verify `cgroup.events` reads `populated 0` (or the cgroup is absent).
 3. **Unmount `<home>/drive`** and remove temporary run credentials. Settlement does not walk retained storage.
 

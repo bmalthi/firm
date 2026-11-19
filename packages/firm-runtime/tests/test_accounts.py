@@ -738,7 +738,7 @@ def test_model_quota_refusal_pauses_only_the_profile_and_spends_no_attempt(tmp_p
 
 
 def agy_two_profiles(model, effort):
-    """The first profile on an AGY account, where effort xhigh always selects Argon."""
+    """The first profile on an AGY account, where effort xhigh always selects Carbon."""
     config = two_profiles_one_account_configuration()
     config["accounts"]["a"]["provider"] = "agy"
     config["profiles"]["first"].update(provider="agy", model=model, effort=effort)
@@ -782,8 +782,8 @@ def test_model_quota_on_the_profiles_own_settings_is_timed_and_refunds_the_attem
 
 @pytest.mark.parametrize("model,profile_effort,role_effort", [
     ("one", "low", "high"),  # effort alone does not change the model
-    ("gemini-4-argon", "medium", "high"),
-    ("gemini-4-argon", "high", "xhigh"),  # xhigh selects Argon, which the profile names
+    ("gemini-4-carbon", "medium", "high"),
+    ("gemini-4-carbon", "high", "xhigh"),  # xhigh selects Carbon, which the profile names
 ])
 def test_model_quota_on_an_override_that_keeps_the_model_still_holds_the_profile(
     tmp_path, model, profile_effort, role_effort
@@ -808,7 +808,7 @@ def test_model_quota_on_an_override_that_keeps_the_model_still_holds_the_profile
 def test_model_quota_on_an_override_that_selects_another_model_is_the_roles_own_failure(
     tmp_path
 ):
-    # The profile names Hydrogen, but this role's xhigh effort ran Argon: holding the
+    # The profile names Hydrogen, but this role's xhigh effort ran Carbon: holding the
     # profile would pause Hydrogen roles for a refusal that was never about Hydrogen.
     runtime, now = model_quota_system(
         tmp_path, effort="xhigh", config=agy_two_profiles("gemini-4-hydrogen", "medium")
@@ -848,25 +848,25 @@ def test_quota_failure_without_a_binding_or_model_code_still_needs_an_adapter(tm
         )
 
 
-def test_report_task_setup_notifies_once_per_model_and_code(system):
+def test_report_llm_setup_notifies_once_per_model_and_code(system):
     runtime, _ = system
 
     def notices():
         with runtime.store.read() as db:
             return db.execute(
                 "SELECT COUNT(*) FROM messages WHERE body LIKE ?",
-                (render("notices", "task_setup_rejected_subject", provider="codex") + "\n\n%",),
+                (render("notices", "llm_setup_rejected_subject", provider="codex") + "\n\n%",),
             ).fetchone()[0]
 
     for _ in range(2):
         with runtime.store.transaction() as db:
-            runtime.accounts.report_task_setup(db, "codex", "m1", "model_rejected")
+            runtime.accounts.report_llm_setup(db, "codex", "m1", "model_rejected")
     assert notices() == 1
     with runtime.store.transaction() as db:
-        runtime.accounts.report_task_setup(db, "codex", "m2", "model_rejected")
+        runtime.accounts.report_llm_setup(db, "codex", "m2", "model_rejected")
     assert notices() == 2
     with runtime.store.transaction() as db:
-        runtime.accounts.report_task_setup(db, "codex", "m2", "other_code")
+        runtime.accounts.report_llm_setup(db, "codex", "m2", "other_code")
     assert notices() == 3
     assert runtime.accounts.status()["incidents"] == []
 

@@ -80,11 +80,8 @@ def _prepare_auth(kind: str) -> None:
     if kind == "credentials-json":
         os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
         credentials = _claude_home() / ".credentials.json"
-        if os.environ.get("FIRM_TASK_RUN") == "1":
-            credentials.symlink_to(_auth_source())
-        else:
-            shutil.copyfile(_auth_source(), credentials)
-            credentials.chmod(0o600)
+        shutil.copyfile(_auth_source(), credentials)
+        credentials.chmod(0o600)
         return
     raise ValueError("invalid Claude authentication kind")
 
@@ -152,10 +149,7 @@ def main() -> int:
             os.environ["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "0"
             if os.environ.get("FIRM_CREDENTIALS_URL"):
                 mirror = runpy.run_path(str(_auth_source().parent / "credential-mirror"))
-                auth = _auth_source() if os.environ.get("FIRM_TASK_RUN") == "1" else (
-                    claude_home / ".credentials.json"
-                )
-                return mirror["run_claude"](command, auth)
+                return mirror["run_claude"](command, claude_home / ".credentials.json")
             os.execvpe(command[0], command, os.environ)
             return 0
         token = os.environ["FIRM_ACTIVATION_TOKEN"]
@@ -163,6 +157,13 @@ def main() -> int:
             raise ValueError("missing activation token")
         if not _begin_activation(os.environ["FIRM_ACTIVATION_START_URL"], token):
             return 70
+        if llm_url := os.environ.pop("FIRM_LLM_URL", None):
+            runpy.run_path(str(_auth_source().parent / "llm-cli"))["install_shims"](
+                _absolute("FIRM_STATE_DIR"),
+                _absolute("FIRM_CREDENTIALS_DIR"),
+                _absolute("FIRM_PRIVATE_HOME"),
+                llm_url,
+            )
 
         # The selected account token is the only provider credential source.
         for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):

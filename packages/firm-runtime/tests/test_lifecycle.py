@@ -6,7 +6,7 @@ import json
 import pytest
 
 from firm_runtime import guidance
-from firm_runtime.accounts import TASK_DEFAULTS
+from firm_runtime.accounts import LLM_DEFAULTS
 from firm_runtime.errors import FirmError
 from firm_runtime.lifecycle import FOUNDER_ID, Lifecycle
 from firm_runtime.messaging import Messaging
@@ -79,7 +79,7 @@ def test_initialize_is_stopped_atomic_and_exactly_once(tmp_path):
 
     assert first == second
     assert first["firm"] == {
-        "firm_id": "acme", "state": "stopped", "config": {**CONFIG, "task": TASK_DEFAULTS}
+        "firm_id": "acme", "state": "stopped", "config": {**CONFIG, "llm": LLM_DEFAULTS}
     }
     assert first["founder"]["employee_id"] == FOUNDER_ID
     assert first["founder"]["manager_id"] == OWNER
