@@ -2027,55 +2027,6 @@ def test_unprepared_mac_refuses_acquire_without_a_station_or_lease(box):
     assert box._mac_stations == {}
 
 
-def test_child_rpc_facade_carries_worker_launch_settings(box, monkeypatch):
-    from firm_sandbox import Run
-
-    box.up()
-    parent = Run("analyst", "parent", box.linux.generation)
-    calls = []
-
-    def rpc(operation, **payload):
-        calls.append((operation, payload))
-        return {"data": base64.b64encode(b"answer").decode(), "confirmed": True}
-
-    monkeypatch.setattr(box.linux, "rpc", rpc)
-    box.start_child(parent, run_id="task-one", argv=("sh", "-c", "printf answer"),
-                    seconds_remaining=123, env={"WORKER": "1"}, secrets={"auth": b"token"},
-                    secret_env={"PROVIDER_AUTH": "auth"}, stdin=b"instruction")
-    box.child_status("task-one")
-    assert box.child_logs("task-one", offset=2, limit=4) == b"answer"
-    assert box.stop_child("task-one")["confirmed"]
-    url = base64.b64encode(box.linux.network.proxy_url("analyst").encode()).decode()
-    assert calls[0][1].pop("host_time") <= time.time()
-    assert calls == [
-        ("start-child", {"parent_run_id": "parent", "run_id": "task-one",
-                         "argv": ["sh", "-c", "printf answer"], "seconds_remaining": 123,
-                         "env": {"WORKER": "1", "NO_PROXY": "localhost,127.0.0.1,::1",
-                                 "no_proxy": "localhost,127.0.0.1,::1"},
-                         "secrets": {"auth": "dG9rZW4=", "egress-proxy": url},
-                         "secret_env": {"PROVIDER_AUTH": "auth", "HTTPS_PROXY": "egress-proxy",
-                                        "HTTP_PROXY": "egress-proxy",
-                                        "https_proxy": "egress-proxy",
-                                        "http_proxy": "egress-proxy"},
-                         "stdin": "aW5zdHJ1Y3Rpb24="}),
-        ("child-status", {"run_id": "task-one"}),
-        ("child-logs", {"run_id": "task-one", "offset": 2, "limit": 4}),
-        ("stop-child", {"run_id": "task-one", "timeout": 60}),
-    ]
-    with pytest.raises(ValueError, match="discarded VM"):
-        box.start_child(Run("analyst", "parent", "old"), run_id="late", argv=("true",),
-                        seconds_remaining=123)
-
-
-def test_child_layout_uses_disk_state_and_tmpfs_credentials(box):
-    layout = box.child_layout("analyst", "task-one")
-    parent = box.layout("analyst")
-    assert layout.private == "/var/lib/firm/task-homes/task-one/home"
-    assert layout.state == "/var/lib/firm/task-homes/task-one/state"
-    assert layout.credentials == "/run/firm/analyst/tasks/task-one/credentials"
-    assert (layout.private_work, layout.drive) == (parent.private_work, parent.drive)
-
-
 def test_disposal_calls_guest_control_without_retiring_files(box):
     assert box.dispose("analyst") == {}
     assert ("dispose", {"role_id": "analyst"}) in box.linux.calls

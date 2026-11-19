@@ -22,7 +22,6 @@ from firm_runtime.prompt_records import record_inputs
 from firm_runtime.provider_contract import ProviderSetupError, RoleLaunchRequest
 from firm_runtime.provider_support import render_invocation, standing, summary_instructions
 from firm_runtime.summaries import SummaryLaunch
-from firm_runtime.task_runner import WORKER_INSTRUCTIONS
 
 FIXTURES = Path(__file__).resolve().parents[3] / "tools/tests/fixtures/agy"
 
@@ -241,7 +240,7 @@ def test_tool_catalog_and_response_prose_are_not_execution_evidence():
     assert parse_summary(encode(events), 0).error is None
 
 
-@pytest.mark.parametrize("mode", ["role", "task", "tool_free"])
+@pytest.mark.parametrize("mode", ["role", "tool_free"])
 def test_fake_launch_spec_has_one_native_turn_and_mode_authority(tmp_path, mode):
     path = account(tmp_path, expiry=4102444800)
     provider = AgyProvider(model="gemini-4-hydrogen", effort="medium", auth_file=path)
@@ -255,7 +254,6 @@ def test_fake_launch_spec_has_one_native_turn_and_mode_authority(tmp_path, mode)
                 mcp_url='http://firm.local:8421/mcp',
                 provider_session_id=None,
                 offered_tools=tuple(TOOL_DESCRIPTIONS),
-                task_timeout_seconds=600,
             ),
             layout=Layout(),
         )
@@ -270,10 +268,9 @@ def test_fake_launch_spec_has_one_native_turn_and_mode_authority(tmp_path, mode)
             start_url="http://firm.local:8421/summary/start",
             start_token="synthetic-summary",
             instructions="  Synthetic policy 🧭\n\n  Exact indentation.\n",
-            tools_enabled=mode == "task",
+            tools_enabled=False,
         )
-        build = provider.build_task_spec if mode == "task" else provider.build_summary_spec
-        spec = build(request, Layout())
+        spec = provider.build_summary_spec(request, Layout())
         expected_instructions = request.instructions
         assert spec.secret_env == {"FIRM_SUMMARY_TOKEN": "summary-token"}
         assert "activation-token" not in spec.secrets
@@ -299,14 +296,16 @@ def test_fake_launch_spec_has_one_native_turn_and_mode_authority(tmp_path, mode)
 
 def test_native_model_id_maps_xhigh_and_rejects_encoded_model():
     assert native_model_id("gemini-4-argon", "high") == "gemini-4-argon-high"
+    assert native_model_id("gemini-4-neon", "medium") == "gemini-4-neon-medium"
+    assert native_model_id("neon", "high") == "gemini-4-neon-high"
     assert native_model_id("gemini-4-hydrogen", "low") == "gemini-4-hydrogen-low"
-    assert native_model_id("gemini-4-hydrogen", "xhigh") == "gemini-4-argon-high"
+    assert native_model_id("gemini-4-hydrogen", "xhigh") == "gemini-4-carbon-high"
     for model, effort in [("gemini-4-argon", "max"), ("gemini-4-hydrogen-high", "high")]:
         with pytest.raises(ProviderSetupError):
             native_model_id(model, effort)
 
 
-@pytest.mark.parametrize("kind", ["activations", "summaries", "staffing", "tasks"])
+@pytest.mark.parametrize("kind", ["activations", "summaries", "staffing"])
 def test_built_specs_record_exact_instructions_and_native_stdin(tmp_path, kind):
     provider = AgyProvider(
         model="gemini-4-hydrogen", effort="medium",
@@ -322,7 +321,6 @@ def test_built_specs_record_exact_instructions_and_native_stdin(tmp_path, kind):
                 mcp_url='http://firm.local:8421/mcp',
                 provider_session_id=None,
                 offered_tools=tuple(TOOL_DESCRIPTIONS),
-                task_timeout_seconds=600,
             ),
             layout=Layout(),
         )
@@ -338,20 +336,15 @@ def test_built_specs_record_exact_instructions_and_native_stdin(tmp_path, kind):
             provider="agy",
             start_url="http://firm.local:8421/summary/start",
             start_token="synthetic-summary",
-            kind={"summaries": "summary", "staffing": "staffing", "tasks": "task"}[kind],
+            kind={"summaries": "summary", "staffing": "staffing"}[kind],
             instructions=custom_instructions if kind == "staffing" else None,
-            tools_enabled=kind == "tasks",
+            tools_enabled=False,
         )
-        build = provider.build_task_spec if kind == "tasks" else provider.build_summary_spec
-        spec = build(request, Layout())
-        instructions = (
-            custom_instructions if kind == "staffing"
-            else WORKER_INSTRUCTIONS if kind == "tasks"
-            else summary_instructions()
-        )
+        spec = provider.build_summary_spec(request, Layout())
+        instructions = custom_instructions if kind == "staffing" else summary_instructions()
         prompt = request.prompt
-        input_name = "task.txt" if kind == "tasks" else "sources.txt"
-        assert spec.env["FIRM_AGY_MODE"] == ("task" if kind == "tasks" else "tool_free")
+        input_name = "sources.txt"
+        assert spec.env["FIRM_AGY_MODE"] == "tool_free"
     expected_stdin = (
         json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
     ).encode()
@@ -416,7 +409,7 @@ def test_guest_environment_keeps_the_roles_playwright_cache(monkeypatch, tmp_pat
     assert env["PLAYWRIGHT_SKIP_BROWSER_GC"] == "1"
 
 
-@pytest.mark.parametrize("mode", ["role", "task", "tool_free"])
+@pytest.mark.parametrize("mode", ["role", "tool_free"])
 def test_preparation_writes_private_native_home_and_named_agent(tmp_path, monkeypatch, mode):
     import os
 
@@ -628,7 +621,7 @@ def test_tool_errors_do_not_fail_activation(firm):
     assert result.success
 
 
-@pytest.mark.parametrize("mode", ["role", "task", "tool_free"])
+@pytest.mark.parametrize("mode", ["role", "tool_free"])
 def test_mode_permissions_include_explicit_native_denials(mode):
     settings = agy_launch._settings(mode)
     denied = settings["permissions"]["deny"]
@@ -645,8 +638,10 @@ def test_mode_permissions_include_explicit_native_denials(mode):
         assert settings["agentMode"] == "accept-edits"
         assert "run_command" in agy_launch._mode_tools(mode)
         assert "search_web" in agy_launch._mode_tools(mode)
+        assert "generate_image" in agy_launch._mode_tools(mode)
         assert "allow" not in settings["permissions"]
         assert "search_web(*)" not in denied
+        assert "generate_image(*)" not in denied
         assert "read_file(*)" not in denied
     assert ("mcp(*)" in denied) is (mode != "role")
 
@@ -680,7 +675,7 @@ def test_print_timeout_ignores_idle_limit_and_respects_token_margin(
         assert agy_launch._print_timeout(path) == ["--print-timeout", f"{expected}s"]
 
 
-@pytest.mark.parametrize("mode", ["role", "task", "tool_free"])
+@pytest.mark.parametrize("mode", ["role", "tool_free"])
 def test_fake_native_launch_persists_session_and_removes_secrets(tmp_path, mode):
     import os
     import subprocess
@@ -776,7 +771,7 @@ print(json.dumps({'event': 'result', 'result': {'conversation_id': identifier,
     first = subprocess.run(launcher, input=spec.stdin, env=env, capture_output=True, timeout=10)
     assert first.returncode == 0, first.stderr.decode()
     assert parse_result(first.stdout, first.returncode).success
-    assert parse_usage(first.stdout).resolved_model == "gemini-4-argon-high"
+    assert parse_usage(first.stdout).resolved_model == "gemini-4-carbon-high"
     home = private / ".firm/agy-sessions" / spec.env["FIRM_RUNTIME_SESSION_ID"]
     assert (home / ".gemini/antigravity-cli/conversations/synthetic-session.db").is_file()
     for relative in (
@@ -866,7 +861,7 @@ def test_launcher_keeps_shared_mirror_error_without_setup_override(
 
     for key, value in {
         "FIRM_AGY_ARGV": '["/fake/agy", "--print="]',
-        "FIRM_AGY_MODE": "task", "FIRM_SUMMARY_TOKEN": "synthetic",
+        "FIRM_AGY_MODE": "tool_free", "FIRM_SUMMARY_TOKEN": "synthetic",
         "FIRM_SUMMARY_START_URL": "http://synthetic/start",
         "FIRM_CREDENTIALS_URL": "http://synthetic/credentials",
         "FIRM_CREDENTIALS_DIR": str(tmp_path),

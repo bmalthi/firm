@@ -11,7 +11,7 @@ Standing instructions, in order:
 
 - `workplace.json`: identity, manager, and complete owner mandate.
 - `workplace.json`: workspace paths and access rules.
-- `workplace.json`: configured service and Mac capabilities, or their explicit absence.
+- `workplace.json`: configured LLM CLIs (when enabled) and service/Mac capabilities, or their explicit absence.
 - `standing-physics.md`: common workplace physics (how the workplace operates).
 - `standing-good-worker.md`: common good-worker guidance (how to do useful work
   with others).
@@ -30,7 +30,7 @@ Standing instructions, in order:
 
 - `workplace.json`: current identity, manager, and complete owner mandate.
 - `workplace.json`: workspace paths and access rules.
-- `workplace.json`: configured service and Mac capabilities, or their explicit absence.
+- `workplace.json`: configured LLM CLIs (when enabled) and service/Mac capabilities, or their explicit absence.
 - `standing-physics.md`.
 - `standing-good-worker.md`.
 - `guidance-introduction.md` and selected scope/function bodies, when any apply.
@@ -55,7 +55,7 @@ Standing instructions, in order:
 - `workplace.json`: identity, manager, and complete delegated mandate.
 - `workplace.json`: workspace paths, access rules, and instructions for looking
   up the founder's mandate.
-- `workplace.json`: configured service and Mac capabilities, or their explicit absence.
+- `workplace.json`: configured LLM CLIs (when enabled) and service/Mac capabilities, or their explicit absence.
 - `standing-physics.md`.
 - `standing-good-worker.md`.
 - `guidance-introduction.md` and selected scope/function bodies, when any apply.
@@ -75,7 +75,7 @@ Standing instructions, in order:
 - `workplace.json`: current identity, manager, and complete delegated mandate.
 - `workplace.json`: workspace paths, access rules, and founder-mandate lookup
   instructions.
-- `workplace.json`: configured service and Mac capabilities, or their explicit absence.
+- `workplace.json`: configured LLM CLIs (when enabled) and service/Mac capabilities, or their explicit absence.
 - `standing-physics.md`.
 - `standing-good-worker.md`.
 - `guidance-introduction.md` and selected scope/function bodies, when any apply.
@@ -120,7 +120,7 @@ These are used by isolated runtime calls, not injected into employee activations
 - `runtime_summary.md`: correspondence summarization. Employees receive the
   derived summary, not these instructions.
 - `runtime_level-choice.md`: one isolated staffing assessment for pending level and/or guidance decisions.
-- `runtime_task.md`: bounded `task` worker instructions.
+- `runtime_llm.md`: host-brokered guest LLM CLI instructions supplied by the CLI shim.
 
 ## Role guidance and limits
 

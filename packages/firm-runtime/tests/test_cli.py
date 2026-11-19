@@ -411,7 +411,7 @@ def test_guided_start_creates_starter_firm_and_starts_it(tmp_path, monkeypatch, 
     assert login["state_directory"] == firm / ".setup-login" / "codex-personal"
     assert login["target_credentials_path"] == accounts.credentials_path("codex-personal")
     assert (firm / "mandate.md").read_text().startswith("# Make a useful weekly planner")
-    assert 'model = "gpt-6-luna"' in (firm / "firm.toml").read_text()
+    assert 'model = "gpt-6.1-terra"' in (firm / "firm.toml").read_text()
     assert (firm / "durable" / "firm.sqlite3").is_file()
     assert not (firm / "firm-release.json").exists()
     assert "Owner console: http://127.0.0.1:8766/unlock/test-key" in output
@@ -1237,35 +1237,35 @@ def test_owner_decides_requests_and_hosts_through_the_sandbox(tmp_path, monkeypa
     assert "take one host" in capsys.readouterr().err
 
 
-def test_task_config_applied_by_init_and_configure(tmp_path, monkeypatch, capsys):
-    from firm_runtime.accounts import TASK_DEFAULTS
+def test_llm_config_applied_by_init_and_configure(tmp_path, monkeypatch, capsys):
+    from firm_runtime.accounts import LLM_DEFAULTS
     from firm_runtime.store import Store
 
-    directory = _init_firm(tmp_path, monkeypatch, capsys, "task-config")
+    directory = _init_firm(tmp_path, monkeypatch, capsys, "llm-config")
     store = Store(directory / "durable" / "firm.sqlite3")
 
     def stored():
         with store.read() as db:
             return json.loads(store.firm(db)["config_json"])
 
-    assert stored()["task"] == TASK_DEFAULTS
+    assert stored()["llm"] == LLM_DEFAULTS
     config = tmp_path / "replacement.toml"
     base = 'max_active = 2\nstaffing = false\nfounder_profile = "controlled"\n'
     config.write_text(
-        base + "[profiles.controlled]\n[task]\nmax_concurrent = 1\n"
-        '[task.claude]\nmodel = "custom-opus"\neffort = "high"\n'
+        base + "[profiles.controlled]\n[llm]\nmax_concurrent = 1\n"
+        '[llm.claude]\nmodel = "custom-opus"\neffort = "high"\n'
         '[summary.codex]\nmodel = "summary-test"\neffort = "low"\n'
     )
     result = _invoke(monkeypatch, capsys, "configure", directory, "--config", config)
     assert result["status"] == "applied"
-    assert stored()["task"] == {
-        **TASK_DEFAULTS,
+    assert stored()["llm"] == {
+        **LLM_DEFAULTS,
         "max_concurrent": 1,
         "claude": {"model": "custom-opus", "effort": "high"},
     }
     assert stored()["summary"]["codex"]["model"] == "summary-test"
     before = stored()
-    config.write_text(base + "[profiles.controlled]\n[task]\nmax_concurrent = true\n")
+    config.write_text(base + "[profiles.controlled]\n[llm]\nmax_concurrent = true\n")
     monkeypatch.setattr(sys, "argv", ["firm", "configure", str(directory), "--config", str(config)])
     with pytest.raises(SystemExit) as error:
         main()

@@ -60,6 +60,7 @@ class OwnerControls:
             self.validate_reconfiguration(db, config)
         app = github.connect(config["github"]) if "github" in config else None
         with self.store.transaction() as db:
+            self.runtime.llm_service._sweep_expired(db, self.store.clock())
             self.validate_reconfiguration(db, config)
             corrected = self.runtime.context.refresh_policies(db, config)
             db.execute("UPDATE firm SET config_json=?", (encoded(config),))
@@ -84,13 +85,21 @@ class OwnerControls:
             raise FirmError("configuration must retain current roles' primary profiles")
         if self.runtime.accounts.enabled(db) and "accounts" not in config:
             raise FirmError("cannot remove named accounts from an execution host")
+        now = self.store.clock()
         for row in db.execute(
-            "SELECT DISTINCT account_id,provider FROM summary_runs "
-            "WHERE kind='task' AND state='running'"
+            "SELECT DISTINCT t.account_id,t.provider FROM summary_runs t "
+            "JOIN activations a ON a.activation_id=t.caller_activation_id "
+            "LEFT JOIN sandbox_runs s ON s.activation_id=a.activation_id "
+            "WHERE t.kind='llm' AND t.state='running' "
+            "AND (t.deadline IS NULL OR t.deadline>?) "
+            "AND (t.lease_until IS NULL OR t.lease_until>?) "
+            "AND a.state='running' AND s.stop_cause IS NULL "
+            "AND (s.deadline IS NULL OR s.deadline>?)",
+            (now, now, now),
         ):
             account = config.get("accounts", {}).get(row["account_id"])
             if account is None or account["provider"] != row["provider"]:
-                raise FirmError("configuration must retain accounts held by tasks")
+                raise FirmError("configuration must retain accounts held by active LLM CLI runs")
 
     @staticmethod
     def _scope(address):

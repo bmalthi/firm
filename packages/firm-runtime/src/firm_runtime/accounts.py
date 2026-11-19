@@ -11,7 +11,11 @@ from uuid import uuid4
 from .errors import FirmError
 from .prompt_resources import render
 from .provider_contract import auth_repair, incident_code
-from .provider_definitions import PROVIDER_DEFINITIONS, effective_model, incompatible_service
+from .provider_definitions import (
+    PROVIDER_DEFINITIONS,
+    effective_model,
+    resolve_model,
+)
 from .store import CONTROL_PRIORITY, OPERATIONS, ORDINARY_PRIORITY, OWNER, encoded
 from .telemetry import CONTEXT_POLICY_KEYS
 
@@ -22,37 +26,42 @@ ACCOUNT_NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 SUBSCRIPTION_READING_FRESH_SECONDS = 5 * 60
 
-TASK_DEFAULTS = {
-    "agy": PROVIDER_DEFINITIONS["agy"].task.as_dict(),
+LLM_DEFAULTS = {
+    "enabled": True,
     "max_concurrent": 2,
-    "timeout_seconds": 600,
-    "max_instruction_bytes": 16384,
-    "max_answer_bytes": 16384,
-    "codex": PROVIDER_DEFINITIONS["codex"].task.as_dict(),
-    "claude": PROVIDER_DEFINITIONS["claude"].task.as_dict(),
+    "timeout_seconds": 1800,
+    "agy": PROVIDER_DEFINITIONS["agy"].llm.as_dict(),
+    "codex": PROVIDER_DEFINITIONS["codex"].llm.as_dict(),
+    "claude": PROVIDER_DEFINITIONS["claude"].llm.as_dict(),
 }
 
 
-def task_settings(value):
-    """Validate and fill task defaults without changing the supplied mapping."""
-    if not isinstance(value, dict) or set(value) - set(TASK_DEFAULTS):
-        raise FirmError("task has unsupported settings")
+def llm_settings(value):
+    """Validate and fill [llm] defaults without changing the supplied mapping."""
+    if not isinstance(value, dict) or set(value) - set(LLM_DEFAULTS):
+        raise FirmError("llm has unsupported settings")
     result = {}
-    for key, default in TASK_DEFAULTS.items():
+    for key, default in LLM_DEFAULTS.items():
         setting = value.get(key, default)
-        if isinstance(default, dict):
+        if key == "enabled":
+            if type(setting) is not bool:
+                raise FirmError("llm.enabled must be a boolean")
+        elif key == "timeout_seconds":
+            if type(setting) is not int or not 1 <= setting <= 86400:
+                raise FirmError("llm.timeout_seconds must be an integer between 1 and 86400")
+        elif isinstance(default, dict):
             if not isinstance(setting, dict) or set(setting) - set(default):
-                raise FirmError(f"task.{key} has unsupported settings")
+                raise FirmError(f"llm.{key} has unsupported settings")
             setting = {**default, **setting}
             if not isinstance(setting["model"], str) or not setting["model"].strip():
-                raise FirmError(f"task.{key}.model must be non-empty")
+                raise FirmError(f"llm.{key}.model must be non-empty")
             if (
                 not isinstance(setting["effort"], str)
                 or setting["effort"] not in PROVIDER_DEFINITIONS[key].supported_efforts
             ):
-                raise FirmError(f"unsupported task effort for {key}")
+                raise FirmError(f"unsupported llm effort for {key}")
         elif type(setting) is not int or setting <= 0:
-            raise FirmError(f"task.{key} must be a positive integer")
+            raise FirmError(f"llm.{key} must be a positive integer")
         result[key] = setting
     return result
 
@@ -161,7 +170,11 @@ def credentials_path(account, provider=None):
 
 def validate_accounts(config):
     """Controlled execution need not configure external providers or accounts."""
-    config["task"] = task_settings(config.get("task", {}))
+    if "task" in config:
+        raise FirmError("[task] has been replaced by [llm]")
+    if "google_cloud" in config:
+        raise FirmError("[google_cloud] has been removed; use Codex or AGY image generation")
+    config["llm"] = llm_settings(config.get("llm", {}))
     summary = config.get("summary")
     if summary is not None:
         if not isinstance(summary, dict) or set(summary) - set(PROVIDER_DEFINITIONS):
@@ -182,18 +195,6 @@ def validate_accounts(config):
     if "accounts" not in config:
         return
     accounts, profiles = config["accounts"], config["profiles"]
-    for collection in (accounts, profiles):
-        if not isinstance(collection, dict):
-            continue
-        for item in collection.values():
-            if not isinstance(item, dict) or not isinstance(item.get("provider"), str):
-                continue
-            provider = item["provider"]
-            service = incompatible_service(provider, config)
-            if service is not None:
-                raise FirmError(
-                    f"{provider.upper()} subscription inference cannot coexist with [{service}]"
-                )
     if not isinstance(accounts, dict) or not accounts:
         raise FirmError("accounts must be a nonempty mapping")
     for name, account in accounts.items():
@@ -354,29 +355,33 @@ class Accounts:
         self._notify_block(db, role, incident)
 
     def _usage(self, db, account_id):
-        """Live roles plus tasks, borrowing one slot per live caller activation.
+        """Live roles plus guest LLM CLIs, borrowing one slot per same-account caller.
 
-        After caller exit every unresolved task holds a slot. Summary and staffing
-        retain their deliberate exemption from configured slots.
-        A running task with a reason has already returned an unconfirmed refusal;
-        only a still-waiting call (NULL reason) can borrow the caller's slot.
+        After caller exit every unresolved CLI run holds a slot. A cross-account
+        CLI call never borrows the caller's slot on another account. Summary and
+        staffing retain their deliberate exemption from configured slots.
         """
         roles = db.execute(
             "SELECT COUNT(*) FROM activations a JOIN execution_bindings b USING(session_id) "
             "WHERE b.account_id=? AND a.state IN ('admitted','running')",
             (account_id,),
         ).fetchone()[0]
-        tasks = db.execute(
+        now = self.store.clock()
+        llm_runs = db.execute(
             "SELECT COALESCE(SUM(n-borrowed),0) FROM ("
             "SELECT COUNT(*) AS n, CASE WHEN a.state IN ('admitted','running') "
+            "AND b.account_id=t.account_id "
             "AND COUNT(CASE WHEN t.reason IS NULL THEN 1 END)>0 "
             "THEN 1 ELSE 0 END AS borrowed FROM summary_runs t "
             "JOIN activations a ON a.activation_id=t.caller_activation_id "
-            "WHERE t.kind='task' AND t.state='running' AND t.account_id=? "
+            "LEFT JOIN execution_bindings b ON b.session_id=a.session_id "
+            "WHERE t.kind='llm' AND t.state='running' AND t.account_id=? "
+            "AND (t.deadline IS NULL OR t.deadline>?) "
+            "AND (t.lease_until IS NULL OR t.lease_until>?) "
             "GROUP BY t.caller_activation_id)",
-            (account_id,),
+            (account_id, now, now),
         ).fetchone()[0]
-        return roles + tasks
+        return roles + llm_runs
 
     def _conversations(self, db, account_id):
         """Roles whose current conversation is bound to the account, running or waiting."""
@@ -390,7 +395,7 @@ class Accounts:
         """Isolated summary and staffing runs on the account, outside its slots."""
         return db.execute(
             "SELECT COUNT(*) FROM summary_runs WHERE account_id=? AND state='running' "
-            "AND kind!='task'",
+            "AND kind!='llm'",
             (account_id,),
         ).fetchone()[0]
 
@@ -441,7 +446,7 @@ class Accounts:
             "account_id": account_id,
             "profile": profile_name,
             "provider": provider,
-            "model": setting["model"],
+            "model": resolve_model(provider, setting["model"]),
             "effort": setting["effort"],
         }
 
@@ -646,7 +651,11 @@ class Accounts:
             "profile": name,
             "account_id": account_id,
             "provider": profile["provider"],
-            "settings_json": encoded({**profile, "effort": effort or profile["effort"]}),
+            "settings_json": encoded({
+                **profile,
+                "model": resolve_model(profile["provider"], profile["model"]),
+                "effort": effort or profile["effort"],
+            }),
             "account_json": encoded(accounts[account_id]),
         }
 
@@ -781,17 +790,17 @@ class Accounts:
             self._notify_block(db, role, incident)
         return incident_id
 
-    def report_task_setup(self, db, provider, model, code):
-        """Tell the owner once that task workers on a provider cannot be set up.
+    def report_llm_setup(self, db, provider, model, code):
+        """Tell the owner once that a guest LLM CLI on a provider cannot be set up.
 
-        A task takes its model and effort from ``[task]``, not from an account or a
-        profile, so a failure of those settings holds nothing shared: roles keep
-        working and only the task call is refused. ``code`` is Firm's own setup code
-        or an already recognized provider code. The notice repeats only when the
-        model or the code changes.
+        A CLI call takes its model and default effort from ``[llm]``, not from an
+        account or profile, so a failure of those settings holds nothing shared:
+        roles keep working and only calls to that CLI are refused. ``code`` is
+        Firm's own setup code or an already recognized provider code. The notice
+        repeats only when the model or the code changes.
         """
         payload = {"provider": provider, "model": model, "code": code}
-        request_id = "task-setup-rejected:" + hashlib.sha256(
+        request_id = "llm-setup-rejected:" + hashlib.sha256(
             encoded(payload).encode("utf-8")
         ).hexdigest()
 
@@ -801,16 +810,16 @@ class Accounts:
                 [OWNER],
                 render(
                     "notices",
-                    "task_setup_rejected_body",
+                    "llm_setup_rejected_body",
                     provider=provider,
                     model=model,
                     code=code or "not reported",
                 ),
-                subject=render("notices", "task_setup_rejected_subject", provider=provider),
+                subject=render("notices", "llm_setup_rejected_subject", provider=provider),
                 priority=ORDINARY_PRIORITY,
             )
 
-        self.store.request(db, OPERATIONS, request_id, "task_setup_rejected", payload, notify)
+        self.store.request(db, OPERATIONS, request_id, "llm_setup_rejected", payload, notify)
 
     def observe(self, actor_id, account_id, remaining_fraction, *, observed_at, valid_for, source):
         if actor_id != OWNER:

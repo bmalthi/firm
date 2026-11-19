@@ -20,7 +20,6 @@ from .store import Store
 MANDATE_GUIDANCE = render("tools", "mandate_guidance")
 
 TOOL_DESCRIPTIONS = {
-    "task": render("tools", "task"),
     "send": render("tools", "send"),
     "reply": render("tools", "reply"),
     "peek": render("tools", "peek"),
@@ -147,7 +146,6 @@ def register_tools(server: FastMCP, runtime: Runtime, token: str | Callable[[], 
                 readOnlyHint=name in readonly,
                 destructiveHint=name
                 in {
-                    "task",
                     "fire",
                     "mac_release",
                     "desktop_action",
@@ -175,7 +173,6 @@ def register_tools(server: FastMCP, runtime: Runtime, token: str | Callable[[], 
                 openWorldHint=(name.startswith("desktop_") and name != "desktop_status")
                 or name
                 in {
-                    "task",
                     "mac_acquire",
                     "mac_release",
                     "create_repository",

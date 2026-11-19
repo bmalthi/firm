@@ -449,11 +449,11 @@ def test_launch_handoff_shutdown_and_real_session_resume(system):
         assert not box.live
 
 
-def test_role_launch_request_carries_catalog_and_configured_task_deadline(system):
+def test_role_launch_request_carries_catalog_and_llm_capabilities(system):
     runtime, box, provider = system
     with runtime.store.transaction() as db:
         config = runtime.accounts.config(db)
-        config["task"]["timeout_seconds"] = 947
+        config["llm"]["max_concurrent"] = 4
         db.execute("UPDATE firm SET config_json=?", (json.dumps(config),))
     with host(system) as dispatcher:
         dispatcher.start()
@@ -471,11 +471,12 @@ def test_role_launch_request_carries_catalog_and_configured_task_deadline(system
             )
         )
         assert request.offered_tools == expected
-        assert "task" in request.offered_tools
+        assert "task" not in request.offered_tools
         assert "request_access" in request.offered_tools
         assert "create_repository" not in request.offered_tools
         assert not any(t.startswith(("mac_", "desktop_")) for t in request.offered_tools)
-        assert request.task_timeout_seconds == 947
+        assert call.context["capabilities"]["llm"] == []
+        assert call.context["capabilities"]["llm_max_concurrent"] == 4
 
 
 def usage_row(runtime):
@@ -1705,38 +1706,6 @@ def test_launch_adds_github_helper_and_identity_only_with_github(system, monkeyp
         assert not {"FIRM_GITHUB_URL", "GIT_AUTHOR_NAME"} & set(spec.env)
 
 
-@pytest.mark.parametrize("configured", [False, True])
-def test_launch_adds_the_image_key_only_with_google_cloud(system, tmp_path, configured):
-    runtime, box, _ = system
-    key = tmp_path / "demo-game.key"
-    key.write_text("AIzaSyExampleKeyForTestsOnly0123456789\n")
-    key.chmod(0o600)
-    if configured:
-        with runtime.store.read() as db:
-            config = runtime.accounts.config(db)
-        runtime.owner.configure(
-            OWNER,
-            {**config, "google_cloud": {"project": "demo-game", "api_key_file": str(key)}},
-        )
-    with host(system) as dispatcher:
-        dispatcher.start()
-        invocation = launch(dispatcher, runtime)
-    spec = box.specs[sandbox_run_id(invocation.activation_id)]
-    assert invocation.context["capabilities"]["google_cloud"] == (
-        {"project": "demo-game"} if configured else None
-    )
-    assert str(key) not in json.dumps(invocation.context)
-    assert "AIzaSyExampleKeyForTestsOnly" not in json.dumps(invocation.context)
-    if configured:
-        assert spec.secrets["google-cloud-key"] == b"AIzaSyExampleKeyForTestsOnly0123456789"
-        assert spec.secret_env["GEMINI_API_KEY"] == "google-cloud-key"
-        assert spec.env["GOOGLE_CLOUD_PROJECT"] == "demo-game"
-    else:
-        assert "google-cloud-key" not in spec.secrets
-        assert not {"GEMINI_API_KEY"} & set(spec.secret_env)
-        assert "GOOGLE_CLOUD_PROJECT" not in spec.env
-
-
 @pytest.mark.parametrize("mac_source", ["none", "image", "durable_vm"])
 def test_launch_describes_the_mac_available_to_the_sandbox(system, mac_source):
     from dataclasses import replace
@@ -2137,7 +2106,7 @@ def test_restart_refuses_unknown_execution_before_stopping_owned_runs(system):
         assert len(reopened.status()["active"]) == 1
 
 
-def test_dispatcher_restart_recovers_tasks_only_after_confirmed_stop(system, monkeypatch):
+def test_dispatcher_hard_stop_settles_running_llm_runs_after_vm_proof(system, monkeypatch):
     runtime, box, _ = system
     with host(system) as dispatcher:
         dispatcher.start()
@@ -2145,36 +2114,7 @@ def test_dispatcher_restart_recovers_tasks_only_after_confirmed_stop(system, mon
         with runtime.store.transaction() as db:
             db.execute(
                 "INSERT INTO summary_runs(run_id,started_at,state,input_bytes,kind,"
-                "caller_activation_id) VALUES('task-orphan',?,'running',1,'task',?)",
-                (runtime.store.clock(), caller.activation_id),
-            )
-    confirmations = [False, True]
-    stopped = []
-
-    def stop_child(run_id):
-        stopped.append(run_id)
-        return {"confirmed": confirmations.pop(0)}
-
-    monkeypatch.setattr(box, "stop_child", stop_child, raising=False)
-    with host(system) as restarted:
-        restarted.reconcile()
-        with runtime.store.read() as db:
-            assert db.execute("SELECT state FROM summary_runs").fetchone()[0] == "running"
-        restarted.reconcile()
-        with runtime.store.read() as db:
-            assert db.execute("SELECT state FROM summary_runs").fetchone()[0] == "unavailable"
-    assert stopped == ["task-orphan", "task-orphan"]
-
-
-def test_dispatcher_hard_stop_recovers_tasks_only_after_vm_proof(system, monkeypatch):
-    runtime, box, _ = system
-    with host(system) as dispatcher:
-        dispatcher.start()
-        caller = launch(dispatcher, runtime)
-        with runtime.store.transaction() as db:
-            db.execute(
-                "INSERT INTO summary_runs(run_id,started_at,state,input_bytes,kind,"
-                "caller_activation_id) VALUES('task-orphan',?,'running',1,'task',?)",
+                "caller_activation_id) VALUES('llm-orphan',?,'running',0,'llm',?)",
                 (runtime.store.clock(), caller.activation_id),
             )
         observed = box.infrastructure_status
@@ -2187,60 +2127,29 @@ def test_dispatcher_hard_stop_recovers_tasks_only_after_vm_proof(system, monkeyp
         monkeypatch.setattr(box, "infrastructure_status", observed)
         dispatcher.tick()
         with runtime.store.read() as db:
-            assert db.execute("SELECT state FROM summary_runs").fetchone()[0] == "unavailable"
+            assert tuple(db.execute("SELECT state,reason FROM summary_runs").fetchone()) == (
+                "unavailable", "cancelled",
+            )
 
 
-class TaskProviders(dict):
-    def __init__(self, runtime, provider):
-        super().__init__(codex=provider)
-        self.runtime = runtime
-
-    def task_runner(self, sandbox, *, mcp_url):
-        from firm_runtime.task_runner import GuestTaskRunner
-
-        return GuestTaskRunner(
-            self.runtime, sandbox, build_spec=lambda request, parent: RunSpec(
-                parent.role_id, ("sh", "-c", "printf answer"),
-            ),
-        )
-
-
-def test_dispatcher_opens_provider_task_runner_and_closes_with_host(system):
-    from firm_runtime.task_runner import GuestTaskRunner
-
-    runtime, box, provider = system
-    assert runtime.task_service.runner is None
-    with SandboxDispatcher(runtime, box, TaskProviders(runtime, provider),
-                           mcp_url="http://unused") as host:
-        assert isinstance(runtime.task_service.runner, GuestTaskRunner)
-        assert host._task_runner is runtime.task_service.runner
-    assert runtime.task_service.runner is None
-
-
-def test_task_launch_gate_closes_before_emergency_poweroff_without_guest_wait(system, monkeypatch):
-    runtime, box, provider = system
-    with SandboxDispatcher(runtime, box, TaskProviders(runtime, provider),
-                           mcp_url="http://unused") as host:
-        host.start()
-        runner = host._task_runner
-        close = runner.close
-        down = box.down
-
-        def poweroff(**options):
-            assert runner.closed
-            return down(**options)
-
-        def join_after_poweroff():
-            assert box.infrastructure_status()["running"] is False
-            close()
-
-        monkeypatch.setattr(box, "down", poweroff)
-        monkeypatch.setattr(runner, "close", join_after_poweroff)
-        host.stop(force=True)
-        host.tick()
-        host.start()
-        assert host._task_runner is not runner
-        assert not host._task_runner.closed
+def test_dispatcher_settles_llm_runs_when_vms_stopped(system, monkeypatch):
+    runtime, box, _ = system
+    with host(system) as dispatcher:
+        dispatcher.start()
+        caller = launch(dispatcher, runtime)
+        with runtime.store.transaction() as db:
+            db.execute(
+                "INSERT INTO summary_runs(run_id,started_at,state,input_bytes,kind,"
+                "caller_activation_id) VALUES('llm-orphan',?,'running',0,'llm',?)",
+                (runtime.store.clock(), caller.activation_id),
+            )
+        monkeypatch.setattr(box, "infrastructure_status", lambda: {"running": False})
+        with pytest.raises(FirmError, match="stopped unexpectedly"):
+            dispatcher.tick()
+        with runtime.store.read() as db:
+            assert tuple(db.execute("SELECT state,reason FROM summary_runs").fetchone()) == (
+                "unavailable", "cancelled",
+            )
 
 
 def test_provider_yield_uses_retained_interruption_path(system):

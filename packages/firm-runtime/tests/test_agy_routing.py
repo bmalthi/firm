@@ -1,6 +1,7 @@
 """AGY account, staffing, parser dispatch and unavailable telemetry integration."""
 
 import copy
+import hashlib
 import json
 
 import pytest
@@ -10,7 +11,7 @@ from test_agy_provider import encode, stream
 from firm_runtime import accounts, levels
 from firm_runtime.agy_provider import AgyProvider
 from firm_runtime.errors import FirmError
-from firm_runtime.providers import Providers, provider_adapter, record_task_output
+from firm_runtime.providers import Providers, provider_adapter
 from firm_runtime.quota_observer import QuotaObserver
 from firm_runtime.runtime import Runtime
 from firm_runtime.store import OWNER, Store
@@ -51,7 +52,7 @@ def test_defaults_and_factory_keep_model_effort_separate(tmp_path, monkeypatch):
     accounts.validate_accounts(config)
     path = config["accounts"]["subscription"]["auth_file"]
     assert path.endswith("/subscription-agy/home/.gemini/antigravity-cli/antigravity-oauth-token")
-    assert config["task"]["agy"] == {"model": "gemini-4-hydrogen", "effort": "high"}
+    assert config["llm"]["agy"] == {"model": "gemini-4-neon", "effort": "medium"}
     assert isinstance(
         provider_adapter(config["profiles"]["main"], config["accounts"]["subscription"]),
         AgyProvider,
@@ -70,64 +71,14 @@ def test_gemini_alias_stays_rejected(tmp_path, target):
         accounts.validate_accounts(config)
 
 
-@pytest.mark.parametrize("target", ["profile", "task", "summary"])
+@pytest.mark.parametrize("target", ["profile", "llm", "summary"])
 def test_configuration_accepts_owner_xhigh_mapping(tmp_path, target):
     config = configuration(tmp_path / "auth")
     if target == "profile":
         config["profiles"]["main"]["effort"] = "xhigh"
     else:
-        config[target] = {"agy": {"model": "gemini-4-argon", "effort": "xhigh"}}
+        config[target] = {"agy": {"model": "gemini-4-carbon", "effort": "xhigh"}}
     accounts.validate_accounts(config)
-
-
-def test_google_cloud_is_rejected_even_if_agy_only_in_alternate(tmp_path):
-    config = configuration(tmp_path / "auth")
-    config["accounts"]["codex"] = {"provider": "codex", "max_active": 1}
-    config["profiles"]["primary"] = {
-        "provider": "codex",
-        "model": "test",
-        "effort": "high",
-        "accounts": ["codex"],
-        "alternates": ["main"],
-    }
-    config["founder_profile"] = "primary"
-    config["google_cloud"] = {"project": "synthetic"}
-    with pytest.raises(FirmError, match="cannot coexist"):
-        accounts.validate_accounts(config)
-
-
-def test_google_cloud_launch_defense_uses_retained_provider_binding(tmp_path, monkeypatch):
-    from runtime_test_support import FakeSandbox
-
-    from firm_runtime.sandbox_dispatcher import SandboxDispatcher
-
-    runtime = runtime_for(tmp_path)
-    providers = Providers(runtime)
-    runtime.start()
-    invocation = runtime.admit()
-    runtime.mark_started(invocation.activation_id)
-    runtime.finish(invocation.activation_id, "interrupted", category="owner_stop")
-    with runtime.store.transaction() as db:
-        config = runtime.accounts.config(db)
-        config["google_cloud"] = {"project": "synthetic"}
-        db.execute("UPDATE firm SET config_json=?", (json.dumps(config),))
-        retained = runtime.accounts.binding(db, invocation.session_id)
-        assert retained["provider"] == "agy"
-    monkeypatch.setattr(AgyProvider, "build_spec", lambda *a, **k: pytest.fail("built spec"))
-    # This check is about the captured launch policy, independent of token freshness.
-    monkeypatch.setattr(providers, "preflight", lambda: {"failures": []})
-    box = FakeSandbox(tmp_path / "sandbox")
-    with SandboxDispatcher(runtime, box, providers,
-                           mcp_url="http://127.0.0.1:9000/mcp") as dispatcher:
-        dispatcher.start()
-        assert dispatcher.tick() == []
-        assert not box.specs
-    with runtime.store.read() as db:
-        latest = db.execute("SELECT * FROM activations ORDER BY rowid DESC LIMIT 1").fetchone()
-        assert latest["activation_id"] != invocation.activation_id
-        assert latest["session_id"] == invocation.session_id
-        assert latest["state"] == "interrupted"
-        assert latest["failure_category"] == "config"
 
 
 def test_owner_staffing_model_defaults(tmp_path):
@@ -142,8 +93,8 @@ def test_owner_staffing_model_defaults(tmp_path):
         for name in ("low", "medium", "high", "chooser")
     ] == [
         ("gemini-4-hydrogen", "medium"),
-        ("gemini-4-hydrogen", "high"),
-        ("gemini-4-argon", "medium"),
+        ("gemini-4-neon", "medium"),
+        ("gemini-4-neon", "high"),
         ("gemini-4-hydrogen", "low"),
     ]
     result.pop("founder_profile")
@@ -173,10 +124,10 @@ def test_xhigh_chooser_pick_routes_to_owner_selected_native_variant(tmp_path):
         role = runtime.store.role(db, employee)
         profile = runtime.accounts.config(db)["profiles"][role["execution_profile"]]
         assert profile["model"] == "gemini-4-hydrogen"
-        assert native_model_id(profile["model"], role["effort"]) == "gemini-4-argon-high"
+        assert native_model_id(profile["model"], role["effort"]) == "gemini-4-carbon-high"
 
 
-def test_retained_account_and_model_survive_config_edits_and_collision_guard(tmp_path):
+def test_retained_account_and_model_survive_config_edits(tmp_path):
     runtime = runtime_for(tmp_path)
     runtime.start()
     invocation = runtime.admit()
@@ -189,10 +140,6 @@ def test_retained_account_and_model_survive_config_edits_and_collision_guard(tmp
     adapter = providers.for_session(invocation.session_id)
     assert adapter.model == "gemini-4-hydrogen"
     assert adapter.auth_file == account(tmp_path)
-    with runtime.store.transaction() as db:
-        config["google_cloud"] = {"project": "synthetic"}
-        db.execute("UPDATE firm SET config_json=?", (json.dumps(config),))
-    assert providers.for_session(invocation.session_id).name == "agy"
 
 
 def test_both_parser_dispatch_maps_use_captured_agy_provider(tmp_path):
@@ -205,12 +152,18 @@ def test_both_parser_dispatch_maps_use_captured_agy_provider(tmp_path):
     logs = encode(stream(usage={"input_tokens": 100, "output_tokens": 20}))
     result = runner.parse_output(request, logs, 0)
     assert result.text == "FIRM_OK" and result.usage["input_tokens"] == 100
-    assert (
-        record_task_output(
-            runtime, "task-synthetic", "agy", "subscription", logs, 0, apply_holds=False
+    runtime.start()
+    call = runtime.admit()
+    runtime.mark_started(call.activation_id)
+    with runtime.store.transaction() as db:
+        now = runtime.store.clock()
+        db.execute(
+            "INSERT INTO summary_runs(run_id,started_at,state,input_bytes,account_id,provider,"
+            "model,deadline,token_hash,provider_started_at,kind,caller_activation_id) "
+            "VALUES('llm-sub',?,'running',0,'subscription','agy','gemini-4-hydrogen',?,?,?,'llm',?)",
+            (now, now + 60, hashlib.sha256(b"tok").hexdigest(), now, call.activation_id),
         )
-        == "FIRM_OK"
-    )
+    assert runtime.llm_service.finish("tok", exit_code=0, logs=logs)["status"] == "completed"
     with runtime.store.read() as db:
         assert runtime.accounts.subscription_reading(db, "subscription") is None
 
@@ -247,14 +200,14 @@ def test_console_shows_reported_native_variant_separately_from_configured_base(t
     runtime.start()
     invocation = runtime.admit()
     events = stream()
-    events[0]["init"]["model"] = "gemini-4-argon-high"
+    events[0]["init"]["model"] = "gemini-4-carbon-high"
     runtime.record_usage(invocation.activation_id, parse_usage(encode(events)))
     app = build_console_app(runtime, allowed_host=HOST)
     with _login(app) as client:
         roles = client.get("/api/snapshot").json()["roles"]
     founder = next(role for role in roles if role["employee_id"] == "founder")
     assert founder["execution"]["model"] == "gemini-4-hydrogen"
-    assert founder["execution"]["resolved_model"] == "gemini-4-argon-high"
+    assert founder["execution"]["resolved_model"] == "gemini-4-carbon-high"
 
 
 def test_transient_build_failure_retries_without_shared_hold(tmp_path, monkeypatch):
@@ -283,42 +236,62 @@ def test_transient_build_failure_retries_without_shared_hold(tmp_path, monkeypat
             assert role["retry_at"] > runtime.store.clock()
 
 
-def test_task_model_quota_refusal_is_reported_once_and_holds_nothing(tmp_path):
+def test_llm_model_quota_refusal_is_reported_once_and_holds_nothing(tmp_path):
     from test_agy_provider import quota_stream
 
-    from firm_runtime.task_runner import TaskExecutionError
-
     runtime = runtime_for(tmp_path)
+    runtime.start()
+    call = runtime.admit()
+    runtime.mark_started(call.activation_id)
     logs = encode(quota_stream())
 
     def notices():
         with runtime.store.read() as db:
             return db.execute(
-                "SELECT body FROM messages WHERE body LIKE 'Task workers cannot run on agy\n\n%'"
+                "SELECT body FROM messages WHERE body LIKE 'LLM CLI cannot run on agy\n\n%'"
             ).fetchall()
 
-    # A run that did not exit by itself never reports or holds.
-    with pytest.raises(TaskExecutionError) as stopped:
-        record_task_output(runtime, "task-0", "agy", "subscription", logs, 0,
-                           apply_holds=False, model="gemini-4-task")
-    assert str(stopped.value) == "provider_failure" and notices() == []
-    for run_id in ("task-1", "task-2"):
-        with pytest.raises(TaskExecutionError) as refused:
-            record_task_output(runtime, run_id, "agy", "subscription", logs, 0,
-                               apply_holds=True, model="gemini-4-task")
-        assert str(refused.value) == "configuration"
+    def seed(run_id, token):
+        with runtime.store.transaction() as db:
+            now = runtime.store.clock()
+            db.execute(
+                "INSERT INTO summary_runs(run_id,started_at,state,input_bytes,account_id,"
+                "provider,model,deadline,token_hash,provider_started_at,kind,"
+                "caller_activation_id) VALUES(?,?,'running',0,'subscription','agy',"
+                "'gemini-4-llm',?,?,?,'llm',?)",
+                (run_id, now, now + 60, hashlib.sha256(token.encode()).hexdigest(), now,
+                 call.activation_id),
+            )
+
+    # Cancelled runs do not inspect provider errors or report setup failures.
+    seed("llm-0", "tok-0")
+    stopped = runtime.llm_service.finish("tok-0", exit_code=0, logs=logs, reason="cancelled")
+    assert stopped["status"] == "unavailable" and stopped["reason"] == "cancelled"
+    assert notices() == []
+    for idx in (1, 2):
+        seed(f"llm-{idx}", f"tok-{idx}")
+        refused = runtime.llm_service.finish(f"tok-{idx}", exit_code=0, logs=logs)
+        assert refused["status"] == "unavailable" and refused["reason"] == "configuration"
     assert runtime.accounts.status()["incidents"] == []
     (notice,) = notices()
-    assert "gemini-4-task" in notice[0] and "model_quota_reached" in notice[0]
+    assert "gemini-4-llm" in notice[0] and "model_quota_reached" in notice[0]
 
 
 @pytest.mark.parametrize("code", ["resume_state_missing", "settings_invalid", "token_headroom"])
-def test_local_task_failure_never_creates_account_hold(tmp_path, code):
-    from firm_runtime.task_runner import TaskExecutionError
-
+def test_local_llm_failure_never_creates_account_hold(tmp_path, code):
     runtime = runtime_for(tmp_path)
+    runtime.start()
+    call = runtime.admit()
+    runtime.mark_started(call.activation_id)
+    with runtime.store.transaction() as db:
+        now = runtime.store.clock()
+        db.execute(
+            "INSERT INTO summary_runs(run_id,started_at,state,input_bytes,account_id,provider,"
+            "model,deadline,token_hash,provider_started_at,kind,caller_activation_id) "
+            "VALUES('llm-local',?,'running',0,'subscription','agy','gemini-4-hydrogen',?,?,?,'llm',?)",
+            (now, now + 60, hashlib.sha256(b"tok-local").hexdigest(), now, call.activation_id),
+        )
     logs = encode([{"type": "firm.launch_failed", "kind": "launcher_setup", "code": code}])
-    with pytest.raises(TaskExecutionError):
-        record_task_output(runtime, "synthetic", "agy", "subscription", logs, 71,
-                           apply_holds=True)
+    result = runtime.llm_service.finish("tok-local", exit_code=71, logs=logs)
+    assert result["status"] == "unavailable" and result["reason"] == "provider_failure"
     assert runtime.accounts.status()["incidents"] == []

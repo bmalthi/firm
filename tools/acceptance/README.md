@@ -59,7 +59,7 @@ directory and require a sandbox that has not been bound to a different database.
 | `provider.py` | Configured provider execution, credentials, tools and resume | `--root FIRM_DIR --evidence DIR --provider-config PROVIDERS_TOML --profile PROFILE [--provider codex\|claude\|agy] [--resume]` |
 | `summary.py` | Isolated summarization and hiring assessment | `--root FIRM_DIR --evidence DIR --provider-config PROVIDERS_TOML --profile PROFILE [--provider codex\|claude\|agy]` |
 | `stateless.py` | Reusable tool-free account isolation, cleanup, cancellation and restart without inference | `--root FIRM_DIR --evidence DIR` |
-| `task.py` | Worker execution, concurrency, cancellation and isolation | `--root FIRM_DIR --evidence DIR --provider codex\|claude\|agy --provider-config PROVIDERS_TOML --profile PROFILE [--timeout 120]` |
+| `llm_cli.py` | Host-brokered guest LLM CLI execution, resume, concurrency and cleanup | `--root FIRM_DIR --evidence DIR --provider codex\|claude\|agy --provider-config PROVIDERS_TOML --profile PROFILE [--timeout 120]` |
 | `docker.py` | Containers, mounts, resource accounting and cleanup | `--root FIRM_DIR --evidence DIR [--role ROLE]` |
 | `browser.py` | Native or containerized browser rendering and exported artifacts | `--root FIRM_DIR --evidence DIR [--role ROLE] [--mode native\|docker] [--chromium-sandbox] [--offline-reuse]` |
 | `network.py` | Egress enforcement, revocation, restart retention and Mac proxy policy | `--root FIRM_DIR --evidence DIR [--station N]` |
@@ -102,7 +102,7 @@ against its original evidence database. Use each tool's `--help` for options.
 AGY retains the native conversation on resume; Codex and Claude use
 a fresh route for retries in this acceptance fixture.
 
-See [provider acceptance](providers.md) for provider, summary and task setup,
+See [provider acceptance](providers.md) for provider, summary and LLM CLI setup,
 including AGY login and resume requirements.
 
 [Mac lease acceptance](mac/README.md) covers the enrolled Mac station, a role's lease

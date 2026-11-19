@@ -75,9 +75,6 @@ class ProbeProvider:
     def build_summary_spec(self, request, layout):
         raise NotImplementedError("probe only executes roles")
 
-    def build_task_spec(self, request, layout):
-        raise NotImplementedError("probe only executes roles")
-
     def parse_summary(self, logs, exit_code):
         raise NotImplementedError("probe only executes roles")
 

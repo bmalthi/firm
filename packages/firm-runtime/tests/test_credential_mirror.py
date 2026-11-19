@@ -74,7 +74,7 @@ def test_real_backend_projection_delivered_by_copied_standalone_assets(
     source = Path(credential_mirror.__file__).parent
     guest = tmp_path / "guest"
     guest.mkdir()
-    for name in ("credential_mirror", "claude_launch", "codex_launch", "agy_launch"):
+    for name in ("credential_mirror", "claude_launch", "codex_launch", "agy_launch", "llm_cli"):
         shutil.copyfile(source / f"{name}.py", guest / f"{name}.py")
     auth = (tmp_path / "profile/home" / agy_auth.TOKEN_PATH if provider == "agy"
             else tmp_path / "host-auth")
@@ -93,7 +93,7 @@ class RefuseHost(importlib.abc.MetaPathFinder):
             raise AssertionError("guest imported host package")
 sys.meta_path.insert(0, RefuseHost())
 root = Path(sys.argv[1])
-for name in ("claude_launch", "codex_launch", "agy_launch"):
+for name in ("claude_launch", "codex_launch", "agy_launch", "llm_cli"):
     runpy.run_path(str(root / (name + ".py")))
 mirror = runpy.run_path(str(root / "credential_mirror.py"))
 snapshot = json.load(sys.stdin)

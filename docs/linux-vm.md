@@ -61,7 +61,7 @@ The build also installs the newest Playwright release's Chromium, with the OS li
 that version needs, into `/opt/firm/ms-playwright`, owned by root and read-only to roles,
 and records its minor version as `X.Y.0` in `/opt/firm/playwright-version`. Each new
 role's own Playwright cache, `~/.cache/ms-playwright`, links to those browsers.
-`PLAYWRIGHT_BROWSERS_PATH` names that cache, so tasks and AGY sessions, which have
+`PLAYWRIGHT_BROWSERS_PATH` names that cache, so guest LLM CLI sessions and AGY sessions, which have
 their own homes, find it, and `PLAYWRIGHT_SKIP_BROWSER_GC=1` stops installing another
 Playwright version from deleting the links. A role that adds the matching Playwright
 (`uv add "playwright~=$(cat /opt/firm/playwright-version)"`) launches Chromium without
@@ -161,7 +161,7 @@ Power-off still completes even with quarantined slots. Their reservations surviv
 after restart, guest cleanup must succeed before those slots become available again.
 
 Keep deliverables and work colleagues need on the drive. Scratch and Docker state persist between work periods. When an activation ends, settlement runs under a 20-second deadline:
-1. **Stop the slice & verify quiescence:** Stops child tasks, captures slice usage, stops the rootless daemon and `user-<uid>.slice`, then confirms the kernel's recursive `cgroup.events` reads `populated 0` (or the slice cgroup is gone).
+1. **Stop the slice & verify quiescence:** Signals slice child processes, captures slice usage, stops the rootless daemon and `user-<uid>.slice`, then confirms the kernel's recursive `cgroup.events` reads `populated 0` (or the slice cgroup is gone).
 2. **Unmount `~/drive`** and remove temporary run credentials. Settlement neither deletes nor walks retained storage.
 
 A failed slice stop or emptiness check keeps execution reserved until resolved. Owners

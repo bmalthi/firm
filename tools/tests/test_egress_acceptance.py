@@ -287,7 +287,6 @@ def test_probe_provider_runs_the_program_with_the_activation_token_as_a_secret()
             mcp_url='http://127.0.0.1:9000/mcp',
             provider_session_id=None,
             offered_tools=tuple(TOOL_DESCRIPTIONS),
-            task_timeout_seconds=600,
         ),
         layout=layout,
     )

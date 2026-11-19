@@ -1,12 +1,13 @@
 """Allowance contracts through the real parsing and persistence consumers."""
 
+import hashlib
 import json
 from types import SimpleNamespace
 
 import pytest
 
 from firm_runtime import claude_provider, codex_provider
-from firm_runtime.providers import Providers, record_task_output
+from firm_runtime.providers import Providers
 from firm_runtime.runtime import Runtime
 from firm_runtime.sandbox_dispatcher import SandboxDispatcher
 from firm_runtime.store import Store
@@ -83,7 +84,7 @@ def observation_system(request, tmp_path):
     return runtime, now, provider
 
 
-@pytest.mark.parametrize("path", ["role", "summary", "staffing", "task"])
+@pytest.mark.parametrize("path", ["role", "summary", "staffing", "llm"])
 def test_observations_keep_exact_window_shapes_and_empty_replacement(observation_system, path):
     runtime, now, provider = observation_system
     parser = claude_provider if provider == "claude" else codex_provider
@@ -103,16 +104,24 @@ def test_observations_keep_exact_window_shapes_and_empty_replacement(observation
         def consume(logs):
             return runner.parse_output(request, logs, 0)
     else:
+        runtime.start()
+        invocation = runtime.admit()
+        runtime.mark_started(invocation.activation_id)
+        counter = [0]
+
         def consume(logs):
-            return record_task_output(
-                    runtime,
-                    "unused",
-                    provider,
-                    "a",
-                    logs,
-                    0,
-                    apply_holds=True,
+            counter[0] += 1
+            tok = f"llm-sub-{counter[0]}"
+            with runtime.store.transaction() as db:
+                t = now[0]
+                db.execute(
+                    "INSERT INTO summary_runs(run_id,started_at,state,input_bytes,account_id,"
+                    "provider,model,deadline,token_hash,provider_started_at,kind,"
+                    "caller_activation_id) VALUES(?,?,'running',0,'a',?,'test',?,?,?,'llm',?)",
+                    (f"r-{counter[0]}", t, provider, t + 60,
+                     hashlib.sha256(tok.encode()).hexdigest(), t, invocation.activation_id),
                 )
+            return runtime.llm_service.finish(tok, exit_code=0, logs=logs)
     logs = allowance(provider) + b"\n" + completed(provider)
     consume(logs)
     expected = (
@@ -148,10 +157,22 @@ def test_observations_keep_exact_window_shapes_and_empty_replacement(observation
 
 
 @pytest.mark.parametrize("event", [False, True])
-def test_recovered_task_never_creates_subscription_evidence(observation_system, event):
-    runtime, _, provider = observation_system
+def test_cancelled_llm_run_never_creates_subscription_evidence(observation_system, event):
+    runtime, now, provider = observation_system
+    runtime.start()
+    invocation = runtime.admit()
+    runtime.mark_started(invocation.activation_id)
+    with runtime.store.transaction() as db:
+        t = now[0]
+        db.execute(
+            "INSERT INTO summary_runs(run_id,started_at,state,input_bytes,account_id,provider,"
+            "model,deadline,token_hash,provider_started_at,kind,caller_activation_id) "
+            "VALUES('r-cancel',?,'running',0,'a',?,'test',?,?,?,'llm',?)",
+            (t, provider, t + 60, hashlib.sha256(b"tok-cancel").hexdigest(), t,
+             invocation.activation_id),
+        )
     logs = (allowance(provider) + b"\n" if event else b"") + completed(provider)
-    record_task_output(runtime, "unused", provider, "a", logs, 0, apply_holds=False)
+    runtime.llm_service.finish("tok-cancel", exit_code=0, logs=logs, reason="cancelled")
     with runtime.store.read() as db:
         assert runtime.accounts.subscription_reading(db, "a") is None
         assert db.execute("SELECT COUNT(*) FROM execution_incidents").fetchone()[0] == 0

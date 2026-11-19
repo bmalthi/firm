@@ -235,8 +235,8 @@ class AnalysisReader:
         if type(limit) is not int or not 1 <= limit <= 500:
             raise AnalysisQueryError("limit must be an integer from 1 to 500")
         allowed_types = {
-            "timeline": {"activation", "task"},
-            "usage": {"role", "model", "session", "workload", "tool", "task"},
+            "timeline": {"activation", "llm"},
+            "usage": {"role", "model", "session", "workload", "tool", "llm"},
             "mac": {"lease", "busy", "disk_full", "operation"},
             "resources": {"run", "role", "summary_run"},
         }
@@ -608,37 +608,37 @@ class AnalysisReader:
                             "evidence": {**dict(incident), **resolution},
                         }
                     )
-        tasks = []
+        llms = []
         for result in db.execute(
             "SELECT t.run_id,t.caller_activation_id,a.employee_id,t.started_at,"
             "t.provider_started_at,t.finished_at,t.state,t.reason,t.provider,t.account_id "
             "FROM summary_runs t JOIN activations a ON a.activation_id=t.caller_activation_id "
-            "WHERE t.kind='task' AND t.rowid<=? AND a.rowid<=? AND t.started_at<? "
+            "WHERE t.kind='llm' AND t.rowid<=? AND a.rowid<=? AND t.started_at<? "
             "AND (t.finished_at IS NULL OR t.finished_at>? OR t.started_at>=?) "
             "AND (? IS NULL OR a.employee_id=?)",
             (cutoffs["summary_runs"], cutoffs["activations"], end, start, start,
              employee_id, employee_id),
         ):
-            task = dict(result)
-            task.update(
-                id="task:" + task["run_id"],
-                type="task",
-                activation_id=task["caller_activation_id"],
+            llm = dict(result)
+            llm.update(
+                id="llm:" + llm["run_id"],
+                type="llm",
+                activation_id=llm["caller_activation_id"],
                 outcome=(
-                    "unavailable" if task["reason"] else
-                    "completed" if task["state"] == "summarized" else task["state"]
+                    "unavailable" if llm["reason"] else
+                    "completed" if llm["state"] == "summarized" else llm["state"]
                 ),
-                open=task["finished_at"] is None,
+                open=llm["finished_at"] is None,
                 duration_seconds=duration(
-                    task["started_at"],
-                    task["finished_at"] if task["finished_at"] is not None else now,
+                    llm["started_at"],
+                    llm["finished_at"] if llm["finished_at"] is not None else now,
                 ),
             )
-            tasks.append(task)
+            llms.append(llm)
         return {
-            "rows": rows + tasks + events,
+            "rows": rows + llms + events,
             "activation_count": len(rows),
-            "task_count": len(tasks),
+            "llm_count": len(llms),
             "peak_observed_concurrency": peak,
             "launch_delay": latency(delays),
             "work_period_contents": {
@@ -721,7 +721,7 @@ class AnalysisReader:
                             "employee_id": r["employee_id"],
                         },
                     )
-        summaries, tasks = [], []
+        summaries, llms = [], []
         for r in raw_runs:
             bound = identity.get(r["run_id"], {})
             row = dict(r)
@@ -730,11 +730,11 @@ class AnalysisReader:
                 if row.get(key) is None and bound.get(key) is not None:
                     row[key] = bound[key]
             row["employee_id"] = (
-                row["caller_employee_id"] if r["kind"] == "task" else bound.get("employee_id")
+                row["caller_employee_id"] if r["kind"] == "llm" else bound.get("employee_id")
             )
             if employee_id is None or row.get("employee_id") == employee_id:
-                (tasks if r["kind"] == "task" else summaries).append(row)
-        all_usage = executions + summaries + tasks
+                (llms if r["kind"] == "llm" else summaries).append(row)
+        all_usage = executions + summaries + llms
         groups = defaultdict(list)
         for row in all_usage:
             for dimension, value in (
@@ -756,19 +756,19 @@ class AnalysisReader:
         ]
         rows += [
             {
-                "id": "task:" + task["run_id"],
-                "type": "task",
-                "run_id": task["run_id"],
-                "employee_id": task.get("employee_id"),
-                "activation_id": task["caller_activation_id"],
-                "caller_activation_id": task["caller_activation_id"],
-                "provider": task["provider"],
-                "account_id": task["account_id"],
-                "model": task.get("model"),
-                "resolved_model": task["resolved_model"],
-                "usage": measured([task]),
+                "id": "llm:" + llm["run_id"],
+                "type": "llm",
+                "run_id": llm["run_id"],
+                "employee_id": llm.get("employee_id"),
+                "activation_id": llm["caller_activation_id"],
+                "caller_activation_id": llm["caller_activation_id"],
+                "provider": llm["provider"],
+                "account_id": llm["account_id"],
+                "model": llm.get("model"),
+                "resolved_model": llm["resolved_model"],
+                "usage": measured([llm]),
             }
-            for task in tasks
+            for llm in llms
         ]
         tallies = self.tool_calls(db, {r["activation_id"] for r in executions})
         by_tool = defaultdict(lambda: {"calls": 0, "executions": 0})
@@ -862,7 +862,7 @@ class AnalysisReader:
             "totals": measured(all_usage),
             "role_totals": measured(executions),
             "summary_totals": measured(summaries),
-            "task_totals": measured(tasks),
+            "llm_totals": measured(llms),
             "missing_model_identity": sum(r.get("model") is None for r in all_usage),
             **model_resolution(all_usage),
             "sessions_used": len(session_ids),
@@ -883,8 +883,8 @@ class AnalysisReader:
             },
             "semantics": "Usage of executions admitted in this window, "
             "measured through sampled_at. "
-            "Role, summary and task totals are disjoint; totals count each execution once. "
-            "Role/model/workload rows regroup those same executions; task rows give caller "
+            "Role, summary and llm totals are disjoint; totals count each execution once. "
+            "Role/model/workload rows regroup those same executions; llm rows give caller "
             "attribution and are not additional usage. "
             "Session counters are lifetime totals; cache/reasoning are overlapping breakdowns.",
         }
@@ -1330,16 +1330,21 @@ class AnalysisReader:
                 )
             )
         )
-        for account_id, task_slots in db.execute(
+        for account_id, llm_slots in db.execute(
             "SELECT account_id, COALESCE(SUM(n-borrowed),0) FROM ("
             "SELECT t.account_id, COUNT(*) AS n, CASE WHEN a.state IN ('admitted','running') "
+            "AND b.account_id=t.account_id "
             "AND COUNT(CASE WHEN t.reason IS NULL THEN 1 END)>0 "
             "THEN 1 ELSE 0 END AS borrowed FROM summary_runs t "
             "JOIN activations a ON a.activation_id=t.caller_activation_id "
-            "WHERE t.kind='task' AND t.state='running' AND t.account_id IS NOT NULL "
-            "GROUP BY t.account_id, t.caller_activation_id) GROUP BY account_id"
+            "LEFT JOIN execution_bindings b ON b.session_id=a.session_id "
+            "WHERE t.kind='llm' AND t.state='running' AND t.account_id IS NOT NULL "
+            "AND (t.deadline IS NULL OR t.deadline>?) "
+            "AND (t.lease_until IS NULL OR t.lease_until>?) "
+            "GROUP BY t.account_id, t.caller_activation_id) GROUP BY account_id",
+            (now, now),
         ):
-            occupancy[account_id] += task_slots
+            occupancy[account_id] += llm_slots
         query = (
             "SELECT rowid,* FROM roles"
         )
@@ -1968,7 +1973,7 @@ class AnalysisReader:
             for row in db.execute(
                 "SELECT q.run_id,q.started_at,q.finished_at,r.role_id,r.usage_json "
                 "FROM summary_runs q JOIN sandbox_run_settlements r USING(run_id) "
-                "WHERE q.kind!='task' AND q.started_at>=? AND q.started_at<? "
+                "WHERE q.kind!='llm' AND q.started_at>=? AND q.started_at<? "
                 "AND q.rowid<=? AND r.rowid<=?",
                 (start, end, cutoffs["summary_runs"], cutoffs["sandbox_run_settlements"]),
             ):
@@ -1987,9 +1992,9 @@ class AnalysisReader:
             "max_active": config["max_active"],
             "semantics": "Machine-wide samples are cumulative counters, sampled once a "
             "minute while a VM runs; short dips between samples are not seen. Run peaks "
-            "and CPU usage include child tasks; task resources are not added separately. Peaks "
-            "include page cache, so they bound demand from above, and their concurrent "
-            "bound assumes every peak at once. Host footprints never shrink: a VM keeps "
+            "and CPU usage include guest LLM CLI processes; CLI resources are not added "
+            "separately. Peaks include page cache, so they bound demand from above, and their "
+            "concurrent bound assumes every peak at once. Host footprints never shrink: a VM keeps "
             "the memory it has touched. `disk` is each machine's current state, from its "
             "own latest sample regardless of this window; `machines` also reports the "
             "window's last sample, named accordingly.",

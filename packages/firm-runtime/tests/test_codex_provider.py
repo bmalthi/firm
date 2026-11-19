@@ -77,10 +77,21 @@ def provider(tmp_path, *, auth=b'{"tokens":{"access_token":"host-secret"}}'):
     return CodexProvider(model="gpt-6-astra", effort="high", auth_file=auth_file)
 
 
-@pytest.mark.parametrize("model", ["gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra"])
-def test_builds_fresh_sandbox_spec_without_exposing_credentials(tmp_path, model):
+@pytest.mark.parametrize(
+    ("configured", "resolved"),
+    [
+        ("gpt-6.1-terra", "gpt-6.1-terra"),
+        ("gpt-6.2-sol", "gpt-6.2-sol"),
+        ("gpt-6.2-astra", "gpt-6.2-astra"),
+        ("terra", "gpt-6.1-terra"),
+        ("sol", "gpt-6.2-sol"),
+        ("astra", "gpt-6.2-astra"),
+    ],
+)
+def test_builds_fresh_sandbox_spec_without_exposing_credentials(tmp_path, configured, resolved):
     adapter = provider(tmp_path)
-    adapter = CodexProvider(model=model, effort="high", auth_file=adapter.auth_file)
+    adapter = CodexProvider(model=configured, effort="high", auth_file=adapter.auth_file)
+    assert adapter.model == resolved
     call = invocation()
     spec = adapter.build_spec(
         RoleLaunchRequest(
@@ -90,7 +101,6 @@ def test_builds_fresh_sandbox_spec_without_exposing_credentials(tmp_path, model)
             mcp_url='http://firm.local:8421/mcp',
             provider_session_id=None,
             offered_tools=tuple(TOOL_DESCRIPTIONS),
-            task_timeout_seconds=600,
         ),
         layout=Layout(),
     )
@@ -103,7 +113,8 @@ def test_builds_fresh_sandbox_spec_without_exposing_credentials(tmp_path, model)
     assert b"host-secret" in spec.secrets["codex-auth"]
     assert spec.env["FIRM_ACTIVATION_START_URL"] == ("http://firm.local:8421/activation/start")
     command = json.loads(spec.env["FIRM_CODEX_ARGV"])
-    assert command[:3] == [f"{Layout().tools}/codex", "--model", model]
+    assert command[:3] == [f"{Layout().tools}/codex", "--model", resolved]
+    assert "features.image_generation=true" in command
     assert "--cd" not in command
     assert "exec" in command
     assert "resume" not in command
@@ -114,7 +125,7 @@ def test_builds_fresh_sandbox_spec_without_exposing_credentials(tmp_path, model)
     assert 'mcp_servers.firm.bearer_token_env_var="FIRM_ACTIVATION_TOKEN"' in rendered
     assert "mcp_servers.firm.required=true" in rendered
     assert f"mcp_servers.firm.enabled_tools={json.dumps(tuple(TOOL_DESCRIPTIONS))}" in command
-    assert "mcp_servers.firm.tool_timeout_sec=665" in command
+    assert "mcp_servers.firm.tool_timeout_sec=120" in command
     assert 'model_reasoning_effort="high"' in rendered
     assert "activation-secret" not in rendered
     assert "host-secret" not in rendered
@@ -165,6 +176,7 @@ def test_builds_summary_spec_without_role_authority_or_tools(tmp_path):
     assert "include_collaboration_mode_instructions=false" in command
     assert "features.shell_tool=false" in command
     assert "features.view_image=false" in command
+    assert "features.image_generation=false" in command
     assert 'web_search="disabled"' in command
     assert command[command.index("--model") + 1] == "gpt-5.6-luna"
     assert len(spec.run_id) <= 40
@@ -210,7 +222,6 @@ def test_builds_exact_resume_and_validates_native_session_id(tmp_path):
             mcp_url='https://bridge.example/mcp/',
             provider_session_id=native_id,
             offered_tools=tuple(TOOL_DESCRIPTIONS),
-            task_timeout_seconds=600,
         ),
         layout=Layout(),
     )
@@ -229,7 +240,6 @@ def test_builds_exact_resume_and_validates_native_session_id(tmp_path):
                 mcp_url='https://bridge.example/mcp',
                 provider_session_id='../../auth.json',
                 offered_tools=tuple(TOOL_DESCRIPTIONS),
-                task_timeout_seconds=600,
             ),
             layout=Layout(),
         )
@@ -247,7 +257,6 @@ def test_auth_file_is_selected_explicitly_and_read_only_at_build(tmp_path):
                 mcp_url='http://firm.local/mcp',
                 provider_session_id=None,
                 offered_tools=tuple(TOOL_DESCRIPTIONS),
-                task_timeout_seconds=600,
             ),
             layout=Layout(),
         )
@@ -263,7 +272,6 @@ def test_auth_file_is_selected_explicitly_and_read_only_at_build(tmp_path):
                 mcp_url='http://firm.local/mcp',
                 provider_session_id=None,
                 offered_tools=tuple(TOOL_DESCRIPTIONS),
-                task_timeout_seconds=600,
             ),
             layout=Layout(),
         )
@@ -281,7 +289,6 @@ def test_auth_file_is_selected_explicitly_and_read_only_at_build(tmp_path):
                 mcp_url='http://firm.local/mcp',
                 provider_session_id=None,
                 offered_tools=tuple(TOOL_DESCRIPTIONS),
-                task_timeout_seconds=600,
             ),
             layout=Layout(),
         )
@@ -298,7 +305,6 @@ def test_auth_file_is_selected_explicitly_and_read_only_at_build(tmp_path):
                 mcp_url='http://firm.local/mcp',
                 provider_session_id=None,
                 offered_tools=tuple(TOOL_DESCRIPTIONS),
-                task_timeout_seconds=600,
             ),
             layout=Layout(),
         )
@@ -323,7 +329,6 @@ def test_rejects_non_direct_mcp_urls(tmp_path, url):
                 mcp_url=url,
                 provider_session_id=None,
                 offered_tools=tuple(TOOL_DESCRIPTIONS),
-                task_timeout_seconds=600,
             ),
             layout=Layout(),
         )
@@ -369,7 +374,6 @@ def test_employee_birth_and_fresh_transition_inputs_are_attributed(tmp_path):
             mcp_url='http://firm.local/mcp',
             provider_session_id=None,
             offered_tools=tuple(TOOL_DESCRIPTIONS),
-            task_timeout_seconds=600,
         ),
         layout=Layout(),
     )
@@ -500,8 +504,7 @@ def test_parse_result_requires_canonical_thread_and_terminal_event():
     assert incomplete.error.kind == "invalid_output"
 
 
-@pytest.mark.parametrize("task", [False, True])
-def test_launcher_keeps_only_session_tree_in_persistent_home(tmp_path, monkeypatch, task):
+def test_launcher_keeps_only_session_tree_in_persistent_home(tmp_path, monkeypatch):
     runtime_session_id = str(uuid4())
     run_root = tmp_path / "run" / "firm"
     credentials = run_root / "credentials"
@@ -513,19 +516,23 @@ def test_launcher_keeps_only_session_tree_in_persistent_home(tmp_path, monkeypat
     monkeypatch.setenv("FIRM_STATE_DIR", str(run_root))
     monkeypatch.setenv("FIRM_CREDENTIALS_DIR", str(credentials))
     monkeypatch.setenv("FIRM_PRIVATE_HOME", str(role_home))
-    monkeypatch.setenv("FIRM_TASK_RUN", "1" if task else "0")
 
     codex_launch._prepare_home(runtime_session_id)
 
     codex_home = run_root / "codex"
     assert (codex_home / "auth.json").read_bytes() == auth_source.read_bytes()
-    assert (codex_home / "auth.json").is_symlink() is task
-    if task:
-        assert (codex_home / "auth.json").resolve() == auth_source.resolve()
+    assert not (codex_home / "auth.json").is_symlink()
     assert (codex_home / "sessions").is_symlink()
+    assert (codex_home / "generated_images").is_symlink()
     persistent = role_home / ".firm" / "codex-sessions" / runtime_session_id
     assert (codex_home / "sessions").resolve() == (persistent / "sessions").resolve()
-    assert list(persistent.iterdir()) == [persistent / "sessions"]
+    assert (codex_home / "generated_images").resolve() == (
+        persistent / "generated_images"
+    ).resolve()
+    assert sorted(persistent.iterdir()) == [
+        persistent / "generated_images",
+        persistent / "sessions",
+    ]
     assert not (role_home / "auth.json").exists()
 
 
@@ -638,6 +645,70 @@ def test_tool_calls_count_completed_work_items_and_not_the_role_s_own_prose():
     assert parse_tool_calls("not json\n") == {}
     with pytest.raises(TypeError):
         parse_tool_calls(None)
+
+
+def test_rollout_image_generation_calls_reach_tool_tally_without_leaking_content(
+    tmp_path, capsys
+):
+    records = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "image_generation_call",
+                "id": "ig_1",
+                "revised_prompt": "secret prompt",
+                "result": "base64secret",
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "image_generation_end",
+                "call_id": "ig_1",
+                "saved_path": "/secret/out.png",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "image_gen",
+                "call_id": "call_2",
+                "arguments": '{"prompt":"secret2"}',
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "image_generation_end",
+                "call_id": "call_2",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_3",
+            },
+        },
+    ]
+    logs = "\n".join(json.dumps(r) for r in records) + "\n"
+    (tmp_path / "rollout.jsonl").write_text(logs)
+    codex_launch._scan_rollouts(tmp_path, {})
+    projected = capsys.readouterr().out
+    assert "secret" not in projected
+    assert "base64secret" not in projected
+    assert "/secret/out.png" not in projected
+    assert parse_tool_calls(projected) == {"image_generation": 2}
+    assert parse_tool_calls(logs.encode()) == {"image_generation": 2}
+    combined = (
+        projected
+        + json.dumps({"type": "item.completed", "item": {"id": "ig_1", "type": "image_generation"}})
+        + "\n"
+    )
+    assert parse_tool_calls(combined) == {"image_generation": 2}
+    assert parse_usage(projected) is None
 
 
 @pytest.mark.parametrize("invalid", [None, "", "  ", 42, {}, []])

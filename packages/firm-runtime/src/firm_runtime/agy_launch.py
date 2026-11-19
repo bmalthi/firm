@@ -33,6 +33,7 @@ NATIVE_TOOLS = [
     "replace_file_content",
     "multi_replace_file_content",
     "search_web",
+    "generate_image",
 ]
 NATIVE_INVENTORY = [
     "ask_custom_permission",
@@ -96,7 +97,7 @@ NATIVE_INVENTORY = [
     "wait_5_seconds",
     "write_to_file",
 ]
-MODE_TOOLS = {"role": NATIVE_TOOLS, "task": NATIVE_TOOLS, "tool_free": []}
+MODE_TOOLS = {"role": NATIVE_TOOLS, "tool_free": []}
 STARTUP_MARGIN = 300
 MAX_EVENT_BYTES = 1024 * 1024
 NATIVE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
@@ -110,7 +111,7 @@ def _settings(mode):
         denied += [f"{name}(*)" for name in sorted(set(NATIVE_INVENTORY) | {
             "command", "read_file", "write_file",
         })]
-    # Native strict approvals deny task reads; roles/tasks use VM/UID isolation,
+    # Native strict approvals deny task reads; roles use VM/UID isolation,
     # like Codex/Claude, with the policy verified against AGY 1.5.3.
     return {
         "useG1Credits": False,
@@ -448,6 +449,13 @@ def main():
         url = os.environ["FIRM_ACTIVATION_START_URL" if role else "FIRM_SUMMARY_START_URL"]
         if not _begin_activation(url, token):
             return 70
+        if role and (llm_url := os.environ.pop("FIRM_LLM_URL", None)):
+            runpy.run_path(str(_absolute("FIRM_CREDENTIALS_DIR") / "llm-cli"))["install_shims"](
+                _absolute("FIRM_STATE_DIR"),
+                _absolute("FIRM_CREDENTIALS_DIR"),
+                _absolute("FIRM_PRIVATE_HOME"),
+                llm_url,
+            )
         with ExitStack() as stack:
             if os.environ.get("FIRM_CREDENTIALS_URL"):
                 module = runpy.run_path(

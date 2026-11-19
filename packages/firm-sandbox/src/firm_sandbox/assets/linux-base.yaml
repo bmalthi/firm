@@ -30,12 +30,12 @@ provision:
       # Node takes the newest release of this line; the provider CLIs below stay pinned
       # because Firm parses their output.
       NODE_MAJOR=24
-      CLAUDE_CODE_VERSION=2.1.281
-      CODEX_VERSION=0.165.0
-      AGY_URL=https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.3-6604829099950080/linux-arm/cli_linux_arm64.tar.gz
+      CLAUDE_CODE_VERSION=2.1.327
+      CODEX_VERSION=0.170.0
+      AGY_URL=https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.11-6132547114106880/linux-arm/cli_linux_arm64.tar.gz
       # Vendor SHA-512 from the linux_arm64 (glibc) manifest, resolved at release time:
       # https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_arm64.json
-      AGY_SHA512=c2fac818b3c1bb224079df03a714ccba99728b6a3a41d86d247ab2feb8582a43840c5032f1c2b75e72667623d5503e7ffda2712c4f37b6ee19f99c3fcfb25bae
+      AGY_SHA512=5f703c88e01851061c87c07b1a4ca54c1f5a6826ffada9fb005974a099e9a552ddb1f9ba2fe1194e2829803482c86084babf8cf91530a528bc7f659613600585
       CURL="curl --retry 10 --retry-all-errors --retry-max-time 600 -fsSL"
       PACKAGES="cifs-utils acl samba samba-vfs-modules uidmap dbus-user-session
         curl xz-utils git gh build-essential ssl-cert
@@ -72,6 +72,10 @@ provision:
       rm -rf "$node_stage"
       npm install -g --prefix /usr/local \
         "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@openai/codex@${CODEX_VERSION}"
+      # npm 11+ skips unallowlisted postinstall scripts; install.cjs is idempotent.
+      /usr/local/bin/node /usr/local/lib/node_modules/@anthropic-ai/claude-code/install.cjs
+      /usr/local/bin/claude --version
+      /usr/local/bin/codex --version
       # Playwright's newest Chromium, with the OS libraries that version needs, shared
       # read-only by every role. The version is PyPI's, since roles add Playwright with
       # uv; Playwright changes browsers only in minor releases, so X.Y.0 is recorded.
@@ -108,6 +112,7 @@ provision:
       exec /usr/local/lib/agy/agy "$@"
       AGY
       chmod 0755 /usr/local/bin/agy
+      /usr/local/bin/agy --version
       # GitHub credentials are supplied only during a role's run.
       cat > /etc/gitconfig <<'GITCONFIG'
       [credential "https://github.com"]

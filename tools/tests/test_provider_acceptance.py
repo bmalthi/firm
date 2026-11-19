@@ -34,7 +34,7 @@ def load(name):
 
 provider = load("provider")
 summary = load("summary")
-task = load("task")
+llm_cli = load("llm_cli")
 common = sys.modules["provider_checks.acceptance_common"]
 
 
@@ -48,7 +48,7 @@ def access_document():
 
 def launch_spec(**kwargs):
     return RunSpec("role", ("guest-python", "launcher"), run_id="run-one", env={
-        "FIRM_AGY_MODE": "task", "FIRM_AGY_ARGV": json.dumps([
+        "FIRM_AGY_MODE": "tool_free", "FIRM_AGY_ARGV": json.dumps([
             "/usr/local/bin/agy", "--print=", "--model", "gemini-4-hydrogen-high",
         ]),
     }, secrets={"agy-auth": json.dumps(access_document()).encode()}, **kwargs)
@@ -70,7 +70,7 @@ def native_stream(*, model="gemini-4-hydrogen-high", native_id="synthetic-native
     return b"".join((json.dumps(event) + "\n").encode() for event in events)
 
 
-@pytest.mark.parametrize("module", [provider, summary, task])
+@pytest.mark.parametrize("module", [provider, summary, llm_cli])
 def test_cli_selects_agy_explicitly(module):
     args = ["--root", "/tmp/synthetic-firm", "--evidence", "/tmp/synthetic-evidence",
             "--provider-config", "/tmp/synthetic.toml", "--profile", "agy", "--provider", "agy"]
@@ -106,9 +106,6 @@ def test_selected_profile_is_copy_free_and_rejects_normal_home_or_billing(tmp_pa
     with pytest.raises(ValueError, match="dedicated profile"):
         common.selected_profile(source, "agy")
     source = config()
-    source["google_cloud"] = {"project": "synthetic"}
-    with pytest.raises(ValueError, match="google_cloud"):
-        common.selected_profile(source, "agy")
     source["profiles"]["agy"]["provider"] = "unknown"
     with pytest.raises(ValueError, match="Unsupported"):
         common.selected_profile(source, "agy")
@@ -163,8 +160,16 @@ def test_launch_receipt_checks_actual_model_and_projection(tmp_path):
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("model", ["gemini-4-argon-high", "gemini-4-hydrogen-medium",
-                                  "gemini-4-argon-medium"])
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gemini-4-neon-high",
+        "gemini-4-carbon-high",
+        "gemini-4-argon-high",
+        "gemini-4-hydrogen-medium",
+        "gemini-4-argon-medium",
+    ],
+)
 def test_native_model_and_resume_evidence_omit_payloads(model):
     logs = native_stream(model=model, tools=("mcp_firm_peek",))
     evidence = common.agy_output_evidence(
@@ -316,7 +321,7 @@ def test_readme_configuration_recipe_matches_runtime_schema(tmp_path, monkeypatc
     assert profile["effort"] == "medium"
     assert accounts["agy-dedicated"]["max_active"] == 2
     assert configured["summary"]["agy"]["effort"] == "medium"
-    assert configured["task"]["agy"]["effort"] == "high"
+    assert configured["llm"]["agy"]["effort"] == "high"
     path = tmp_path / "sandbox.toml"
     path.write_text(sandbox)
     assert Config.load(path).mac_image is None

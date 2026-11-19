@@ -21,7 +21,6 @@ def common_standing() -> str:
 def test_tool_descriptions_are_resource_backed_and_keep_registered_operations():
     resources = json.loads(prompt("tools.json"))
     expected_names = {
-        "task",
         "send",
         "reply",
         "peek",
@@ -266,13 +265,14 @@ def test_physics_and_limits_do_not_duplicate_authority_rules():
     assert "access_denied" not in common_standing()
 
 
-def test_prompts_use_us_english_and_task_worker_prompt_is_resource_backed():
+def test_prompts_use_us_english_and_llm_instructions_are_resource_backed():
     import re
     from pathlib import Path
 
-    from firm_runtime.task_runner import WORKER_INSTRUCTIONS
+    from firm_runtime.llm_service import LlmService
 
-    assert WORKER_INSTRUCTIONS == prompt("runtime_task.md")
+    _, secrets, _ = LlmService.launch_settings("http://firm.local/llm")
+    assert secrets["llm-instructions"].decode() == prompt("runtime_llm.md") + "\n"
     uk_pattern = re.compile(
         r"\b(?:"
         r"behaviours?|organis(?:e|ed|ing|ations?)|"

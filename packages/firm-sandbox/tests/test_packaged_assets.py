@@ -8,14 +8,18 @@ import yaml
 def test_packaged_guest_recipe_contains_vendor_verified_agy_pin():
     recipe = resources.files("firm_sandbox").joinpath("assets/linux-base.yaml").read_text()
     script = yaml.safe_load(recipe)["provision"][0]["script"]
-    assert "1.5.3-6604829099950080/linux-arm/cli_linux_arm64.tar.gz" in script
+    assert "1.5.11-6132547114106880/linux-arm/cli_linux_arm64.tar.gz" in script
     assert (
-        "AGY_SHA512=c2fac818b3c1bb224079df03a714ccba99728b6a3a41d86d247ab2feb8582a438"
-        "40c5032f1c2b75e72667623d5503e7ffda2712c4f37b6ee19f99c3fcfb25bae"
+        "AGY_SHA512=5f703c88e01851061c87c07b1a4ca54c1f5a6826ffada9fb005974a099e9a552"
+        "ddb1f9ba2fe1194e2829803482c86084babf8cf91530a528bc7f659613600585"
     ) in script
     assert "sha512sum --check --status" in script
     assert "export AGY_CLI_DISABLE_AUTO_UPDATE=true" in script
     assert 'install -o root -g root -m 0755 "$agy_stage/antigravity"' in script
+    assert "/usr/local/lib/node_modules/@anthropic-ai/claude-code/install.cjs" in script
+    assert "/usr/local/bin/claude --version" in script
+    assert "/usr/local/bin/codex --version" in script
+    assert "/usr/local/bin/agy --version" in script
     assert resources.files("firm_sandbox").joinpath("assets/linux-generalize.sh").is_file()
 
 

@@ -101,7 +101,7 @@ class RoleLaunchRequest:
     """Role launch context, translated according to each native provider's needs.
 
     Adapters enforce the offered catalog through supported native controls or
-    reject unsupported exposure. Native call budgets include bounded task cleanup.
+    reject unsupported exposure.
     Invocation.context remains mutable, as it is throughout admission and launch.
     """
 
@@ -111,7 +111,6 @@ class RoleLaunchRequest:
     mcp_url: str
     provider_session_id: str | None
     offered_tools: tuple[str, ...]
-    task_timeout_seconds: float
 
 
 class ExecutionProvider(Protocol):
@@ -128,8 +127,6 @@ class ExecutionProvider(Protocol):
     def build_spec(self, request: RoleLaunchRequest, *, layout: Layout) -> RunSpec: ...
 
     def build_summary_spec(self, request: SummaryLaunch, layout: Layout) -> RunSpec: ...
-
-    def build_task_spec(self, request: SummaryLaunch, layout: Layout) -> RunSpec: ...
 
     def parse_result(self, logs: bytes | str, exit_code: int) -> ProviderResult: ...
 

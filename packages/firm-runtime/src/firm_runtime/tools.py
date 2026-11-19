@@ -1,8 +1,6 @@
 """Role operations bind the caller to one live activation, inside each transaction."""
 
-import asyncio
 import hashlib
-import threading
 from typing import Annotated, Literal, TypedDict
 
 from pydantic import ConfigDict, Field
@@ -29,24 +27,6 @@ class RoleTools:
     def __init__(self, runtime, token: str):
         self.runtime = runtime
         self.token = token
-
-    async def task(self, instruction: str, request_id: str) -> dict:
-        """Await a bounded worker without blocking parallel MCP calls."""
-        cancelled = threading.Event()
-        worker = asyncio.create_task(asyncio.to_thread(
-            self.runtime.task_service.call, self.token, instruction, request_id,
-            cancelled=cancelled,
-        ))
-        try:
-            result = await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            cancelled.set()
-            await worker
-            raise
-        # The worker may outlast mail arrivals, drain requests, or this activation.
-        # Reauthorize and present current controls only after releasing the wait.
-        with self.runtime.authorized(self.token) as actor:
-            return self.runtime.present_controls(actor["activation_id"], result)
 
     def _call(
         self,

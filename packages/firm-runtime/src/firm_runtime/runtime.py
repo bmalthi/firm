@@ -17,6 +17,7 @@ from .github import GitHubAccess
 from .hosts import NetworkHosts
 from .levels import Levels
 from .lifecycle import Lifecycle
+from .llm_service import LlmService
 from .mac_lease import MacLease
 from .messaging import Messaging
 from .orientation import orientation_for_admission
@@ -27,7 +28,6 @@ from .requests import OwnerRequests
 from .scheduling import acknowledge_opportunities
 from .store import CONTROL_PRIORITY, OPERATIONS, ORDINARY_PRIORITY, OWNER, Store, encoded
 from .summaries import SummaryService
-from .tasks import TaskService
 from .telemetry import ContextTelemetry, handoff_checklist
 
 ACTIVE = ("admitted", "running")
@@ -59,10 +59,10 @@ class Invocation:
 
 
 class Runtime:
-    def __init__(self, store: Store, *, task_runner=None):
+    def __init__(self, store: Store):
         self.store = store
         self.accounts = Accounts(self)
-        self.task_service = TaskService(self, task_runner)
+        self.llm_service = LlmService(self)
         self.summary_service = SummaryService(store=store, capacity=self.accounts)
         self.messaging = Messaging(store, summary_service=self.summary_service)
         self.lifecycle = Lifecycle(store, self.messaging)
@@ -312,6 +312,7 @@ class Runtime:
             if active >= json.loads(firm["config_json"])["max_active"]:
                 return None
             now = self.store.clock()
+            self.llm_service._sweep_expired(db, now)
             managed = self.accounts.enabled(db)
 
             def select(candidates):
@@ -691,6 +692,7 @@ class Runtime:
                 "failure=? WHERE activation_id=?",
                 (outcome, now, category, failure, activation_id),
             )
+            self.llm_service.settle_activation(db, activation_id, reason="cancelled")
             db.execute(
                 "DELETE FROM discovery_continuations WHERE activation_id=?", (activation_id,)
             )
@@ -876,6 +878,7 @@ class Runtime:
                 changed = db.execute(
                     "UPDATE firm SET state='stopped' WHERE state IN ('draining','stopping')"
                 )
+                self.llm_service.settle_all(db, reason="cancelled")
                 if changed.rowcount:
                     analysis_history.record(
                         db,

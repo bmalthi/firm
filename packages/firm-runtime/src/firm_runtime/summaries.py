@@ -40,7 +40,7 @@ class SummaryInputTooLarge(ValueError):
 
 
 def summary_role_id(run_id: str, stateless_slot: int | None = None) -> str:
-    """Stateless calls lease reusable accounts; task specs retain run identities."""
+    """Stateless calls lease reusable accounts; stateful runs retain identities."""
     if stateless_slot is not None:
         if type(stateless_slot) is not int or not 0 <= stateless_slot < MAX_SUMMARY_CONCURRENCY:
             raise ValueError("invalid stateless slot")
@@ -81,14 +81,15 @@ CREATE TABLE IF NOT EXISTS summary_runs (
     resolved_model TEXT,
     token_hash TEXT UNIQUE,
     provider_started_at REAL,
+    lease_until REAL,
     kind TEXT NOT NULL DEFAULT 'summary',
     caller_activation_id TEXT REFERENCES activations(activation_id),
     stateless_slot INTEGER CHECK(stateless_slot >= 0 AND stateless_slot < 4)
 );
 CREATE INDEX IF NOT EXISTS summary_runs_by_account
     ON summary_runs(account_id, state);
-CREATE INDEX IF NOT EXISTS task_runs_by_caller
-    ON summary_runs(caller_activation_id, state) WHERE kind='task';
+CREATE INDEX IF NOT EXISTS llm_runs_by_caller
+    ON summary_runs(caller_activation_id, state) WHERE kind='llm';
 CREATE UNIQUE INDEX IF NOT EXISTS active_stateless_slots
     ON summary_runs(stateless_slot) WHERE state='running' AND stateless_slot IS NOT NULL;
 """
@@ -612,7 +613,7 @@ class SummaryService:
         now = self.store.clock()
         with self.store.transaction() as db:
             occupied = {row[0] for row in db.execute(
-                "SELECT stateless_slot FROM summary_runs WHERE state='running' AND kind!='task'"
+                "SELECT stateless_slot FROM summary_runs WHERE state='running' AND kind!='llm'"
             )}
             available = sorted(set(range(MAX_SUMMARY_CONCURRENCY)) - occupied)
             if not available:
@@ -661,15 +662,6 @@ class SummaryService:
                 or self.store.firm(db)["state"] != "running"
             ):
                 raise FirmError("summary launch is no longer admitted")
-            if row["kind"] == "task":
-                parent = db.execute(
-                    "SELECT a.state,s.stop_cause,s.deadline FROM activations a "
-                    "JOIN sandbox_runs s USING(activation_id) WHERE a.activation_id=?",
-                    (row["caller_activation_id"],),
-                ).fetchone()
-                if (not parent or parent["state"] != "running" or parent["stop_cause"]
-                        or parent["deadline"] <= now):
-                    raise FirmError("task parent is no longer live")
             db.execute(
                 "UPDATE summary_runs SET provider_started_at=? WHERE run_id=?", (now, row["run_id"])
             )
@@ -725,13 +717,13 @@ class SummaryService:
                 marks = ",".join("?" for _ in active_run_ids)
                 query = (
                     "UPDATE summary_runs SET state='unavailable',finished_at=?,reason=? "
-                    f"WHERE state='running' AND kind!='task' AND run_id NOT IN ({marks})"
+                    f"WHERE state='running' AND kind!='llm' AND run_id NOT IN ({marks})"
                 )
                 params = (now, "host_restart", *sorted(active_run_ids))
             else:
                 query = (
                     "UPDATE summary_runs SET state='unavailable',finished_at=?,reason=? "
-                    "WHERE state='running' AND kind!='task'"
+                    "WHERE state='running' AND kind!='llm'"
                 )
                 params = (now, "host_restart")
             if candidate_ids is not None:

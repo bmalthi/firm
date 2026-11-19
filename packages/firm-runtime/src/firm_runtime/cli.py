@@ -132,8 +132,8 @@ def _show_check(report: dict) -> bool:
 
 
 def _announce_first_run(provider: str, *, directory: Path | None = None) -> None:
-    model = {"codex": "gpt-6-luna", "claude": "Claude Sonnet",
-             "agy": "Gemini 4 Hydrogen (experimental)"}[provider]
+    model = {"codex": "gpt-6.1-terra", "claude": "Claude Sonnet",
+             "agy": "Gemini 4 Neon (experimental)"}[provider]
     allocation = "8 GiB of RAM and a 60 GiB maximum virtual disk"
     if directory is not None and (directory / "sandbox.toml").is_file():
         try:

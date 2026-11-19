@@ -1,6 +1,7 @@
 """Authenticated Streamable HTTP MCP endpoint for sandboxed role executions."""
 
 import hashlib
+import json
 from collections.abc import Sequence
 
 import anyio
@@ -62,6 +63,28 @@ def _auth_error() -> JSONResponse:
         status_code=401,
         headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
     )
+
+
+async def _read_json_body(request: Request, max_bytes: int) -> dict | None:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > max_bytes:
+                return None
+        except ValueError:
+            return None
+    chunks = bytearray()
+    async for chunk in request.stream():
+        if len(chunks) + len(chunk) > max_bytes:
+            return None
+        chunks.extend(chunk)
+    if not chunks:
+        return {}
+    try:
+        parsed = json.loads(chunks.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def build_http_app(
@@ -143,26 +166,32 @@ def build_http_app(
                 account_id = binding["account_id"]
                 provider = binding["provider"]
             except FirmError:
+                now = runtime.store.clock()
                 summary = db.execute(
                     "SELECT account_id,provider,kind,caller_activation_id FROM summary_runs "
                     "WHERE token_hash=? "
-                    "AND state='running' AND provider_started_at IS NOT NULL AND deadline>?",
-                    (hashlib.sha256(token.encode()).hexdigest(), runtime.store.clock()),
+                    "AND state='running' AND provider_started_at IS NOT NULL "
+                    "AND deadline>? AND (lease_until IS NULL OR lease_until>?)",
+                    (hashlib.sha256(token.encode()).hexdigest(), now, now),
                 ).fetchone()
                 if summary is None or runtime.store.firm(db)["state"] not in {
                     "running",
                     "draining",
                 }:
                     raise FirmError("Invalid credential token") from None
-                if summary["kind"] == "task":
+                if summary["kind"] == "llm":
                     parent = db.execute(
                         "SELECT a.state,s.stop_cause,s.deadline FROM activations a "
-                        "JOIN sandbox_runs s USING(activation_id) WHERE a.activation_id=?",
+                        "LEFT JOIN sandbox_runs s USING(activation_id) WHERE a.activation_id=?",
                         (summary["caller_activation_id"],),
                     ).fetchone()
-                    if (not parent or parent["state"] != "running" or parent["stop_cause"]
-                            or parent["deadline"] <= runtime.store.clock()):
-                        raise FirmError("Task parent is no longer live") from None
+                    if (
+                        not parent
+                        or parent["state"] != "running"
+                        or parent["stop_cause"] is not None
+                        or (parent["deadline"] is not None and parent["deadline"] <= now)
+                    ):
+                        raise FirmError("LLM CLI parent is no longer live") from None
                 account_id, provider = summary["account_id"], summary["provider"]
             account = runtime.accounts.config(db).get("accounts", {}).get(account_id)
             if not account or account["provider"] != provider:
@@ -232,5 +261,101 @@ def build_http_app(
         else:
             status, body = 200, issued
         return JSONResponse(body, status_code=status, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/llm/start", methods=["POST"])
+    async def llm_start(request: Request):
+        rejection = await security.validate_request(request)
+        if rejection is not None:
+            return rejection
+        token = _bearer_token(request)
+        if token is None or len(token) > 256:
+            return _auth_error()
+        payload = await _read_json_body(request, 64 * 1024)
+        if payload is None or not isinstance(payload.get("provider"), str):
+            return JSONResponse(
+                {"error": "invalid_request"}, status_code=400, headers={"Cache-Control": "no-store"}
+            )
+        effort = payload.get("effort")
+        resumed = payload.get("resumed", False)
+        try:
+            result = await anyio.to_thread.run_sync(
+                lambda: runtime.llm_service.start(
+                    token, payload["provider"], effort=effort, resumed=resumed
+                )
+            )
+        except FirmError as exc:
+            if "token" in str(exc):
+                return _auth_error()
+            return JSONResponse(
+                {"error": "invalid_request", "message": str(exc)},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/llm/heartbeat", methods=["POST"])
+    async def llm_heartbeat(request: Request):
+        rejection = await security.validate_request(request)
+        if rejection is not None:
+            return rejection
+        token = _bearer_token(request)
+        if token is None or len(token) > 256:
+            return _auth_error()
+        payload = await _read_json_body(request, 16 * 1024)
+        if payload is None:
+            return JSONResponse(
+                {"error": "invalid_request"}, status_code=400, headers={"Cache-Control": "no-store"}
+            )
+        progress = payload.get("progress", False)
+        try:
+            result = await anyio.to_thread.run_sync(
+                lambda: runtime.llm_service.heartbeat(token, progress=progress)
+            )
+        except FirmError as exc:
+            if "token" in str(exc):
+                return _auth_error()
+            return JSONResponse(
+                {"error": "invalid_request", "message": str(exc)},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/llm/finish", methods=["POST"])
+    async def llm_finish(request: Request):
+        rejection = await security.validate_request(request)
+        if rejection is not None:
+            return rejection
+        token = _bearer_token(request)
+        if token is None or len(token) > 256:
+            return _auth_error()
+        payload = await _read_json_body(request, 1024 * 1024)
+        if payload is None:
+            return JSONResponse(
+                {"error": "invalid_request"}, status_code=400, headers={"Cache-Control": "no-store"}
+            )
+        exit_code = payload.get("exit_code")
+        logs = payload.get("logs")
+        reason = payload.get("reason")
+        resumed = payload.get("resumed", False)
+        try:
+            result = await anyio.to_thread.run_sync(
+                lambda: runtime.llm_service.finish(
+                    token,
+                    exit_code=exit_code,
+                    logs=logs,
+                    reason=reason,
+                    resumed=resumed,
+                )
+            )
+        except FirmError as exc:
+            if "token" in str(exc):
+                return _auth_error()
+            return JSONResponse(
+                {"error": "invalid_request", "message": str(exc)},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     return server.streamable_http_app()

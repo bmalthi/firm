@@ -1,7 +1,7 @@
 # Runtime configuration and owner operations
 
 > **Quick Reference — Operating a Firm**
-> * **Configuration (`firm.toml` & `sandbox.toml`):** Put `mandate.md`, `firm.toml` (provider profiles, accounts, and optional `[staffing]` / `[github]` / `[google_cloud]`), and `sandbox.toml` (VM sizing and `[network]` policy) in the firm's directory.
+> * **Configuration (`firm.toml` & `sandbox.toml`):** Put `mandate.md`, `firm.toml` (provider profiles, accounts, and optional `[staffing]` / `[github]`), and `sandbox.toml` (VM sizing and `[network]` policy) in the firm's directory.
 > * **Dedicated Credentials (`~/.config/firm-runtime/credentials/`):** Use a dedicated login per account (`firm start` wizard or `firm save-credentials`) so OAuth refresh-token rotation never signs out your everyday host CLI.
 > * **Console & CLI Parity:** Everything in the local Owner Console (`http://127.0.0.1:8766/`) has an equivalent JSON CLI command (`firm status`, `firm analyze`, `firm send`, `firm requests`, `firm network`, `firm stop`).
 > * **CLI invocation:** Once installed via `uv tool install`, run commands directly as `firm <subcommand> ...`. Inside a source checkout of this repository, you can equivalently run `uv run firm ...`, which the examples below show.
@@ -13,10 +13,9 @@ and, for an optional Mac station, the [Mac station guide](mac-station.md). The
 ## Contents
 
 - [Firm configuration](#firm-configuration) ([Hiring levels](#hiring-levels))
-- [Provider credentials](#provider-credentials) ([Claude](#claude), [Codex](#codex), [Renewal](#renewal), [Correspondence summaries](#correspondence-summaries), [Tasks](#tasks))
+- [Provider credentials](#provider-credentials) ([Claude](#claude), [Codex](#codex), [Renewal](#renewal), [Correspondence summaries](#correspondence-summaries), [LLM CLIs](#llm-clis))
 - [GitHub](#github) ([Organization settings](#organization-settings), [Configuration](#configuration), [Registering the App](#registering-the-app), [Repositories on request](#repositories-on-request), [What roles get](#what-roles-get), [Revoking access](#revoking-access))
 - [Owner requests](#owner-requests) ([Network hosts](#network-hosts))
-- [Generative images](#generative-images)
 - [Start and stop](#start-and-stop) ([Execution boundaries](#execution-boundaries))
 - [Accounts, quota and recovery](#accounts-quota-and-recovery) ([Moving a role to another provider](#moving-a-role-to-another-provider))
 - [Handoff](#handoff)
@@ -41,7 +40,7 @@ founder_profile = "codex"
 
 [profiles.codex]
 provider = "codex"
-model = "gpt-6-luna"
+model = "gpt-6.1-terra"
 effort = "low"
 accounts = ["codex-personal"]
 context_window = 256000
@@ -126,21 +125,25 @@ change notice. Prompt resource edits take effect only after restarting the host.
 
 `[staffing]` configures the [hiring-level chooser](../design/runtime.md#hiring-levels).
 Omitting `[staffing]` enables the chooser automatically. With the Codex configuration
-above, Luna at medium effort assesses each hire and selects its effort and model class. The
+above, Terra at medium effort assesses each hire and selects its effort and model class. The
 generated profiles are `staffing-low`, `staffing-medium`, `staffing-high` and
 `staffing-chooser`, using the founder's accounts and context policy; alternate routes take
 suffixes `-1`, `-2` and so on. If the founder profile lists `alternates`, default staffing
 generates matching class and chooser routes for those providers too.
 
-Codex uses Luna (`gpt-6-luna`), Sol (`gpt-6.1-sol`) and Astra (`gpt-6-astra`) for low,
-medium and high; Claude uses Sonnet, Opus and Fable (`claude-fable-5-1`). Initialization
+Codex uses Terra (`gpt-6.1-terra`), Sol (`gpt-6.2-sol`) and Astra (`gpt-6.2-astra`) for low,
+medium and high; Claude uses Sonnet (`sonnet`), Opus (`opus`) and Fable (`fable`). Initialization
 saves the expanded settings in the firm's database. The generated Codex high-class
 profile uses medium effort. A hire's chosen effort still overrides its profile default.
 
-Codex also accepts `gpt-6.1-terra` in any explicit profile, including a custom staffing
-class. It is not part of the default three-class mapping. New Linux VMs install Codex
-CLI 0.165.0; Terra requires 0.159.0 or newer. Model availability still depends on the
-configured account. See the [OpenAI model guide](https://learn.chatgpt.com/docs/models).
+Explicit profiles, `[summary]`, and `[llm]` may also use family or class aliases in place
+of versioned model IDs: Codex resolves `terra`/`sol`/`astra` and `low`/`medium`/`high` to
+`gpt-6.1-terra`/`gpt-6.2-sol`/`gpt-6.2-astra`; AGY resolves `hydrogen`/`neon`/`carbon` to
+`gemini-4-hydrogen`/`gemini-4-neon`/`gemini-4-carbon` and `low`/`medium`/`high` to
+`gemini-4-hydrogen`/`gemini-4-neon`/`gemini-4-neon`; Claude
+resolves `low`/`medium`/`high` to `sonnet`/`opus`/`fable` (which the Claude CLI routes natively).
+New Linux VMs install Codex CLI 0.170.0, Claude Code 2.1.327, and AGY CLI 1.5.11. Model
+availability still depends on the configured account. See the [OpenAI model guide](https://learn.chatgpt.com/docs/models).
 
 To choose explicitly instead:
 
@@ -155,7 +158,7 @@ low = "game_low"
 
 [profiles.chooser_codex]
 provider = "codex"
-model = "gpt-6-luna"
+model = "gpt-6.1-terra"
 effort = "medium"
 accounts = ["codex-personal"]
 alternates = ["chooser_claude"]
@@ -168,7 +171,7 @@ high class at high effort; an explicit founder profile keeps its configured mode
 
 For fixed-profile hiring, set `staffing = false` at the top level, **before any TOML tables**.
 Only this explicit opt-out disables assessment; hires then take `default_profile`, or
-`founder_profile` when no default is given. Note that [correspondence summaries](#correspondence-summaries) (`[summary.<provider>]`) and [tasks](#tasks) (`[task.<provider>]`) have their own default model settings; if your account only exposes a single model, set `model` in those tables as well.
+`founder_profile` when no default is given. Note that [correspondence summaries](#correspondence-summaries) (`[summary.<provider>]`) and [LLM CLIs](#llm-clis) (`[llm.<provider>]`) have their own default model settings; if your account only exposes a single model, set `model` in those tables as well.
 
 ## Provider credentials
 
@@ -231,12 +234,13 @@ class entries are ordered low, medium, high. Quota and context depend on provide
 | Host credentials | `ACCOUNT.json` | `ACCOUNT.json` | `ACCOUNT-agy/home/.gemini/antigravity-cli/antigravity-oauth-token` |
 | VM credentials | OAuth access bundle, blank refresh token; or static API key | Setup token as-is; or OAuth access bundle without refresh token | Access-only token file, blank refresh token |
 | [Renewal](#renewal) | Host OAuth exchange within 10 min of expiry; API keys static | Repeat setup-token sign-in; OAuth JSON uses host exchange within 10 min | Host `agy models` below 50 min; macOS Keychain sandbox |
-| [Model classes](#firm-configuration): low, medium, high | `gpt-6-luna` / high; `gpt-6.1-sol` / high; `gpt-6-astra` / medium | `sonnet` / high; `opus` / high; `claude-fable-5-1` / high | `gemini-4-hydrogen` / medium; `gemini-4-hydrogen` / high; `gemini-4-argon` / medium |
-| Chooser / [summary](#correspondence-summaries) default | `gpt-6-luna` / medium | `sonnet` / medium | `gemini-4-hydrogen` / low (chooser), medium (summary) |
-| [Task](#tasks) default | `gpt-6.1-sol` / medium | `opus` / medium | `gemini-4-hydrogen` / high |
-| Accepted efforts | low, medium, high, xhigh, max, ultra | low, medium, high, xhigh, max | low, medium, high; Firm `xhigh` → `gemini-4-argon-high` |
+| [Model classes](#firm-configuration): low, medium, high | `gpt-6.1-terra` / high; `gpt-6.2-sol` / high; `gpt-6.2-astra` / medium | `sonnet` / high; `opus` / high; `fable` / high | `gemini-4-hydrogen` / medium; `gemini-4-neon` / medium; `gemini-4-neon` / high |
+| Chooser / [summary](#correspondence-summaries) default | `gpt-6.1-terra` / medium | `sonnet` / medium | `gemini-4-hydrogen` / low (chooser), medium (summary) |
+| [LLM CLI](#llm-clis) default | `gpt-6.2-sol` / medium | `opus` / medium | `gemini-4-neon` / medium |
+| Accepted efforts | low, medium, high, xhigh, max, ultra | low, medium, high, xhigh, max | low, medium, high; Firm `xhigh` → `gemini-4-carbon-high` |
 | Resume / retained conversation | `exec resume`; private `sessions` tree | `--resume`; private `projects` tree | `--conversation`; private HOME and checked conversation DB |
-| [Web search](installation.md#4-default-firewall-web-search-and-network-egress) | Provider-side `web_search` | Provider-side `WebSearch` | Provider-side `search_web` for roles/tasks |
+| [Web search](installation.md#4-default-firewall-web-search-and-network-egress) | Provider-side `web_search` | Provider-side `WebSearch` | Provider-side `search_web` for roles and CLIs |
+| Image generation | Native `image_gen` (`gpt-image-2`) for roles and CLIs | None natively; use `codex` / `agy` CLI when configured | Native `generate_image` for roles and CLIs |
 | [Page fetch](linux-vm.md#network-access-and-cutoff) | Shell `curl` through firewall | `WebFetch` through firewall | Shell `curl` through firewall; native page fetch denied |
 | [Quota](#accounts-quota-and-recovery) / [context](#context-pressure) | Quota polling/stream; context from rollout | Quota stream (OAuth JSON also polling); context from stream | Unavailable |
 | [Provider network hosts](linux-vm.md#network-access-and-cutoff) | `*.openai.com`, `chatgpt.com`, `*.chatgpt.com` | `*.anthropic.com`, `*.claude.com` | `www.googleapis.com`, `daily-cloudcode-pa.googleapis.com` |
@@ -331,11 +335,11 @@ coordinator does not silently switch accounts or read arbitrary desktop logins.
 ### Correspondence summaries
 
 Summaries have their own provider settings and do not reuse the calling role's model. Defaults
-are Codex `gpt-6-luna` and Claude `sonnet`, both at medium effort:
+are Codex `gpt-6.1-terra`, Claude `sonnet`, and AGY `gemini-4-hydrogen`, at medium effort:
 
 ```toml
 [summary.codex]
-model = "gpt-6-luna"
+model = "gpt-6.1-terra"
 effort = "medium"
 
 [summary.claude]
@@ -364,47 +368,53 @@ provider turn itself fails, the reason is the provider's failure kind — `proce
 `firm-sandbox --config SANDBOX_TOML ps` to find its `s-slot-N` account, then
 `firm-sandbox --config SANDBOX_TOML logs s-slot-N --run-id RUN_ID`.
 
-### Tasks
+### LLM CLIs
 
-The `task` tool lets a role hand one bounded instruction to a short-lived worker and get one
-text answer back: locating code, condensing files, diagnosing a command, without the role
-spending its own context on every intermediate read. Tasks have their own model settings,
-independent of the role's and of summaries. These are the defaults, which apply even when
-the tables are absent:
+Every role whose firm configures provider accounts receives non-interactive `claude` (`-p`),
+`codex` (`exec`) and `agy` (`-p`) wrappers on its Linux `PATH` whenever accounts exist for
+those providers. A role calls them from its shell to run focused sub-loops, inspect large
+trees, script workflows, or get a fresh-context review without adding noisy intermediate work
+to its own conversation. LLM CLIs have their own model and default effort settings,
+independent of the role's and of summaries (callers may pass `--effort`, but `--model` and
+`--mcp-config` are rejected). These are the defaults, which apply even when the tables are
+absent:
 
 ```toml
-[task]
+[llm]
+enabled = true
 max_concurrent = 2          # per role
-timeout_seconds = 600
-max_instruction_bytes = 16384
-max_answer_bytes = 16384
+timeout_seconds = 1800
 
-[task.codex]
-model = "gpt-6.1-sol"
+[llm.codex]
+model = "gpt-6.2-sol"
 effort = "medium"
 
-[task.claude]
+[llm.claude]
 model = "opus"
+effort = "medium"
+
+[llm.agy]
+model = "gemini-4-neon"
 effort = "medium"
 ```
 
-A task runs on the calling role's own provider and account. While the role waits, its first
-running task uses the role's slot; each further concurrent task needs a free slot on that
-account or is refused at once (`unavailable: capacity`), and one beyond `max_concurrent`
-is refused as `busy`. Account and profile holds apply as they do to roles, and a task
-whose login is refused or whose account allowance is exhausted pauses the account, because
-that is true of the account. A task whose own settings fail (a model the provider does not
-offer, an unsupported effort, a worker that cannot be set up, or on AGY a task model whose
-own allowance is spent) is refused as `configuration` and pauses nothing: roles keep
-working, and Operations tells you once per model and code so you can correct
-`[task.<provider>]`. The worker runs
-as the role's Linux user inside the role's current work period, with the role's files and
-shell but no firm tools and no conversation history; a timeout or the end of the work
-period kills that task alone and the role keeps running. Anything the worker hands to the
-role's Docker or systemd user manager outlives the task and ends with the work period.
-`firm analyze` attributes tasks to the calling role, with task tokens counted apart from
-the role's own. Changes applied with `firm configure` affect later tasks.
-[`tools/acceptance/task.py`](../tools/acceptance/task.py) checks all of this live.
+Roles can invoke any configured provider regardless of their own provider (cross-provider calls
+are allowed). One active CLI call on the role's own bound account borrows the caller's slot;
+additional concurrent calls on that account, or calls to other providers/accounts, take a free
+account slot or are refused at once (`capacity`), and calls beyond `max_concurrent` are refused
+as `busy`. Account and profile holds apply as they do to roles, and a CLI call whose login is
+refused or whose account allowance is exhausted pauses the account. A call whose own settings
+fail (an invalid model/effort, failed CLI setup, or on AGY a CLI model whose allowance is
+spent) is refused as `configuration` and pauses nothing: roles keep working, and Operations
+tells you once per model and code so you can correct `[llm.<provider>]`. Each wrapper strips
+`FIRM_*`, `GH_TOKEN`, `GITHUB_TOKEN`, and raw API key environment variables, sets
+`FIRM_LLM_CHILD=1` (preventing nested CLI recursion), stages credentials only transiently
+on `/run` during the live lease, persists transcripts under `<private_home>/.firm/cli/<provider>`,
+writes only the answer to `stdout`, and prints the session ID and waiting-mail cues to `stderr`.
+A timeout or the end of the work period stops the CLI process and closes its lease. `firm
+analyze` attributes CLI calls to the calling role, with tokens counted apart from the role's own.
+Changes applied with `firm configure` affect later calls.
+[`tools/acceptance/llm_cli.py`](../tools/acceptance/llm_cli.py) checks this live.
 
 ## GitHub
 
@@ -666,37 +676,6 @@ for it. Grants hold until revoked and are pushed to the sandbox again at every
 hosts, and `--section network` shows the allowlist with each host's source, the pending
 requests, and the proxy's record of requests by role and host.
 
-## Generative images
-
-Off by default. A firm with `[google_cloud]` gives every role's run one API key for
-Google's Gemini API, in `GEMINI_API_KEY`, with the project in `GOOGLE_CLOUD_PROJECT`.
-
-```toml
-[google_cloud]
-project = "example-project"
-api_key_file = "/absolute/path/to/key"   # default: the owner-private directory, below
-```
-
-The key is a single line in a file the owner writes and only the owner can read. Without
-`api_key_file` the runtime looks in
-`~/.config/firm-runtime/credentials/google-cloud-<project>.key`, beside the provider
-credentials. The path is what the configuration holds; the key itself never enters
-`firm.toml`, the database or the input records under `durable/inputs/`. It is staged into
-each run's credentials directory the way a provider token is, so it lives only as long as
-the work period.
-
-`firm configure` applies it to a running firm: the configuration is read again for every
-work period, so the next one has the key and no restart is needed. A file that cannot be
-read, holds nothing, or holds more than one line fails the launch and closes admission
-rather than starting a role that silently cannot generate; the error names the file and
-never its contents.
-
-What the key may reach is not the runtime's to enforce, and the runtime counts no
-spending. Restrict the key on the Google Cloud side — one project, one API — and give that
-project a spend cap. A monthly spend cap in AI Studio is the only limit that acts in
-minutes; Cloud Billing budgets notify on reported spend and lag by hours, so they are a
-backstop rather than a brake.
-
 ## Start and stop
 
 The shortest path is to install Firm and run `firm start`; the wizard creates or resumes
@@ -830,9 +809,9 @@ with [AGY](#experimental-agy-configuration). API billing and request-rate
 limits are separate from subscription windows and are not assigned a guessed reset.
 
 An account may set `stop_admitting_at` to a fraction from 0 through 1. A streamed subscription
-reading at or above that fraction pauses fresh and retained role activations, tasks, summaries and
-staffing on that account until the latest crossed window resets. The reading must be no older than
-five minutes when the pause is created; once created, its hold remains through the reported reset
+reading at or above that fraction pauses fresh and retained role activations, LLM CLI calls,
+summaries and staffing on that account until the latest crossed window resets. The reading
+must be no older than five minutes when the pause is created; once created, its hold remains through the reported reset
 even after the reading ages. Roles already running finish their turns. The default is unset, which
 leaves admission unchanged. Claude's `allowed_warning` status sends one Operations notice per
 account, window and reset. Codex rollout windows retain the provider's limit ID; crossing a
@@ -1359,7 +1338,7 @@ founder_profile = "agy"
 
 [profiles.agy]
 provider = "agy"
-model = "gemini-4-hydrogen"
+model = "gemini-4-neon"
 effort = "medium"
 accounts = ["agy-personal"]
 
@@ -1368,33 +1347,36 @@ provider = "agy"
 max_active = 1
 ```
 
-Firm stores model and effort separately. Low/medium classes select
-`gemini-4-hydrogen`; high selects `gemini-4-argon`, with class default efforts
-medium/high/medium respectively. The founder's high/high override selects Argon
-high. Chooser defaults to Hydrogen low, summary defaults to Hydrogen medium, and tasks default to Hydrogen high.
-Efforts low, medium and high append a suffix to the base model. **Firm xhigh
-selects `gemini-4-argon-high` regardless of class**; native xhigh is unsupported.
+Firm stores model and effort separately. Low selects `gemini-4-hydrogen` (medium effort),
+medium selects `gemini-4-neon` (medium effort), and high selects `gemini-4-neon` (high
+effort); the family aliases `hydrogen`, `neon`, `carbon` map to their base IDs, while class
+aliases `low`, `medium`, `high` map to `gemini-4-hydrogen`, `gemini-4-neon`,
+`gemini-4-neon`. The founder's high/high override selects Neon high. Chooser defaults to
+Hydrogen low, summary defaults to Hydrogen medium, and `[llm.agy]` defaults to Neon
+medium. Efforts low, medium and high append a suffix to the base model. **Firm xhigh selects
+`gemini-4-carbon-high` regardless of class**; native xhigh is unsupported.
 The command passes only `--model`. Console diagnostics report native `init.model`;
 the retained binding separately stores the configured base identity.
 
-Role/task agents declare bounded file/shell tools plus provider-side `search_web`,
+Role and guest CLI agents declare bounded file/shell tools plus provider-side `search_web`
+and `generate_image`,
 using `toolPermission: "always-proceed"` and `agentMode: "accept-edits"` with VM/UID
 isolation. Firm denies `read_url(*)` and `execute_url(*)`, plus `mcp(*)` outside
 roles. Search needs no extra permission namespace or page-fetch allowance.
 Every agent sets `inheritCustomizations: false`; workspace instructions can reach
-role/task runs. Tool-free runs declare `tools: []` and explicitly deny native
+role and guest CLI runs. Tool-free runs declare `tools: []` and explicitly deny native
 names/namespaces, including search, `manage_task` and `mcp(*)`, under strict
 permissions. Empty declarations alone do not enforce isolation: implicit native
 tools, delegation, browser and scheduler exclusion are unproven, and an implicit
 `manage_task` step can occur. Summaries have no shares or role authority.
 Firm rejects summary/chooser results containing a structured native tool step,
-including the captured implicit `manage_task` case. Role/task tool-step names
+including the captured implicit `manage_task` case. Role and guest CLI tool-step names
 remain visible in execution telemetry, including names outside the declared catalog.
 This detects reported contract violations after execution; it does not undo tool
 effects or prove that native reporting includes every execution.
 
 Only roles get eager authenticated Firm MCP, with an activation bearer and the
-configured task timeout. Tasks and summaries get no MCP config. A tool ERROR
+120-second transport timeout (`MCP_TIMEOUT_SECONDS`). Guest LLM CLIs and summaries get no MCP config. A tool ERROR
 does not fail an otherwise successful activation: the protocol cannot distinguish
 ordinary tool errors from transport/auth failures. Missing MCP without a structured
 failure cannot be reliably inferred from prose. Before an AGY role activation
@@ -1429,13 +1411,13 @@ way Firm pauses the profile that names the model until the stated reset, spends 
 attempt, and leaves the account's other profiles running; a refusal with no usable reset
 time waits for you. The reset permits one more attempt, so a refusal after it is a new
 pause until the reset it states. The pause is the profile's: it also holds a role on that
-profile whose effort selects another model (`xhigh` always selects Argon), and it is not
+profile whose effort selects another model (`xhigh` always selects Carbon), and it is not
 opened by such a role, which keeps the ordinary retries because no profile stands for the
 model it ran. Summaries and staffing assessments refused this way only fail that turn. See [expiry recovery and clock requirements](installation.md#experimental-agy-integration).
 
 Usage is cumulative per conversation: input, output, cache-read and thinking map
 to session counters, with thinking included in output. Activation deltas, context
-occupancy/window, compactions and quota are unknown. Fresh summary/chooser/task
+occupancy/window, compactions and quota are unknown. Fresh summary, chooser and guest CLI
 sessions also report session totals as run totals, without double counting.
 Summary/chooser `output_tokens` use the raw reported total; reasoning is also
 reported separately. Those turns use a 30-second timeout, configured effort,

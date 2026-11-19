@@ -71,7 +71,6 @@ def test_builds_fresh_spec_with_explicit_settings_and_secret_token(tmp_path):
             mcp_url='http://firm.local:8421/mcp',
             provider_session_id=None,
             offered_tools=tuple(TOOL_DESCRIPTIONS),
-            task_timeout_seconds=600,
         ),
         layout=Layout(),
     )
@@ -110,7 +109,7 @@ def test_builds_fresh_spec_with_explicit_settings_and_secret_token(tmp_path):
                 "headers": {"Authorization": "Bearer ${FIRM_ACTIVATION_TOKEN}"},
                 "type": "http",
                 "url": "http://firm.local:8421/mcp",
-                "timeout": 665000,
+                "timeout": 120000,
             }
         }
     }
@@ -285,7 +284,6 @@ def test_builds_exact_resume_and_rejects_noncanonical_native_id(tmp_path):
             mcp_url='https://bridge.example/mcp',
             provider_session_id=native_id,
             offered_tools=tuple(TOOL_DESCRIPTIONS),
-            task_timeout_seconds=600,
         ),
         layout=Layout(),
     )
@@ -303,7 +301,6 @@ def test_builds_exact_resume_and_rejects_noncanonical_native_id(tmp_path):
                 mcp_url='https://bridge.example/mcp',
                 provider_session_id='../../token',
                 offered_tools=tuple(TOOL_DESCRIPTIONS),
-                task_timeout_seconds=600,
             ),
             layout=Layout(),
         )
@@ -323,7 +320,6 @@ def test_auth_file_is_private_explicit_and_read_at_build(tmp_path):
                 mcp_url='http://firm/mcp',
                 provider_session_id=None,
                 offered_tools=tuple(TOOL_DESCRIPTIONS),
-                task_timeout_seconds=600,
             ),
             layout=Layout(),
         )
@@ -340,7 +336,6 @@ def test_auth_file_is_private_explicit_and_read_at_build(tmp_path):
                 mcp_url='http://firm/mcp',
                 provider_session_id=None,
                 offered_tools=tuple(TOOL_DESCRIPTIONS),
-                task_timeout_seconds=600,
             ),
             layout=Layout(),
         )
@@ -360,7 +355,6 @@ def test_auth_file_is_private_explicit_and_read_at_build(tmp_path):
                 mcp_url='http://firm/mcp',
                 provider_session_id=None,
                 offered_tools=tuple(TOOL_DESCRIPTIONS),
-                task_timeout_seconds=600,
             ),
             layout=Layout(),
         )
@@ -380,7 +374,6 @@ def test_exported_credentials_json_is_copied_to_tmpfs_not_put_in_environment(tmp
             mcp_url='http://firm.local/mcp',
             provider_session_id=None,
             offered_tools=tuple(TOOL_DESCRIPTIONS),
-            task_timeout_seconds=600,
         ),
         layout=Layout(),
     )
@@ -396,7 +389,6 @@ def test_exported_credentials_json_is_copied_to_tmpfs_not_put_in_environment(tmp
             mcp_url='http://firm.local/mcp',
             provider_session_id=None,
             offered_tools=tuple(TOOL_DESCRIPTIONS),
-            task_timeout_seconds=600,
         ),
         layout=Layout(),
     )
@@ -422,8 +414,7 @@ def test_launcher_keeps_only_projects_tree_in_persistent_home(tmp_path, monkeypa
     assert not (persistent / ".credentials.json").exists()
 
 
-@pytest.mark.parametrize("task", [False, True])
-def test_launcher_keeps_exported_credentials_on_tmpfs(tmp_path, monkeypatch, task):
+def test_launcher_keeps_exported_credentials_on_tmpfs(tmp_path, monkeypatch):
     claude_home = tmp_path / "run" / "firm" / "claude"
     claude_home.mkdir(parents=True)
     source = tmp_path / "run" / "firm" / "credentials" / "claude-auth"
@@ -432,15 +423,12 @@ def test_launcher_keeps_exported_credentials_on_tmpfs(tmp_path, monkeypatch, tas
     monkeypatch.setenv("FIRM_STATE_DIR", str(claude_home.parent))
     monkeypatch.setenv("FIRM_CREDENTIALS_DIR", str(source.parent))
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "ambient-token")
-    monkeypatch.setenv("FIRM_TASK_RUN", "1" if task else "0")
 
     claude_launch._prepare_auth("credentials-json")
 
     copied = claude_home / ".credentials.json"
     assert copied.read_bytes() == source.read_bytes()
-    assert copied.is_symlink() is task
-    if task:
-        assert copied.resolve() == source.resolve()
+    assert not copied.is_symlink()
     assert copied.stat().st_mode & 0o077 == 0
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in claude_launch.os.environ
 

@@ -1,7 +1,7 @@
 """Guest controller of the firm's Linux VM, installed root-owned; JSON over the control channel.
 
 One request on stdin, one ``ok``/``error`` reply on stdout, under a global lock, which
-``sample``, ``export``, ``storage``, ``child-status`` and ``child-logs`` skip; only ``export``
+``sample``, ``export`` and ``storage`` skip; only ``export``
 replies with a tar stream instead of JSON. Every role is a Linux account whose work
 runs inside one systemd slice; the file server's steps are the ``files`` operation of
 the same controller. This module is self-contained so the guest needs nothing but its
@@ -25,7 +25,6 @@ import math
 import os
 import pwd
 import re
-import selectors
 import shutil
 import stat
 import subprocess
@@ -54,8 +53,6 @@ SHARED_BROWSERS = Path("/opt/firm/ms-playwright")
 LIMIT = 8 * 1024 * 1024
 FILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}\.[a-z0-9]{1,8}")
 MAX_LOG_BYTES = 64 * 1024 * 1024
-CHILD_LOG_BYTES = 4 * 1024 * 1024
-CHILD_STOP_TIMEOUT = 2.0
 CLOCK_TOLERANCE = 2.0  # Guest and host clocks further apart than this are stepped at launch.
 SETTLE_TIMEOUT = 20.0
 DISPOSE_DAEMON_TIMEOUT = 15.0  # User manager, daemon and socket share this budget.
@@ -210,25 +207,6 @@ class Privileged:
         finally:
             os.seteuid(0)
             os.setegid(0)
-
-    def create_child_cgroup(self, path):
-        path.mkdir()  # The live parent's slice must already exist.
-        if self.simulate:
-            (path / "cgroup.procs").write_text("")
-            (path / "cgroup.kill").write_text("")
-            (path / "cgroup.events").write_text("populated 0\n")
-
-    def kill_child_cgroup(self, path):
-        (path / "cgroup.kill").write_text("1")
-        if self.simulate:
-            (path / "cgroup.procs").write_text("")
-            (path / "cgroup.events").write_text("populated 0\n")
-
-    def remove_child_cgroup(self, path):
-        if self.simulate:
-            for name in ("cgroup.procs", "cgroup.kill", "cgroup.events"):
-                (path / name).unlink()
-        path.rmdir()
 
     def spawn(self, argv, **options):
         argv = [str(item) for item in argv]
@@ -538,7 +516,7 @@ def role_environment(info):
         "XDG_RUNTIME_DIR": f"/run/user/{info['uid']}",
         "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{info['uid']}/bus",
         "DOCKER_HOST": f"unix:///run/user/{info['uid']}/docker.sock",
-        # Named so a task, whose HOME is its own, still uses the role's proxy settings.
+        # Named so guest sessions whose HOME is overridden still use the role's proxy settings.
         "DOCKER_CONFIG": f"{info['home']}/.docker",
         # Playwright's default cache, named for the same reason.
         "PLAYWRIGHT_BROWSERS_PATH": f"{info['home']}/.cache/ms-playwright",
@@ -1318,11 +1296,6 @@ def clean_run_state(info):
         raise RuntimeError("Run state root must not be a symlink")
     if role_root.is_dir():
         shutil.rmtree(role_root)
-    children = STATE / "children"
-    for path in children.iterdir() if children.exists() else ():
-        record = json.loads((path / "record.json").read_text())
-        if record.get("role_id") == info["role_id"]:
-            shutil.rmtree(STATE / "task-homes" / path.name, ignore_errors=True)
 
 
 def clean_stateless_home(info):
@@ -1632,16 +1605,6 @@ def supervise(run_id):
                 with (directory / "stdin").open("wb") as stream:
                     stream.write(base64.b64decode(request.get("stdin", ""), validate=True))
                 record = json.loads((directory / "record.json").read_text())
-                # Only ordinary mounted-role environment is inherited by tasks. Never
-                # copy activation tokens, secret_env or provider settings from this run.
-                save(
-                    directory / "execution.json",
-                    {
-                        "info": info,
-                        "cwd": cwd,
-                        "env": role_environment(info),
-                    },
-                )
                 record.update({"supervisor": os.getpid(), "phase": "running"})
                 save(directory / "record.json", record)
                 with (directory / "stdin").open("rb") as source:
@@ -1710,7 +1673,7 @@ def supervise(run_id):
                 )
 
 
-# ---- task children: separate journals, no account lifecycle -----------------------------
+# ---- guest clock -----------------------------------------------------------------------
 
 
 def step_clock(request):
@@ -1732,377 +1695,6 @@ def step_clock(request):
         time.clock_settime(time.CLOCK_REALTIME, host_time)
 
 
-def validate_seconds_remaining(value):
-    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
-        raise ValueError("Invalid child seconds remaining")
-    return value
-
-
-def child_path(child_id):
-    return STATE / "children" / identifier(child_id)
-
-
-@contextmanager
-def child_lock(child_id):
-    with (child_path(child_id) / "lock").open("a") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        yield
-
-
-def child_cgroup(record):
-    return slice_cgroup(record["uid"]) / ("task-" + record["run_id"])
-
-
-def start_child(request):
-    allowed = {
-        "operation",
-        "parent_run_id",
-        "run_id",
-        "argv",
-        "seconds_remaining",
-        "env",
-        "secrets",
-        "secret_env",
-        "stdin",
-    }
-    if set(request) - allowed:
-        raise ValueError("Children accept only a parent, command, ID, duration and launch settings")
-    parent_id, child_id = identifier(request["parent_run_id"]), identifier(request["run_id"])
-    deadline = time.time() + validate_seconds_remaining(request["seconds_remaining"])
-    argv = request["argv"]
-    if (
-        not isinstance(argv, list)
-        or not argv
-        or not all(isinstance(a, str) and "\0" not in a for a in argv)
-    ):
-        raise ValueError("Invalid command")
-    environment = request.get("env", {})
-    if not isinstance(environment, dict) or not all(
-        isinstance(k, str)
-        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k)
-        and isinstance(v, str)
-        and "\0" not in v
-        for k, v in environment.items()
-    ):
-        raise ValueError("Invalid environment")
-    decoded = validate_secrets(request)
-    try:
-        stdin = base64.b64decode(request.get("stdin", ""), validate=True)
-    except (ValueError, TypeError) as exc:
-        raise ValueError("Invalid stdin encoding") from exc
-    directory = child_path(child_id)
-    if directory.exists():
-        raise ValueError("Child ID already used or stopped")
-    # A child journal never qualifies as a parent, even if its supervisor is alive.
-    if child_path(parent_id).exists() or not run_path(parent_id).is_dir():
-        raise ValueError("Parent must be a top-level run")
-    with run_lock(parent_id):
-        parent = status(parent_id)
-        if (
-            not parent.get("running")
-            or parent.get("phase") != "running"
-            or (run_path(parent_id) / "stop").exists()
-        ):
-            raise ValueError("Parent is not live or is stopping")
-        if deadline <= time.time():
-            raise ValueError("Child deadline has passed")
-        execution = json.loads((run_path(parent_id) / "execution.json").read_text())
-        info = execution["info"]
-        if info.get("stateless"):
-            raise ValueError("Stateless runs cannot launch task children")
-        record = {
-            "run_id": child_id,
-            "parent_run_id": parent_id,
-            "role_id": parent["role_id"],
-            "uid": info["uid"],
-            "boot": boot(),
-            "deadline": deadline,
-            "started": time.time(),
-            "phase": "launching",
-        }
-        directory.parent.mkdir(mode=0o700, exist_ok=True)
-        staging = STATE / "child-staging"
-        shutil.rmtree(staging, ignore_errors=True)
-        staging.mkdir(mode=0o700)
-        save(staging / "record.json", record)
-        save(
-            staging / "request.json",
-            {
-                **execution,
-                "argv": argv,
-                "env": {**execution["env"], **environment},
-                "secret_env": request.get("secret_env", {}),
-            },
-        )
-        (staging / "stdin").write_bytes(stdin)
-        (staging / "lock").touch(mode=0o600)
-        os.rename(staging, directory)  # Journal precedes cgroup creation and spawn.
-        with child_lock(child_id):
-            try:
-                credentials = child_credentials(record)
-                managed_directory(credentials.parent.parent, 0, 0, 0o711)
-                managed_directory(credentials.parent, info["uid"], info["gid"], 0o700)
-                managed_directory(credentials, info["uid"], info["gid"], 0o700)
-                create_credentials({**info, "credentials": str(credentials)}, decoded)
-                privileged.create_child_cgroup(child_cgroup(record))
-                process = privileged.spawn(
-                    [PYTHON, "-I", CONTROLLER, "--supervise-child", child_id],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-                record["supervisor"] = process.pid
-                save(directory / "record.json", record)
-            except Exception:
-                _stop_child(child_id, reason="launch_failed", exit_code=125)
-                raise
-    return record
-
-
-def child_status(child_id):
-    directory = child_path(child_id)
-    record = json.loads((directory / "record.json").read_text())
-    result = directory / "exit.json"
-    log = directory / "log"
-    size = log.stat().st_size if log.exists() else 0
-    if result.exists():
-        return {**record, **json.loads(result.read_text()), "log_bytes": size}
-    if record["boot"] != boot():
-        with child_lock(child_id):
-            return {**_stop_child(child_id, reason="interrupted", exit_code=125), "log_bytes": size}
-    return {
-        **record,
-        "running": True,
-        "exit_code": None,
-        "confirmed": False,
-        "unresolved": False,
-        "log_bytes": size,
-    }
-
-
-def _stop_child(child_id, *, reason="cancelled", exit_code=None, publish=True):
-    """Caller holds child lock. Never use a PID or process group as kill evidence."""
-    directory = child_path(child_id)
-    record = json.loads((directory / "record.json").read_text())
-    (directory / "stop").touch(mode=0o600, exist_ok=True)
-    previous = (
-        json.loads((directory / "exit.json").read_text())
-        if (directory / "exit.json").exists()
-        else {}
-    )
-    confirmed = False
-    try:
-        if "uid" not in record or record["boot"] != boot():
-            confirmed = True  # Tombstone, or processes from a previous boot.
-        else:
-            group = child_cgroup(record)
-            if not group.exists():
-                confirmed = True
-            else:
-                privileged.kill_child_cgroup(group)
-                end = time.monotonic() + CHILD_STOP_TIMEOUT
-                while "populated 0" not in (group / "cgroup.events").read_text().splitlines():
-                    if time.monotonic() >= end:
-                        break
-                    time.sleep(0.02)
-                else:
-                    # Root-owned, nondelegated leaf: children cannot create subgroups.
-                    privileged.remove_child_cgroup(group)
-                    confirmed = True
-    except OSError:
-        pass  # A failed read, kill or removal never proves cleanup.
-    result = {
-        "running": not confirmed,
-        "confirmed": confirmed,
-        "unresolved": not confirmed,
-        "ended": time.time(),
-        "exit_code": previous.get("exit_code", exit_code if exit_code is not None else 137),
-        "reason": previous.get("reason", reason),
-    }
-    if publish:
-        save(directory / "exit.json", result)
-    if confirmed:
-        for name in ("request.json", "stdin"):
-            (directory / name).unlink(missing_ok=True)
-        if record.get("parent_run_id"):
-            shutil.rmtree(child_credentials(record).parent, ignore_errors=True)
-            shutil.rmtree(STATE / "task-homes" / child_id, ignore_errors=True)
-    return {**record, **result}
-
-
-def stop_child(child_id):
-    directory = child_path(child_id)
-    if not directory.exists():
-        # Fence a delayed start RPC, including admission before any guest journal.
-        directory.parent.mkdir(mode=0o700, exist_ok=True)
-        staging = STATE / "child-staging"
-        shutil.rmtree(staging, ignore_errors=True)
-        staging.mkdir(mode=0o700)
-        save(staging / "record.json", {"run_id": child_id, "boot": boot()})
-        os.rename(staging, directory)
-    with child_lock(child_id):
-        return _stop_child(child_id)
-
-
-def stop_children(parent_id):
-    directory = STATE / "children"
-    failed = []
-    for path in directory.iterdir() if directory.exists() else ():
-        record = json.loads((path / "record.json").read_text())
-        if record.get("parent_run_id") == parent_id:
-            if not stop_child(path.name)["confirmed"]:
-                failed.append(path.name)
-    if failed:
-        raise RuntimeError("Child cleanup unconfirmed: " + ", ".join(failed))
-
-
-def child_logs(child_id, offset=0, limit=1024 * 1024):
-    if type(offset) is not int or offset < 0 or type(limit) is not int or limit < 0:
-        raise ValueError("Invalid log range")
-    try:
-        with (child_path(child_id) / "log").open("rb") as stream:
-            stream.seek(offset)
-            data = stream.read(min(limit, CHILD_LOG_BYTES))
-    except FileNotFoundError:
-        data = b""
-    return {"data": base64.b64encode(data).decode()}
-
-
-def enter_child(record, info, cwd):
-    # Popen runs this in its fork before exec, while the supervisor holds the
-    # child lock. No user instruction can run or fork before cgroup membership.
-    (child_cgroup(record) / "cgroup.procs").write_text(str(os.getpid()))
-    os.setgroups([info["gid"]])
-    os.setgid(info["gid"])
-    os.setuid(info["uid"])
-    os.chdir(cwd)
-
-
-def child_credentials(record):
-    return RUN_ROOT / record["role_id"] / "tasks" / record["run_id"] / "credentials"
-
-
-def supervise_child(child_id):
-    directory = child_path(child_id)
-    code, reason = 125, "launch_failed"
-    process = None
-    try:
-        record = json.loads((directory / "record.json").read_text())
-        with run_lock(record["parent_run_id"]), child_lock(child_id):
-            parent = status(record["parent_run_id"])
-            if (
-                (directory / "stop").exists()
-                or (run_path(record["parent_run_id"]) / "stop").exists()
-                or not parent.get("running")
-                or record["deadline"] <= time.time()
-            ):
-                return
-            request = json.loads((directory / "request.json").read_text())
-            info = request["info"]
-            # Journals remain root-only; tasks need traversal to their disk homes.
-            managed_directory(STATE, 0, 0, 0o711)
-            root = STATE / "task-homes"
-            managed_directory(root, 0, 0, 0o711)
-            root = root / child_id
-            managed_directory(root, info["uid"], info["gid"], 0o700)
-            for name in ("home", "state"):
-                managed_directory(root / name, info["uid"], info["gid"], 0o700)
-            credentials = child_credentials(record)
-            env = {
-                **request["env"],
-                "HOME": str(root / "home"),
-                "XDG_CONFIG_HOME": str(root / "state"),
-                "XDG_CACHE_HOME": str(root / "state"),
-                "XDG_DATA_HOME": str(root / "state"),
-                "FIRM_PRIVATE_HOME": str(root / "home"),
-                "FIRM_STATE_DIR": str(root / "state"),
-                "FIRM_CREDENTIALS_DIR": str(credentials),
-                "FIRM_RUN_ID": child_id,
-            }
-            env.update(
-                {
-                    variable: (credentials / name).read_text()
-                    for variable, name in request["secret_env"].items()
-                }
-            )
-            with (directory / "stdin").open("rb") as source:
-                process = privileged.spawn(
-                    request["argv"],
-                    env=env,
-                    stdin=source,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                    preexec_fn=lambda: enter_child(record, info, request["cwd"]),
-                )
-            record.update(supervisor=os.getpid(), phase="running")
-            save(directory / "record.json", record)
-        code, reason = monitor_child(process, record, directory)
-    except Exception:
-        pass  # Command/env-bearing exceptions do not belong in the journal.
-    finally:
-        with child_lock(child_id):
-            result = _stop_child(child_id, reason=reason, exit_code=code, publish=False)
-        try:
-            if process is not None and result["confirmed"]:
-                if drain_child_output(process, directory):
-                    result.update(reason="log_overflow", exit_code=137)
-        finally:
-            if process is not None:
-                process.stdout.close()
-                if result["confirmed"]:
-                    process.wait()
-            # Normal completion is visible only after all observed output is flushed.
-            with child_lock(child_id):
-                save(directory / "exit.json", result)
-
-
-def drain_child_output(process, directory):
-    """Retain bytes already in the pipe after cgroup death, without waiting on daemons."""
-    fd = process.stdout.fileno()
-    os.set_blocking(fd, False)
-    with (directory / "log").open("ab") as log:
-        remaining = max(0, CHILD_LOG_BYTES - log.tell())
-        while True:
-            try:
-                chunk = os.read(fd, min(65536, remaining + 1))
-            except BlockingIOError:
-                return False
-            if not chunk:
-                return False
-            kept = chunk[:remaining]
-            log.write(kept)
-            remaining -= len(kept)
-            if len(kept) != len(chunk):
-                return True
-
-
-def monitor_child(process, record, directory):
-    """The guest watchdog also bounds logs when a child never closes stdout."""
-    saved = 0
-    with selectors.DefaultSelector() as selector, (directory / "log").open("wb") as log:
-        selector.register(process.stdout, selectors.EVENT_READ)
-        while True:
-            remaining = record["deadline"] - time.time()
-            if remaining <= 0:
-                return 137, "timeout"
-            ready = selector.select(min(0.1, remaining))
-            if ready:
-                chunk = os.read(process.stdout.fileno(), 65536)
-                keep = chunk[: max(0, CHILD_LOG_BYTES - saved)]
-                log.write(keep)
-                log.flush()
-                saved += len(keep)
-                if len(keep) != len(chunk):
-                    return 137, "log_overflow"
-                if not chunk:
-                    selector.unregister(process.stdout)
-            code = process.poll()
-            if code is not None and (not ready or not chunk):
-                return code, "exited"
-
-
 def read_settlement(directory):
     try:
         return json.loads((directory / "settlement.json").read_text())
@@ -2112,15 +1704,9 @@ def read_settlement(directory):
 
 def settle_run(info, directory):
     """Stop and supervisor share one receipt, so neither loses the other's evidence."""
-    # Caller holds the parent run lock; no child can launch across settlement.
     (directory / "stop").touch(mode=0o600, exist_ok=True)
-    child_error = None
-    try:
-        stop_children(directory.name)
-    except Exception as exc:
-        child_error = exc
     previous = read_settlement(directory)
-    if previous and not previous["error"] and child_error is None:
+    if previous and not previous["error"]:
         return previous
     # Stopping the slice removes the cgroup that holds its usage counters.
     receipt = {
@@ -2128,11 +1714,7 @@ def settle_run(info, directory):
         "error": None,
     }
     try:
-        # Stopping member units cleans the role's Docker/services even when a
-        # foreign task cgroup stays populated; slice stop alone cannot kill tasks.
         settle(info)
-        if child_error is not None:
-            raise child_error
     except Exception as exc:
         receipt["error"] = str(exc)
         raise
@@ -2183,12 +1765,6 @@ def remove_run(run_id):
     if result.get("running") or result.get("unresolved"):
         raise ValueError("Stop and resolve a run before removing it")
     # Completed supervisors release both locks before another RPC may remove it.
-    children = STATE / "children"
-    for path in children.iterdir() if children.exists() else ():
-        record = json.loads((path / "record.json").read_text())
-        if record.get("parent_run_id") == run_id:
-            with child_lock(path.name):
-                shutil.rmtree(path)
     shutil.rmtree(run_path(run_id))
     return {"removed": run_id}
 
@@ -2688,16 +2264,6 @@ def dispatch(request):
         return {"roles": data["roles"], "boot": boot(), "firm_id": data.get("firm_id")}
     if operation == "provision":
         return provision(request["role_id"])
-    if operation == "start-child":
-        return start_child(request)
-    if operation == "child-status":
-        return child_status(request["run_id"])
-    if operation == "child-logs":
-        return child_logs(
-            request["run_id"], request.get("offset", 0), request.get("limit", 1024 * 1024)
-        )
-    if operation == "stop-child":
-        return stop_child(request["run_id"])
     if operation == "start":
         return start(request)
     if operation == "runs":
@@ -2746,9 +2312,6 @@ def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--supervise":
         supervise(identifier(sys.argv[2]))
         return
-    if len(sys.argv) == 3 and sys.argv[1] == "--supervise-child":
-        supervise_child(identifier(sys.argv[2]))
-        return
     if sys.argv[1:] == ["--reclaim-scratch"]:
         request = json.load(sys.stdin)
         print(json.dumps(reclaim_scratch(
@@ -2771,12 +2334,11 @@ def main():
         if request["operation"] == "sample":
             # Read-only counters must not wait for long provisioning calls.
             result = sample()
-        elif request["operation"] in {"child-status", "child-logs", "storage"}:
-            # Journal reads must not queue behind unrelated role operations.
-            # Reboot reconciliation in child_status takes the child lock itself.
+        elif request["operation"] == "storage":
+            # Read-only estimates must not queue behind unrelated role operations.
             result = dispatch(request)
         else:
-            if request["operation"] in {"start", "start-child"}:
+            if request["operation"] == "start":
                 # Before the global lock: a launch that waits there behind another
                 # role's work would otherwise set the clock to when it was sent.
                 step_clock(request)
